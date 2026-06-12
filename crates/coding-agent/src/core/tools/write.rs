@@ -11,15 +11,14 @@ use super::common::*;
 pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool {
         name: "write".to_string(),
-        label: "Write".to_string(),
-        description: "Create or overwrite a UTF-8 text file through the session filesystem"
-            .to_string(),
+        label: "write".to_string(),
+        description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
         parameters: json!({
             "type": "object",
             "required": ["path", "content"],
             "properties": {
-                "path": { "type": "string" },
-                "content": { "type": "string" }
+                "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
+                "content": { "type": "string", "description": "Content to write to the file" }
             }
         }),
         execute: Arc::new(move |_id, args, _abort, _update| {

@@ -223,8 +223,14 @@ fn render_entry(
     }
 
     let style = message_style(entry.kind);
-    let bullet = Span::styled("● ", style.add_modifier(Modifier::BOLD));
-    let first_prefix_width = 2; // "● " = 2 cells
+    // User messages use ">", others use "●"
+    let (prefix, first_prefix_width) = if entry.kind == MessageKind::User {
+        let prefix = Span::styled("> ", Style::default().fg(Color::Rgb(100, 100, 110)));
+        (prefix, 2)
+    } else {
+        let prefix = Span::styled("● ", style.add_modifier(Modifier::BOLD));
+        (prefix, 2)
+    };
     let body_width = render_width.saturating_sub(first_prefix_width).max(8);
 
     // Parse body as markdown for assistant/tool messages, plain for user/error/system
@@ -249,7 +255,7 @@ fn render_entry(
     let mut out = Vec::new();
     for (line_idx, line) in rendered.into_iter().enumerate() {
         let mut spans = if line_idx == 0 {
-            vec![bullet.clone()]
+            vec![prefix.clone()]
         } else {
             vec![Span::raw("  ")]
         };

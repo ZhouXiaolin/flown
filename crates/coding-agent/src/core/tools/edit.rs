@@ -9,25 +9,24 @@ use super::common::*;
 pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool {
         name: "edit".to_string(),
-        label: "Edit".to_string(),
-        description:
-            "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file."
-                .to_string(),
+        label: "edit".to_string(),
+        description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".to_string(),
         parameters: json!({
             "type": "object",
             "required": ["path", "edits"],
             "additionalProperties": false,
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
                 "edits": {
                     "type": "array",
+                    "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits.",
                     "items": {
                         "type": "object",
                         "required": ["oldText", "newText"],
                         "additionalProperties": false,
                         "properties": {
-                            "oldText": { "type": "string" },
-                            "newText": { "type": "string" }
+                            "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                            "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
                         }
                     }
                 }

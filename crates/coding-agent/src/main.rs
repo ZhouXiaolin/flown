@@ -490,7 +490,7 @@ fn format_tool_call(name: &str, args: &serde_json::Value) -> String {
         }
         "bash" => {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Bash\n```bash\n{command}\n```")
+            format!("Bash({command})")
         }
         _ => format!("Tool {name}"),
     }

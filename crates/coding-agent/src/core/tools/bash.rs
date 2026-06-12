@@ -12,14 +12,18 @@ static BASH_OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool {
         name: "bash".to_string(),
-        label: "Bash".to_string(),
-        description: "Run a shell command in the session execution environment".to_string(),
+        label: "bash".to_string(),
+        description: format!(
+            "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+            DEFAULT_MAX_LINES,
+            DEFAULT_MAX_BYTES / 1024
+        ),
         parameters: json!({
             "type": "object",
             "required": ["command"],
             "properties": {
-                "command": { "type": "string" },
-                "timeout": { "type": "integer", "minimum": 1 }
+                "command": { "type": "string", "description": "Bash command to execute" },
+                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (optional, no default timeout)" }
             }
         }),
         execute: Arc::new(move |_id, args, _abort, _update| {
