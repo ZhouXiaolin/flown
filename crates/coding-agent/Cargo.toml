@@ -51,6 +51,9 @@ arboard = "3"
 rquickjs.workspace = true
 async-trait = "0.1"
 
+# Diff
+similar.workspace = true
+
 # Utilities
 chrono.workspace = true
 dirs.workspace = true

@@ -519,21 +519,16 @@ impl Editor {
         )
     }
 
-    /// Compute the total height needed for the input widget.
+    /// Compute the total height needed for the input widget (including slash popup if active).
     pub fn input_height(&self, width: u16) -> u16 {
         let inner_width = width.saturating_sub(2).max(1) as usize;
         let rows = self
             .display_rows(inner_width)
             .len()
             .clamp(1, MAX_INPUT_BODY_LINES);
-        rows as u16 + 2 // +2 for top and bottom borders
-    }
+        let editor_height = rows as u16 + 2; // +2 for top and bottom borders
 
-    // ── Rendering ──────────────────────────────────────────────────
-
-    /// Render the editor widget.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
-        // Reserve space for the popup above
+        // Add slash popup height if active
         let popup_height = self
             .slash_popup
             .as_ref()
@@ -543,6 +538,35 @@ impl Editor {
             })
             .unwrap_or(0);
 
+        editor_height + popup_height
+    }
+
+    // ── Rendering ──────────────────────────────────────────────────
+
+    /// Get the height of the slash popup if active.
+    fn slash_popup_height(&self) -> u16 {
+        self.slash_popup
+            .as_ref()
+            .map(|p| {
+                let visible_items = p.items.len().min(6);
+                (visible_items as u16) + 2 // +2 for border
+            })
+            .unwrap_or(0)
+    }
+
+    /// Render the editor widget.
+    pub fn render(&self, f: &mut Frame, area: Rect) {
+        let popup_height = self.slash_popup_height();
+
+        // Popup area is at the top of the given area
+        let popup_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: popup_height,
+        };
+
+        // Editor area is below the popup
         let editor_area = Rect {
             x: area.x,
             y: area.y + popup_height,
@@ -552,7 +576,7 @@ impl Editor {
 
         // Render slash popup if active
         if let Some(ref popup) = self.slash_popup {
-            self.render_slash_popup(f, area, popup);
+            self.render_slash_popup(f, popup_area, popup);
         }
 
         // Editor border style
@@ -603,28 +627,21 @@ impl Editor {
     }
 
     fn render_slash_popup(&self, f: &mut Frame, area: Rect, popup: &SlashPopup) {
-        let visible_count = popup.items.len().min(6) as u16;
-        let popup_area = Rect {
-            x: area.x + 1,
-            y: area.y,
-            width: area.width.saturating_sub(2).min(40),
-            height: visible_count + 2, // +2 for border
-        };
-
         // Clear background
-        f.render_widget(Clear, popup_area);
+        f.render_widget(Clear, area);
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Commands ");
 
-        let inner = block.inner(popup_area);
-        f.render_widget(block, popup_area);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
 
         // Render items
+        let visible_count = inner.height as usize;
         let mut lines = Vec::new();
-        for (vis_idx, &cmd_idx) in popup.items.iter().take(visible_count as usize).enumerate() {
+        for (vis_idx, &cmd_idx) in popup.items.iter().take(visible_count).enumerate() {
             let cmd = &SLASH_COMMANDS[cmd_idx];
             let is_selected = vis_idx == popup.selected;
             let prefix = if is_selected { "▸ " } else { "  " };

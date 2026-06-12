@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
+
+use crate::config::Config;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -91,4 +95,248 @@ pub enum McpAction {
         #[arg(long, default_value = "{}")]
         args: String,
     },
+}
+
+// ── Command handlers ──────────────────────────────────────────────
+
+pub async fn cmd_chat(
+    model_override: Option<String>,
+    _provider_override: Option<String>,
+    prompt: Vec<String>,
+) -> anyhow::Result<()> {
+    let config = Config::load()?;
+
+    let default_model = config.resolve_default_model();
+    let model_str = model_override.unwrap_or(default_model);
+    let (provider_name, api_key) = config.resolve_provider_and_key(&model_str);
+
+    let initial_prompt = if prompt.is_empty() {
+        None
+    } else {
+        Some(prompt.join(" "))
+    };
+
+    crate::interactive_mode::run_tui(config, model_str, provider_name, api_key, initial_prompt).await
+}
+
+pub fn cmd_config(action: Option<ConfigAction>) -> anyhow::Result<()> {
+    let config = Config::load()?;
+
+    match action.unwrap_or(ConfigAction::Show) {
+        ConfigAction::Show => {
+            println!("{}", serde_json::to_string_pretty(&config)?);
+        }
+        ConfigAction::Set { key, value } => {
+            println!("Setting {key} = {value}");
+        }
+        ConfigAction::Edit => {
+            let path = Config::config_path();
+            println!("Config path: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+pub async fn cmd_mcp(action: Option<McpAction>) -> anyhow::Result<()> {
+    use crate::core::mcp::McpManager;
+
+    let config = Config::load()?;
+
+    match action.unwrap_or(McpAction::List) {
+        McpAction::List => {
+            if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                println!("Configured MCP servers:");
+                for (name, server) in &config.mcp_servers {
+                    let status = if server.disabled {
+                        "disabled"
+                    } else {
+                        "configured"
+                    };
+                    println!("  {name} — {} ({status})", server.command);
+                }
+            }
+        }
+        McpAction::Status => {
+            if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                let mut manager = McpManager::new(config.mcp_servers.clone());
+                manager.connect_all().await;
+                let infos = manager.server_info();
+                println!("MCP Server Status:");
+                println!();
+                for info in &infos {
+                    let status_icon = match info.status {
+                        crate::core::types::McpServerStatus::Connected => "✓",
+                        crate::core::types::McpServerStatus::Disconnected => "✗",
+                        crate::core::types::McpServerStatus::Error => "⚠",
+                    };
+                    let tool_count = info.tool_count;
+                    let error_info = info.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default();
+                    println!("  {status_icon} {} — {} ({} tool(s)){}",
+                        info.name, info.command, tool_count, error_info);
+                }
+            }
+        }
+        McpAction::Tools => {
+            if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                let mut manager = McpManager::new(config.mcp_servers.clone());
+                manager.connect_all().await;
+                let tool_infos = manager.tool_infos();
+                if tool_infos.is_empty() {
+                    println!("No MCP tools available (servers may be disconnected or have no tools).");
+                } else {
+                    // Group tools by server
+                    let mut by_server: std::collections::BTreeMap<String, Vec<&crate::core::types::ToolInfo>> = std::collections::BTreeMap::new();
+                    for tool in &tool_infos {
+                        let server = tool.source.as_deref().unwrap_or("unknown").to_string();
+                        by_server.entry(server).or_default().push(tool);
+                    }
+                    for (server, tools) in &by_server {
+                        println!("  {} ({})", server, tools.len());
+                        for tool in tools {
+                            let desc = if tool.description.is_empty() {
+                                String::new()
+                            } else {
+                                let truncated: String = tool.description.chars().take(80).collect();
+                                if truncated.len() < tool.description.len() {
+                                    format!(" — {}…", truncated)
+                                } else {
+                                    format!(" — {}", truncated)
+                                }
+                            };
+                            println!("      {}    {}", tool.name, desc);
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+        McpAction::Call { server, tool, args } => {
+            let arguments: serde_json::Value = serde_json::from_str(&args)
+                .map_err(|e| anyhow::anyhow!("invalid --args JSON: {e}"))?;
+            let mut manager = McpManager::new(config.mcp_servers.clone());
+            manager.connect(&server).await
+                .map_err(|e| anyhow::anyhow!("failed to connect to MCP server '{server}': {e}"))?;
+            let result = manager.call_tool(&format!("mcp__{server}__{tool}"), arguments).await
+                .map_err(|e| anyhow::anyhow!("MCP tool call failed: {e}"))?;
+            println!("{result}");
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_completions(shell: clap_complete::Shell) -> anyhow::Result<()> {
+    use clap_complete::generate;
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    generate(shell, &mut cmd, "flown", &mut std::io::stdout());
+    Ok(())
+}
+
+// ── Agent construction ────────────────────────────────────────────
+
+/// Build the Agent from config, model string, and API key.
+pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Config) -> anyhow::Result<flown_agent::Agent> {
+    flown_ai::init();
+
+    let (provider_hint, model_id) = model_str
+        .find('/')
+        .map(|i| (&model_str[..i], &model_str[i + 1..]))
+        .unwrap_or(("", model_str));
+
+    let model = flown_ai::models::get_model(provider_hint, model_id)
+        .or_else(|| flown_ai::models::get_model("", model_id));
+
+    let model = match model {
+        Some(m) => m,
+        None => {
+            anyhow::bail!(
+                "Model '{}' not found in registry. Check your config.",
+                model_str
+            );
+        }
+    };
+
+    // Build system prompt with project context
+    let cwd = std::env::current_dir()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let context_files = crate::system_prompt::load_project_context_files(&cwd);
+
+    // Load skills from ~/.flown/skills and .claude/skills
+    let skills_dir = dirs::home_dir()
+        .map(|h| h.join(".flown").join("skills"))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".flown/skills".to_string());
+
+    let local_skills_dir = ".claude/skills";
+
+    let skills = match crate::skills::load_skills(&[&skills_dir, local_skills_dir]).await {
+        Ok(skills) => skills,
+        Err(_) => Vec::new(),
+    };
+
+    // Set up MCP manager if configured
+    let mcp_manager: Option<Arc<tokio::sync::Mutex<crate::core::mcp::McpManager>>> =
+        if !config.mcp_servers.is_empty() {
+            let mut mcp_manager = crate::core::mcp::McpManager::new(config.mcp_servers.clone());
+            mcp_manager.connect_all().await;
+            Some(Arc::new(tokio::sync::Mutex::new(mcp_manager)))
+        } else {
+            None
+        };
+
+    let system_prompt = crate::system_prompt::build_system_prompt(crate::system_prompt::BuildSystemPromptOptions {
+        cwd,
+        context_files,
+        skills,
+        ..Default::default()
+    }).await;
+
+    let agent = flown_agent::Agent::new(flown_agent::AgentOptions {
+        initial_state: Some(flown_agent::AgentState {
+            system_prompt,
+            model,
+            thinking_level: flown_ai::types::ThinkingLevel::Off,
+            messages: Vec::new(),
+            is_streaming: false,
+            streaming_message: None,
+            pending_tool_calls: std::collections::HashSet::new(),
+            error_message: None,
+        }),
+        get_api_key: Some(Arc::new(move |_provider| {
+            let key = api_key.clone();
+            Box::pin(async move { key })
+        })),
+        ..Default::default()
+    });
+
+    // Set up tools
+    let env = Arc::new(crate::native_env::NativeExecutionEnv::new());
+    let tools = crate::core::tools::built_in_coding_tools(env, mcp_manager);
+
+    agent.set_tools(tools);
+
+    Ok(agent)
+}
+
+pub fn detect_git_branch() -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
 }
