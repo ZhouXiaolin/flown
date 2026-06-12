@@ -18,15 +18,18 @@ pub fn render_layout(
 ) {
     let area = f.area();
 
+    // Compute editor height based on content
+    let editor_height = editor.input_height(area.width).max(3);
+
     // Main vertical layout:
     // [transcript (fill)]
     // [status line (1 row)]
-    // [editor (3 rows)]
+    // [editor (dynamic height)]
     // [hint bar (1 row)]
     let chunks = Layout::vertical([
         Constraint::Min(10),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(editor_height),
         Constraint::Length(1),
     ])
     .split(area);

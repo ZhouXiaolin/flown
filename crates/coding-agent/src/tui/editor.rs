@@ -22,13 +22,18 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/quit", description: "Exit the application" },
 ];
 
-/// Multi-line input editor with CJK-aware cursor and slash command autocomplete.
+const MAX_INPUT_BODY_LINES: usize = 8;
+const INPUT_PROMPT_PRIMARY: &str = " ";
+const INPUT_PROMPT_CONTINUE: &str = " ";
+
+/// Multi-line input editor with CJK-aware cursor, visual line wrapping,
+/// and slash command autocomplete.
 pub struct Editor {
     /// Lines of text (each line is a string without newline)
     lines: Vec<String>,
-    /// Current cursor row
+    /// Current cursor row (logical line index)
     cursor_row: usize,
-    /// Current cursor column (byte offset within line)
+    /// Current cursor column (character index within line, NOT byte offset)
     cursor_col: usize,
     /// Whether the editor is focused
     focused: bool,
@@ -43,6 +48,15 @@ struct SlashPopup {
     selected: usize,
     /// Current filter text (after '/')
     filter: String,
+}
+
+/// A single display row after visual line wrapping.
+struct DisplayRow {
+    prefix: &'static str,
+    text: String,
+    logical_line: usize,
+    start_col: usize,
+    end_col: usize,
 }
 
 impl Editor {
@@ -72,7 +86,7 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.cursor_row = self.lines.len() - 1;
-        self.cursor_col = self.lines[self.cursor_row].len();
+        self.cursor_col = self.lines[self.cursor_row].chars().count();
     }
 
     /// Clear the editor content.
@@ -81,6 +95,20 @@ impl Editor {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.slash_popup = None;
+    }
+
+    /// Insert text (handles multi-line paste).
+    pub fn insert_text(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\r' {
+                continue;
+            }
+            if ch == '\n' {
+                self.insert_newline();
+            } else if !ch.is_control() {
+                self.insert_char(ch);
+            }
+        }
     }
 
     /// Handle a key event. Returns an action for the app to process.
@@ -99,8 +127,12 @@ impl Editor {
                 EditorAction::Submit
             }
             // Newline: Shift+Enter, Alt+Enter, or Ctrl+Enter
-            (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) => {
-                self.insert_char('\n');
+            (KeyCode::Enter, m)
+                if m.contains(KeyModifiers::SHIFT)
+                    || m.contains(KeyModifiers::ALT)
+                    || m.contains(KeyModifiers::CONTROL) =>
+            {
+                self.insert_newline();
                 EditorAction::None
             }
             // Backspace
@@ -146,7 +178,7 @@ impl Editor {
                 EditorAction::None
             }
             (KeyCode::End, _) => {
-                self.cursor_col = self.lines[self.cursor_row].len();
+                self.cursor_col = self.lines[self.cursor_row].chars().count();
                 self.slash_popup = None;
                 EditorAction::None
             }
@@ -173,7 +205,9 @@ impl Editor {
             }
             // Ctrl+K — kill to end of line
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.lines[self.cursor_row].truncate(self.cursor_col);
+                let line = &mut self.lines[self.cursor_row];
+                let byte_offset = char_to_byte_offset(line, self.cursor_col);
+                line.truncate(byte_offset);
                 EditorAction::None
             }
             // Regular character input
@@ -239,7 +273,7 @@ impl Editor {
                 let cmd = &SLASH_COMMANDS[cmd_idx];
                 // Replace current line with the command name + space
                 self.lines[0] = format!("{} ", cmd.name);
-                self.cursor_col = self.lines[0].len();
+                self.cursor_col = self.lines[0].chars().count();
             }
         }
     }
@@ -288,46 +322,46 @@ impl Editor {
         }
     }
 
-    // ── Character operations (CJK-aware) ───────────────────────────
+    // ── Character operations (CJK-aware, char-index based) ────────
 
     fn insert_char(&mut self, c: char) {
-        if c == '\n' {
-            let rest = self.lines[self.cursor_row][self.cursor_col..].to_string();
-            self.lines[self.cursor_row].truncate(self.cursor_col);
-            self.cursor_row += 1;
-            self.lines.insert(self.cursor_row, rest);
-            self.cursor_col = 0;
-        } else {
-            self.lines[self.cursor_row].insert(self.cursor_col, c);
-            self.cursor_col += c.len_utf8();
-        }
+        let byte_offset = char_to_byte_offset(&self.lines[self.cursor_row], self.cursor_col);
+        self.lines[self.cursor_row].insert(byte_offset, c);
+        self.cursor_col += 1;
+    }
+
+    fn insert_newline(&mut self) {
+        let byte_offset = char_to_byte_offset(&self.lines[self.cursor_row], self.cursor_col);
+        let rest = self.lines[self.cursor_row][byte_offset..].to_string();
+        self.lines[self.cursor_row].truncate(byte_offset);
+        self.lines.insert(self.cursor_row + 1, rest);
+        self.cursor_row += 1;
+        self.cursor_col = 0;
     }
 
     fn delete_backward(&mut self) {
         if self.cursor_col > 0 {
-            let line = &self.lines[self.cursor_row];
-            let mut prev_boundary = self.cursor_col - 1;
-            while prev_boundary > 0 && !line.is_char_boundary(prev_boundary) {
-                prev_boundary -= 1;
+            let line = &mut self.lines[self.cursor_row];
+            if let Some((offset, _)) = line.char_indices().nth(self.cursor_col - 1) {
+                line.remove(offset);
+                self.cursor_col -= 1;
             }
-            self.lines[self.cursor_row].remove(prev_boundary);
-            self.cursor_col = prev_boundary;
         } else if self.cursor_row > 0 {
             let current = self.lines.remove(self.cursor_row);
             self.cursor_row -= 1;
-            self.cursor_col = self.lines[self.cursor_row].len();
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
             self.lines[self.cursor_row].push_str(&current);
         }
     }
 
     fn delete_forward(&mut self) {
         let line = &self.lines[self.cursor_row];
-        if self.cursor_col < line.len() {
-            let mut next_boundary = self.cursor_col + 1;
-            while next_boundary < line.len() && !line.is_char_boundary(next_boundary) {
-                next_boundary += 1;
+        let char_count = line.chars().count();
+        if self.cursor_col < char_count {
+            let line = &mut self.lines[self.cursor_row];
+            if let Some((offset, _)) = line.char_indices().nth(self.cursor_col) {
+                line.remove(offset);
             }
-            self.lines[self.cursor_row].remove(self.cursor_col);
         } else if self.cursor_row + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_row + 1);
             self.lines[self.cursor_row].push_str(&next);
@@ -336,26 +370,17 @@ impl Editor {
 
     fn move_left(&mut self) {
         if self.cursor_col > 0 {
-            let line = &self.lines[self.cursor_row];
-            let mut prev_boundary = self.cursor_col - 1;
-            while prev_boundary > 0 && !line.is_char_boundary(prev_boundary) {
-                prev_boundary -= 1;
-            }
-            self.cursor_col = prev_boundary;
+            self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.lines[self.cursor_row].len();
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
         }
     }
 
     fn move_right(&mut self) {
-        let line = &self.lines[self.cursor_row];
-        if self.cursor_col < line.len() {
-            let mut next_boundary = self.cursor_col + 1;
-            while next_boundary < line.len() && !line.is_char_boundary(next_boundary) {
-                next_boundary += 1;
-            }
-            self.cursor_col = next_boundary;
+        let char_count = self.lines[self.cursor_row].chars().count();
+        if self.cursor_col < char_count {
+            self.cursor_col += 1;
         } else if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
             self.cursor_col = 0;
@@ -365,29 +390,143 @@ impl Editor {
     fn move_up(&mut self) {
         if self.cursor_row > 0 {
             self.cursor_row -= 1;
-            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+            let char_count = self.lines[self.cursor_row].chars().count();
+            self.cursor_col = self.cursor_col.min(char_count);
         }
     }
 
     fn move_down(&mut self) {
         if self.cursor_row + 1 < self.lines.len() {
             self.cursor_row += 1;
-            self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].len());
+            let char_count = self.lines[self.cursor_row].chars().count();
+            self.cursor_col = self.cursor_col.min(char_count);
         }
     }
 
-    // ── Visual column helpers (CJK-aware) ──────────────────────────
+    // ── Visual line wrapping ───────────────────────────────────────
 
-    /// Compute the visual column (in terminal cells) for a byte offset in a string.
-    fn visual_col_at(s: &str, byte_offset: usize) -> u16 {
-        let mut col = 0u16;
-        for (i, ch) in s.char_indices() {
-            if i >= byte_offset {
+    /// Compute display rows with visual line wrapping for the given inner width.
+    fn display_rows(&self, inner_width: usize) -> Vec<DisplayRow> {
+        let inner_width = inner_width.max(1);
+        let mut rows = Vec::new();
+        for (logical_line, line) in self.lines.iter().enumerate() {
+            rows.extend(Self::wrap_logical_line(logical_line, line, inner_width));
+        }
+        rows
+    }
+
+    /// Wrap a single logical line into multiple display rows.
+    fn wrap_logical_line(
+        logical_line: usize,
+        line: &str,
+        inner_width: usize,
+    ) -> Vec<DisplayRow> {
+        let mut rows = Vec::new();
+        let mut seg_idx = 0usize;
+        let mut col = 0usize;
+        let char_count = line.chars().count();
+
+        loop {
+            let prefix = if logical_line == 0 && seg_idx == 0 {
+                INPUT_PROMPT_PRIMARY
+            } else {
+                INPUT_PROMPT_CONTINUE
+            };
+            let avail = inner_width.saturating_sub(display_width_str(prefix)).max(1);
+            let mut chunk = String::new();
+            let mut used_width = 0usize;
+            let mut end_col = col;
+
+            for ch in line.chars().skip(col) {
+                let ch_width = ch.width().unwrap_or(0);
+                if !chunk.is_empty() && used_width + ch_width > avail {
+                    break;
+                }
+                if chunk.is_empty() && ch_width > avail {
+                    chunk.push(ch);
+                    end_col += 1;
+                    break;
+                }
+                chunk.push(ch);
+                used_width += ch_width;
+                end_col += 1;
+            }
+
+            rows.push(DisplayRow {
+                prefix,
+                text: chunk,
+                logical_line,
+                start_col: col,
+                end_col,
+            });
+
+            if end_col >= char_count {
                 break;
             }
-            col += ch.width().unwrap_or(0) as u16;
+            col = end_col;
+            seg_idx += 1;
+        }
+
+        if rows.is_empty() {
+            rows.push(DisplayRow {
+                prefix: if logical_line == 0 {
+                    INPUT_PROMPT_PRIMARY
+                } else {
+                    INPUT_PROMPT_CONTINUE
+                },
+                text: String::new(),
+                logical_line,
+                start_col: 0,
+                end_col: 0,
+            });
+        }
+
+        rows
+    }
+
+    /// Compute the visual column (terminal cells) for a char offset within a string.
+    fn screen_col_for_char_offset(text: &str, char_offset: usize) -> usize {
+        let mut col = 0usize;
+        for c in text.chars().take(char_offset) {
+            col += c.width().unwrap_or(0);
         }
         col
+    }
+
+    /// Compute the cursor's screen position (row, col) accounting for wrapping.
+    fn cursor_screen_position(&self, inner_width: usize) -> (usize, usize) {
+        let display_rows = self.display_rows(inner_width);
+        for (screen_row, row) in display_rows.iter().enumerate() {
+            if row.logical_line != self.cursor_row {
+                continue;
+            }
+            let char_count = self.lines[self.cursor_row].chars().count();
+            let contains = if row.end_col >= char_count {
+                self.cursor_col >= row.start_col && self.cursor_col <= row.end_col
+            } else {
+                self.cursor_col >= row.start_col && self.cursor_col < row.end_col
+            };
+            if contains {
+                let offset_in_chunk = self.cursor_col.saturating_sub(row.start_col);
+                let col = display_width_str(row.prefix)
+                    + Self::screen_col_for_char_offset(&row.text, offset_in_chunk);
+                return (screen_row, col);
+            }
+        }
+        (
+            display_rows.len().saturating_sub(1),
+            display_width_str(INPUT_PROMPT_PRIMARY),
+        )
+    }
+
+    /// Compute the total height needed for the input widget.
+    pub fn input_height(&self, width: u16) -> u16 {
+        let inner_width = width.saturating_sub(2).max(1) as usize;
+        let rows = self
+            .display_rows(inner_width)
+            .len()
+            .clamp(1, MAX_INPUT_BODY_LINES);
+        rows as u16 + 2 // +2 for top and bottom borders
     }
 
     // ── Rendering ──────────────────────────────────────────────────
@@ -395,10 +534,14 @@ impl Editor {
     /// Render the editor widget.
     pub fn render(&self, f: &mut Frame, area: Rect) {
         // Reserve space for the popup above
-        let popup_height = self.slash_popup.as_ref().map(|p| {
-            let visible_items = p.items.len().min(6);
-            (visible_items as u16) + 2 // +2 for border
-        }).unwrap_or(0);
+        let popup_height = self
+            .slash_popup
+            .as_ref()
+            .map(|p| {
+                let visible_items = p.items.len().min(6);
+                (visible_items as u16) + 2 // +2 for border
+            })
+            .unwrap_or(0);
 
         let editor_area = Rect {
             x: area.x,
@@ -423,36 +566,39 @@ impl Editor {
             .borders(Borders::ALL)
             .border_style(border_style);
 
-        // Build display lines with a minimal dot prefix (no "You" label)
-        let display_lines: Vec<Line> = self
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                if i == 0 {
-                    Line::from(vec![
-                        Span::styled(" ● ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(line.as_str()),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::styled("   ", Style::default()),
-                        Span::raw(line.as_str()),
-                    ])
-                }
+        let inner_width = editor_area.width.saturating_sub(2) as usize;
+        if inner_width == 0 {
+            f.render_widget(block, editor_area);
+            return;
+        }
+
+        // Build display lines with visual wrapping
+        let prompt_style = Style::default().fg(Color::DarkGray);
+        let input_style = Style::default().fg(Color::White);
+        let wrapped_lines: Vec<Line> = self
+            .display_rows(inner_width)
+            .into_iter()
+            .map(|row| {
+                Line::from(vec![
+                    Span::styled(row.prefix, prompt_style),
+                    Span::styled(row.text, input_style),
+                ])
             })
             .collect();
 
-        let paragraph = Paragraph::new(display_lines).block(block);
+        let paragraph = Paragraph::new(wrapped_lines).block(block);
         f.render_widget(paragraph, editor_area);
 
-        // Position cursor (CJK-aware)
+        // Position cursor (CJK-aware, wrapping-aware)
+        // Block with Borders::ALL: content starts at (x+1, y+1)
         if self.focused {
-            let prompt_width = 3u16; // " ● " = 3 cells
-            let text_before = &self.lines[self.cursor_row][..self.cursor_col];
-            let cursor_x = editor_area.x + prompt_width + Self::visual_col_at(text_before, self.cursor_col);
-            let cursor_y = editor_area.y + 1 + self.cursor_row as u16; // +1 for top border
-            f.set_cursor_position((cursor_x, cursor_y));
+            let (cursor_row, cursor_col) = self.cursor_screen_position(inner_width);
+            let max_row = editor_area.height.saturating_sub(2);
+            let max_col = editor_area.width.saturating_sub(3);
+            f.set_cursor_position((
+                editor_area.x + 1 + (cursor_col as u16).min(max_col),
+                editor_area.y + 1 + (cursor_row as u16).min(max_row),
+            ));
         }
     }
 
@@ -487,11 +633,7 @@ impl Editor {
             } else {
                 Style::default().fg(Color::White)
             };
-            let desc_style = if is_selected {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            let desc_style = Style::default().fg(Color::DarkGray);
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
                 Span::styled(&cmd.name[1..], style), // without '/'
@@ -510,4 +652,17 @@ pub enum EditorAction {
     None,
     Submit,
     Quit,
+}
+
+/// Compute the display width of a string in terminal cells.
+fn display_width_str(text: &str) -> usize {
+    text.chars().map(|ch| ch.width().unwrap_or(0)).sum()
+}
+
+/// Convert character index to byte offset within a string.
+fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }

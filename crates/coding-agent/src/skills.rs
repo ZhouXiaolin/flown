@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::core::mcp::McpManager;
-
 const MAX_NAME_LENGTH: usize = 64;
 const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
@@ -14,16 +12,6 @@ pub struct Skill {
     pub content: String,
     pub file_path: String,
     pub disable_model_invocation: Option<bool>,
-}
-
-/// MCP tool info for system prompt formatting.
-#[derive(Debug, Clone)]
-pub struct McpToolInfo {
-    pub server: String,
-    pub tool: String,
-    pub description: String,
-    /// JSON schema for tool parameters.
-    pub params_schema: String,
 }
 
 /// Load skills from directories
@@ -131,76 +119,33 @@ async fn load_skill_from_file(path: &std::path::Path) -> Result<Option<Skill>, S
 }
 
 /// Format skills for system prompt
-pub fn format_skills_for_system_prompt(skills: &[Skill], mcp_tools: &[McpToolInfo]) -> String {
+pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
     let visible: Vec<&Skill> = skills
         .iter()
         .filter(|s| s.disable_model_invocation != Some(true))
         .collect();
 
-    if visible.is_empty() && mcp_tools.is_empty() {
+    if visible.is_empty() {
         return String::new();
     }
 
     let mut output = Vec::new();
 
-    // Regular skills section
-    if !visible.is_empty() {
-        output.push("The following skills provide specialized instructions for specific tasks.".to_string());
-        output.push("Read the full skill file when the task matches its description.".to_string());
-        output.push("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string());
-        output.push(String::new());
-        output.push("<available_skills>".to_string());
-        for skill in &visible {
-            output.push("  <skill>".to_string());
-            output.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-            output.push(format!("    <description>{}</description>", escape_xml(&skill.description)));
-            output.push(format!("    <location>{}</location>", escape_xml(&skill.file_path)));
-            output.push("  </skill>".to_string());
-        }
-        output.push("</available_skills>".to_string());
+    output.push("The following skills provide specialized instructions for specific tasks.".to_string());
+    output.push("Read the full skill file when the task matches its description.".to_string());
+    output.push("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string());
+    output.push(String::new());
+    output.push("<available_skills>".to_string());
+    for skill in &visible {
+        output.push("  <skill>".to_string());
+        output.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
+        output.push(format!("    <description>{}</description>", escape_xml(&skill.description)));
+        output.push(format!("    <location>{}</location>", escape_xml(&skill.file_path)));
+        output.push("  </skill>".to_string());
     }
-
-    // MCP tools section
-    if !mcp_tools.is_empty() {
-        if !visible.is_empty() {
-            output.push(String::new());
-        }
-        output.push("MCP tools are invoked via the bash tool using `flown mcp call`:".to_string());
-        output.push("  bash: flown mcp call <server> <tool> --args '{\"key\": \"value\"}'".to_string());
-        output.push(String::new());
-        output.push(format_mcp_section(mcp_tools));
-    }
+    output.push("</available_skills>".to_string());
 
     output.join("\n")
-}
-
-/// Format MCP tools grouped by server into <available_mcps> section.
-fn format_mcp_section(tools: &[McpToolInfo]) -> String {
-    // Group by server
-    let mut servers: std::collections::BTreeMap<String, Vec<&McpToolInfo>> = std::collections::BTreeMap::new();
-    for tool in tools {
-        servers.entry(tool.server.clone()).or_default().push(tool);
-    }
-
-    let mut lines = vec!["<available_mcps>".to_string()];
-
-    for (server, tools) in &servers {
-        lines.push(format!("  <mcp server=\"{}\">", escape_xml(server)));
-        for tool in tools {
-            let xml_params = json_schema_to_xml_params(&tool.params_schema);
-            lines.push(format!("    <tool name=\"{}\" description=\"{}\">", escape_xml(&tool.tool), escape_xml(&tool.description)));
-            lines.push("      <params>".to_string());
-            for param_line in xml_params.lines() {
-                lines.push(format!("        {}", param_line));
-            }
-            lines.push("      </params>".to_string());
-            lines.push("    </tool>".to_string());
-        }
-        lines.push("  </mcp>".to_string());
-    }
-
-    lines.push("</available_mcps>".to_string());
-    lines.join("\n")
 }
 
 /// Format a skill invocation
@@ -329,157 +274,4 @@ fn escape_xml(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-/// Escape only XML-sensitive characters, preserve quotes (for JSON content).
-fn escape_xml_minimal(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Indent each line of XML by the given amount.
-fn indent_xml(xml: &str, spaces: usize) -> String {
-    let prefix = " ".repeat(spaces);
-    xml.lines()
-        .map(|line| format!("{prefix}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Convert a JSON schema object to XML param tags.
-fn json_schema_to_xml_params(schema: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(schema) else {
-        return schema.to_string();
-    };
-
-    let Some(properties) = value.get("properties").and_then(|v| v.as_object()) else {
-        return schema.to_string();
-    };
-
-    let required: Vec<&str> = value
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    let mut lines = Vec::new();
-    for (name, prop) in properties {
-        let typ = prop.get("type").and_then(|v| v.as_str()).unwrap_or("any");
-        let desc = prop.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let default = prop.get("default").and_then(|v| {
-            if v.is_string() {
-                Some(v.as_str()?.to_string())
-            } else {
-                Some(v.to_string())
-            }
-        });
-
-        let is_required = required.contains(&name.as_str());
-
-        let mut attrs = format!("name=\"{}\" type=\"{}\"", escape_xml(name), typ);
-        if is_required {
-            attrs.push_str(" required=\"true\"");
-        }
-        if let Some(def) = default {
-            attrs.push_str(&format!(" default=\"{}\"", escape_xml(&def)));
-        }
-
-        if desc.is_empty() {
-            lines.push(format!("  <param {attrs} />"));
-        } else {
-            lines.push(format!("  <param {attrs}>{}</param>", escape_xml(desc)));
-        }
-    }
-
-    lines.join("\n")
-}
-
-/// Generate MCP tool info for system prompt formatting.
-pub fn mcp_tool_infos(manager: &McpManager) -> Vec<McpToolInfo> {
-    let mut tools: Vec<McpToolInfo> = manager
-        .tool_infos()
-        .into_iter()
-        .filter_map(|tool| {
-            let source = tool.source.as_deref()?;
-            let server = source.strip_prefix("mcp:")?.to_string();
-
-            // Extract actual tool name from mcp__server__tool
-            let tool_name = tool.name
-                .strip_prefix("mcp__")
-                .and_then(|s| s.split_once("__"))
-                .map(|(_, name)| name.to_string())
-                .unwrap_or_else(|| tool.name.clone());
-
-            let params_schema = serde_json::to_string_pretty(&tool.input_schema)
-                .unwrap_or_else(|_| tool.input_schema.to_string());
-
-            Some(McpToolInfo {
-                server,
-                tool: tool_name,
-                description: tool.description.clone(),
-                params_schema,
-            })
-        })
-        .collect();
-
-    tools.sort_by(|a, b| a.server.cmp(&b.server).then(a.tool.cmp(&b.tool)));
-    tools
-}
-
-struct ConfiguredMcpServer {
-    name: String,
-    command: String,
-    args: Vec<String>,
-}
-
-impl ConfiguredMcpServer {
-    fn skill_description(&self) -> String {
-        format!("Use MCP server `{}`.", self.name)
-    }
-}
-
-fn configured_mcp_servers(manager: &McpManager) -> Vec<ConfiguredMcpServer> {
-    manager
-        .configs()
-        .iter()
-        .map(|(name, config)| ConfiguredMcpServer {
-            name: name.clone(),
-            command: config.command.clone(),
-            args: config.args.clone(),
-        })
-        .collect()
-}
-
-fn mcp_skill_name(server_name: &str, full_tool_name: Option<&str>) -> String {
-    let mut name = format!("mcp_{}", sanitize_skill_segment(server_name));
-    if let Some(full_tool_name) = full_tool_name {
-        let tool_name = full_tool_name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once("__").map(|(_, tool)| tool))
-            .unwrap_or(full_tool_name);
-        name.push('_');
-        name.push_str(&sanitize_skill_segment(tool_name));
-    }
-    name
-}
-
-fn sanitize_skill_segment(value: &str) -> String {
-    let mut result = String::new();
-    let mut last_was_separator = false;
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            result.push(ch.to_ascii_lowercase());
-            last_was_separator = false;
-        } else if !last_was_separator {
-            result.push('_');
-            last_was_separator = true;
-        }
-    }
-    let result = result.trim_matches('_').to_string();
-    if result.is_empty() {
-        "unnamed".to_string()
-    } else {
-        result
-    }
 }

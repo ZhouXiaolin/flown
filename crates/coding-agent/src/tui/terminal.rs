@@ -1,6 +1,8 @@
 use std::io::{self, Stdout};
 
-use crossterm::event::{self, Event, KeyEvent, MouseEvent};
+use crossterm::event::{
+    self, Event, KeyboardEnhancementFlags, KeyEvent, MouseEvent,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +25,10 @@ impl TerminalSession {
         execute!(
             stdout,
             EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
+            crossterm::event::EnableMouseCapture,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
         )?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
@@ -35,6 +40,7 @@ impl TerminalSession {
         disable_raw_mode()?;
         execute!(
             self.terminal.backend_mut(),
+            crossterm::event::PopKeyboardEnhancementFlags,
             crossterm::event::DisableMouseCapture,
             LeaveAlternateScreen
         )?;
@@ -46,7 +52,11 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen
+        );
     }
 }
 

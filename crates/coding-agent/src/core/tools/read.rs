@@ -5,13 +5,9 @@ use flown_agent::types::{AgentTool, AgentToolError, AgentToolResult, ToolExecuti
 use flown_ai::types::{ImageContent, ToolResultContent};
 use serde_json::{Value, json};
 
-use crate::core::mcp::McpManager;
 use super::common::*;
 
-pub fn tool(
-    env: Arc<dyn ExecutionEnv>,
-    mcp: Option<Arc<tokio::sync::Mutex<McpManager>>>,
-) -> AgentTool {
+pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool {
         name: "read".to_string(),
         label: "Read".to_string(),
@@ -27,14 +23,8 @@ pub fn tool(
         }),
         execute: Arc::new(move |_id, args, _abort, _update| {
             let env = env.clone();
-            let mcp = mcp.clone();
             Box::pin(async move {
                 let path = required_string(&args, "path")?;
-
-                // Intercept mcp:// protocol — return tool info
-                if let Some(result) = try_get_mcp_info(&path, &mcp).await {
-                    return result;
-                }
 
                 let resolved_path = env.absolute_path(&path).map_err(tool_error)?;
                 let offset = optional_usize(&args, "offset")?;
@@ -67,50 +57,6 @@ pub fn tool(
         prepare_arguments: None,
         execution_mode: Some(ToolExecutionMode::Parallel),
     }
-}
-
-/// Try to get MCP tool info for `mcp://server/tool` paths.
-async fn try_get_mcp_info(
-    path: &str,
-    mcp: &Option<Arc<tokio::sync::Mutex<McpManager>>>,
-) -> Option<Result<AgentToolResult, AgentToolError>> {
-    let mcp = mcp.as_ref()?;
-    let (server, tool_name) = parse_mcp_uri(path)?;
-
-    let manager = mcp.lock().await;
-    let tool_infos = manager.tool_infos();
-    let tool = tool_infos.iter().find(|t| {
-        t.source.as_deref() == Some(&format!("mcp:{server}")) && t.name == format!("mcp__{server}__{tool_name}")
-    })?;
-
-    let parameters = serde_json::to_string_pretty(&tool.input_schema)
-        .unwrap_or_else(|_| tool.input_schema.to_string());
-
-    let info = format!(
-        "MCP Tool: {}\nServer: {}\nDescription: {}\n\nParameters:\n```json\n{}\n```\n\nTo invoke, run:\n```bash\nflown mcp call {server} {tool_name} --args '{{\"key\": \"value\"}}'\n```",
-        tool.name,
-        server,
-        tool.description,
-        parameters,
-    );
-
-    Some(Ok(AgentToolResult {
-        content: vec![text_block(info)],
-        details: json!({ "path": path }),
-        terminate: None,
-    }))
-}
-
-/// Parse `mcp://server/tool` into (server, tool).
-fn parse_mcp_uri(uri: &str) -> Option<(String, String)> {
-    let rest = uri.strip_prefix("mcp://")?;
-    let (server, tool) = rest.split_once('/')?;
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    // Strip query string if present
-    let tool = tool.split('?').next().unwrap_or(tool);
-    Some((server.to_string(), tool.to_string()))
 }
 
 #[derive(Debug)]

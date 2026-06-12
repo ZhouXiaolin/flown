@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::core::mcp::McpManager;
 use crate::skills::Skill;
 
 pub const DEFAULT_SYSTEM_PROMPT_SENTINEL: &str = "You are Flown coding agent.";
@@ -37,7 +35,6 @@ pub struct BuildSystemPromptOptions {
     pub cwd: String,
     pub context_files: Vec<ProjectContextFile>,
     pub skills: Vec<Skill>,
-    pub mcp_manager: Option<Arc<tokio::sync::Mutex<McpManager>>>,
 }
 
 impl Default for BuildSystemPromptOptions {
@@ -53,7 +50,6 @@ impl Default for BuildSystemPromptOptions {
                 .unwrap_or_else(|_| ".".to_string()),
             context_files: Vec::new(),
             skills: Vec::new(),
-            mcp_manager: None,
         }
     }
 }
@@ -68,14 +64,6 @@ pub async fn build_system_prompt(options: BuildSystemPromptOptions) -> String {
         .map(|text| format!("\n\n{text}"))
         .unwrap_or_default();
 
-    // Get MCP tool infos
-    let mcp_tools = if let Some(mcp_manager) = &options.mcp_manager {
-        let manager = mcp_manager.lock().await;
-        crate::skills::mcp_tool_infos(&manager)
-    } else {
-        Vec::new()
-    };
-
     let skills = &options.skills;
 
     let prompt = if let Some(custom_prompt) = options.custom_prompt {
@@ -83,8 +71,8 @@ pub async fn build_system_prompt(options: BuildSystemPromptOptions) -> String {
         prompt.push_str(&append_section);
         append_project_context(&mut prompt, &options.context_files);
 
-        if !skills.is_empty() || !mcp_tools.is_empty() {
-            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills, &mcp_tools));
+        if !skills.is_empty() {
+            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);
@@ -106,8 +94,8 @@ Project context may provide additional instructions below.",
         prompt.push_str(&append_section);
         append_project_context(&mut prompt, &options.context_files);
 
-        if !skills.is_empty() || !mcp_tools.is_empty() {
-            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills, &mcp_tools));
+        if !skills.is_empty() {
+            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);

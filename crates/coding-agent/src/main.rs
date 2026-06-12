@@ -147,7 +147,6 @@ async fn build_agent(model_str: &str, api_key: Option<String>) -> anyhow::Result
         cwd,
         context_files,
         skills,
-        mcp_manager: mcp_manager.clone(),
         ..Default::default()
     }).await;
 
@@ -234,18 +233,15 @@ async fn run_tui(
 
     let mut terminal_session = TerminalSession::enter()?;
 
-    let mut status_line = tui::status_line::StatusLine {
-        model: model_str.clone(),
-        provider: provider_name.clone(),
-        cwd: std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "?".into()),
-        git_branch: detect_git_branch(),
-        git_dirty: false,
-        context_pct: 0.0,
-        context_total: "200k".into(),
-        session_name: None,
-    };
+    let mut status_line = tui::status_line::StatusLine::new();
+    status_line.model = model_str.clone();
+    status_line.provider = provider_name.clone();
+    status_line.thinking_level = "off".into();
+    status_line.cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    status_line.git_branch = detect_git_branch();
+    status_line.context_total = "200k".into();
 
     let welcome = tui::welcome::Welcome {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -359,6 +355,12 @@ async fn run_tui(
             }
         }
 
+        // Update status line state
+        status_line.busy = agent_busy;
+        if agent_busy {
+            status_line.tick();
+        }
+
         // Render
         terminal_session.terminal.draw(|f| {
             if show_welcome {
@@ -367,6 +369,10 @@ async fn run_tui(
                 tui::layout::render_layout(f, &mut transcript, &status_line, &editor, agent_busy);
             }
         })?;
+        // Show cursor at the position set by editor
+        if !show_welcome {
+            terminal_session.terminal.show_cursor()?;
+        }
 
         let timeout = if agent_busy { 16 } else { 50 };
         let event = poll_event(timeout);
