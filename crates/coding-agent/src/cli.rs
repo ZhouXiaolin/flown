@@ -266,7 +266,7 @@ pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Conf
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".".to_string());
 
-    let context_files = crate::system_prompt::load_project_context_files(&cwd);
+    let context_files = crate::core::system_prompt::load_project_context_files(&cwd);
 
     // Load skills from ~/.flown/skills and .claude/skills
     let skills_dir = dirs::home_dir()
@@ -276,7 +276,7 @@ pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Conf
 
     let local_skills_dir = ".claude/skills";
 
-    let skills = match crate::skills::load_skills(&[&skills_dir, local_skills_dir]).await {
+    let skills = match crate::core::skills::load_skills(&[&skills_dir, local_skills_dir]).await {
         Ok(skills) => skills,
         Err(_) => Vec::new(),
     };
@@ -291,7 +291,7 @@ pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Conf
             None
         };
 
-    let system_prompt = crate::system_prompt::build_system_prompt(crate::system_prompt::BuildSystemPromptOptions {
+    let system_prompt = crate::core::system_prompt::build_system_prompt(crate::core::system_prompt::BuildSystemPromptOptions {
         cwd,
         context_files,
         skills,

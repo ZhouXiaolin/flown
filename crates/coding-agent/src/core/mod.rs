@@ -4,3 +4,5 @@ pub mod session_manager;
 pub mod tools;
 pub mod types;
 pub mod workflow;
+pub mod skills;
+pub mod system_prompt;

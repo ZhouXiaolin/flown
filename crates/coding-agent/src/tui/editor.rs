@@ -554,8 +554,8 @@ impl Editor {
             .unwrap_or(0)
     }
 
-    /// Render the editor widget.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    /// Render the editor widget to a ratatui `Frame`.
+    pub fn render_frame(&self, f: &mut Frame, area: Rect) {
         let popup_height = self.slash_popup_height();
 
         // Popup area is at the top of the given area

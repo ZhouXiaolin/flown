@@ -1,8 +1,12 @@
 use std::time::Instant;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+
+use super::component::Component;
 
 /// Animated snake spinner frames for busy state
 const BUSY_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
@@ -61,9 +65,8 @@ impl StatusLine {
         }
     }
 
-    /// Render the status line as the top border of the editor.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
-        let width = area.width as usize;
+    /// Build the status line as a single `Line`.
+    fn build_line(&self, width: usize) -> Line<'static> {
         let mut spans = Vec::new();
 
         // Separator style: " · " (dot separator like oh-my-pi)
@@ -101,7 +104,6 @@ impl StatusLine {
                 model_text,
                 Style::default().fg(Color::White),
             ));
-            // Thinking level (always show)
             if !self.thinking_level.is_empty() {
                 spans.push(Span::styled(sep, sep_style));
                 let thinking_color = if self.thinking_level == "off" {
@@ -154,21 +156,22 @@ impl StatusLine {
         let ctx_text = format!("{:.0}%", self.context_pct * 100.0);
         spans.push(Span::styled(ctx_text, Style::default().fg(ctx_color)));
 
-        // Cache read/write indicators
         if self.cache_read > 0 || self.cache_write > 0 {
             spans.push(Span::styled(
-                format!(" (↓{}/↑{})", format_tokens(self.cache_read), format_tokens(self.cache_write)),
+                format!(
+                    " (↓{}/↑{})",
+                    format_tokens(self.cache_read),
+                    format_tokens(self.cache_write)
+                ),
                 Style::default().fg(Color::Rgb(80, 80, 90)),
             ));
         }
 
         // ── Fill and right segments ────────────────────────────────
 
-        // Calculate left content width
         let left_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         let left_width = unicode_width::UnicodeWidthStr::width(left_text.as_str());
 
-        // Fill with horizontal line
         let fill_width = width.saturating_sub(left_width + 2);
         if fill_width > 0 {
             spans.push(Span::styled(
@@ -177,7 +180,6 @@ impl StatusLine {
             ));
         }
 
-        // Right segment: session name
         if let Some(name) = &self.session_name {
             spans.push(Span::styled(
                 format!(" {} ", name),
@@ -187,9 +189,19 @@ impl StatusLine {
             ));
         }
 
-        let line = Line::from(spans);
-        let paragraph = ratatui::widgets::Paragraph::new(line);
-        f.render_widget(paragraph, area);
+        Line::from(spans)
+    }
+
+    /// Render the status line to a ratatui `Frame`.
+    pub fn render_frame(&self, f: &mut Frame, area: Rect) {
+        let line = self.build_line(area.width as usize);
+        f.render_widget(Paragraph::new(line), area);
+    }
+}
+
+impl Component for StatusLine {
+    fn render(&mut self, width: u16) -> Vec<Line<'static>> {
+        vec![self.build_line(width as usize)]
     }
 }
 

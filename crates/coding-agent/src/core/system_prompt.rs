@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::skills::Skill;
+use crate::core::skills::Skill;
 
 pub const DEFAULT_SYSTEM_PROMPT_SENTINEL: &str = "You are Flown coding agent.";
 
@@ -72,7 +72,7 @@ pub async fn build_system_prompt(options: BuildSystemPromptOptions) -> String {
         append_project_context(&mut prompt, &options.context_files);
 
         if !skills.is_empty() {
-            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills));
+            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(skills));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);
@@ -95,7 +95,7 @@ Project context may provide additional instructions below.",
         append_project_context(&mut prompt, &options.context_files);
 
         if !skills.is_empty() {
-            prompt.push_str(&crate::skills::format_skills_for_system_prompt(skills));
+            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(skills));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);

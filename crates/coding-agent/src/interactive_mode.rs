@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
 use futures::stream::StreamExt;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc;
 
 use crate::cli;
 use crate::config::Config;
-use crate::tui::transcript::{MessageKind, TranscriptEntry};
+use crate::tui::transcript::Transcript;
+use crate::tui::component::Component;
+use crate::tui::editor::EditorAction;
+use crate::tui::terminal::{poll_event, InputEvent, TerminalSession};
 
 pub async fn run_tui(
     config: Config,
@@ -15,8 +20,6 @@ pub async fn run_tui(
     initial_prompt: Option<String>,
 ) -> anyhow::Result<()> {
     use crossterm::event::{KeyCode, KeyModifiers};
-    use crate::tui::editor::EditorAction;
-    use crate::tui::terminal::{poll_event, InputEvent, TerminalSession};
 
     // Build the real agent
     let agent = match cli::build_agent(&model_str, api_key.clone(), &config).await {
@@ -37,21 +40,6 @@ pub async fn run_tui(
 
     let mut session_mgr = crate::core::session_manager::SessionManager::new(fs, &sessions_root);
 
-    // Load recent sessions for the welcome page
-    let recent_sessions: Vec<crate::tui::welcome::RecentSession> = match session_mgr.list_sessions().await {
-        Ok(metas) => metas
-            .into_iter()
-            .take(5)
-            .map(|m| crate::tui::welcome::RecentSession {
-                id: m.base.id.clone(),
-                name: None,
-                created_at: m.base.created_at.clone(),
-                path: m.path.clone(),
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
     let mut terminal_session = TerminalSession::enter()?;
 
     let mut status_line = crate::tui::status_line::StatusLine::new();
@@ -64,16 +52,9 @@ pub async fn run_tui(
     status_line.git_branch = cli::detect_git_branch();
     status_line.context_total = "200k".into();
 
-    let welcome = crate::tui::welcome::Welcome {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        model: model_str.clone(),
-        provider: provider_name.clone(),
-        recent_sessions,
-    };
-
-    let mut transcript = crate::tui::transcript::Transcript::new();
+    let mut transcript = Transcript::new();
     let mut editor = crate::tui::editor::Editor::new();
-    let mut show_welcome = true;
+    let mut hint_bar = crate::tui::hint_bar::HintBar::new();
 
     let (event_tx, mut event_rx) = mpsc::channel::<flown_agent::AgentEvent>(256);
     let mut agent_busy = false;
@@ -83,8 +64,7 @@ pub async fn run_tui(
 
     // Handle initial prompt (from CLI args)
     if let Some(ref prompt) = initial_prompt {
-        show_welcome = false;
-        transcript.push(TranscriptEntry::user(prompt));
+        transcript.push_user(prompt);
         if let Err(_) = session_mgr.append_user_message(prompt).await {}
         if let Some(ref agent) = agent {
             agent_busy = true;
@@ -113,18 +93,12 @@ pub async fn run_tui(
                 } => match assistant_message_event {
                     AssistantMessageEvent::TextDelta { delta, .. } => {
                         if in_thinking {
-                            transcript.push(TranscriptEntry::thinking(&accumulated_text));
+                            transcript.push_thinking(&accumulated_text);
                             accumulated_text.clear();
                             in_thinking = false;
                         }
-                        if let Some(last) = transcript.last_mut() {
-                            if last.kind == MessageKind::Assistant {
-                                last.body.push_str(&delta);
-                            } else {
-                                transcript.push(TranscriptEntry::assistant(&delta));
-                            }
-                        } else {
-                            transcript.push(TranscriptEntry::assistant(&delta));
+                        if !transcript.append_to_assistant(&delta) {
+                            transcript.push_assistant(&delta);
                         }
                         transcript.scroll_to_bottom();
                         accumulated_text.push_str(&delta);
@@ -137,7 +111,7 @@ pub async fn run_tui(
                         accumulated_text.push_str(&delta);
                     }
                     AssistantMessageEvent::ThinkingEnd { .. } => {
-                        transcript.push(TranscriptEntry::thinking(&accumulated_text));
+                        transcript.push_thinking(&accumulated_text);
                         accumulated_text.clear();
                         in_thinking = false;
                     }
@@ -206,7 +180,7 @@ pub async fn run_tui(
                             } else {
                                 format!("Error {}: {output}", result.tool_name)
                             };
-                            transcript.push(TranscriptEntry::error(msg));
+                            transcript.push_error(msg);
                         }
                     }
                     _ => {}
@@ -216,7 +190,7 @@ pub async fn run_tui(
                     tool_name, args, ..
                 } => {
                     let formatted = format_tool_call(&tool_name, &args);
-                    transcript.push(TranscriptEntry::tool(&formatted));
+                    transcript.push_tool(&formatted);
                 }
 
                 AgentEvent::ToolExecutionEnd {
@@ -241,7 +215,7 @@ pub async fn run_tui(
                         } else {
                             format!("Error {tool_name}: {output}")
                         };
-                        transcript.push(TranscriptEntry::error(msg));
+                        transcript.push_error(msg);
                     }
                 }
 
@@ -271,18 +245,34 @@ pub async fn run_tui(
             status_line.tick();
         }
 
-        // Render
+        // ── Render ────────────────────────────────────────────────────
         terminal_session.terminal.draw(|f| {
-            if show_welcome {
-                welcome.render(f, f.area());
-            } else {
-                crate::tui::layout::render_layout(f, &mut transcript, &status_line, &editor, agent_busy);
-            }
-        })?;
-        if !show_welcome {
-            terminal_session.terminal.show_cursor()?;
-        }
+            let area = f.area();
+            let editor_height = editor.input_height(area.width).max(3);
 
+            // [transcript (fill)]
+            // [status line (1 row)]
+            // [editor (dynamic height)]
+            // [hint bar (1 row)]
+            let chunks = Layout::vertical([
+                Constraint::Min(10),
+                Constraint::Length(1),
+                Constraint::Length(editor_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+            transcript.render_frame(f, chunks[0]);
+            status_line.render_frame(f, chunks[1]);
+            editor.render_frame(f, chunks[2]);
+
+            hint_bar.busy = agent_busy;
+            let hint_lines = hint_bar.render(chunks[3].width);
+            f.render_widget(Paragraph::new(hint_lines), chunks[3]);
+        })?;
+        terminal_session.terminal.show_cursor()?;
+
+        // ── Input ─────────────────────────────────────────────────────
         let timeout = if agent_busy { 16 } else { 50 };
         let event = poll_event(timeout);
 
@@ -290,9 +280,7 @@ pub async fn run_tui(
             InputEvent::Key(key) => {
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => {
-                        if show_welcome {
-                            show_welcome = false;
-                        } else if agent_busy {
+                        if agent_busy {
                             agent_busy = false;
                         } else {
                             break;
@@ -302,62 +290,53 @@ pub async fn run_tui(
                     _ => {}
                 }
 
-                if !show_welcome {
-                    let slash_action = editor.handle_key(key);
-                    match slash_action {
-                        EditorAction::Submit => {
-                            let text = editor.text().trim().to_string();
-                            if !text.is_empty() {
-                                editor.clear();
-                                show_welcome = false;
+                let slash_action = editor.handle_key(key);
+                match slash_action {
+                    EditorAction::Submit => {
+                        let text = editor.text().trim().to_string();
+                        if !text.is_empty() {
+                            editor.clear();
 
-                                if text.starts_with('/') {
-                                    if handle_slash_command(&text, &mut transcript) {
-                                        break;
-                                    }
+                            if text.starts_with('/') {
+                                if handle_slash_command(&text, &mut transcript) {
+                                    break;
+                                }
+                            } else {
+                                transcript.push_user(&text);
+                                if let Err(_) = session_mgr.append_user_message(&text).await {}
+                                if let Some(sid) = session_mgr.current_session_id() {
+                                    status_line.session_name = Some(sid[..8].to_string());
+                                }
+                                if let Some(ref agent) = agent {
+                                    agent_busy = true;
+                                    let agent = agent.clone();
+                                    let tx = event_tx.clone();
+                                    accumulated_text.clear();
+                                    in_thinking = false;
+                                    let handle = tokio::spawn(async move {
+                                        forward_agent_stream(agent, text, tx).await;
+                                    });
+                                    agent_handle = Some(handle);
                                 } else {
-                                    transcript.push(TranscriptEntry::user(&text));
-                                    if let Err(_) = session_mgr.append_user_message(&text).await {}
-                                    if let Some(sid) = session_mgr.current_session_id() {
-                                        status_line.session_name = Some(sid[..8].to_string());
-                                    }
-                                    if let Some(ref agent) = agent {
-                                        agent_busy = true;
-                                        let agent = agent.clone();
-                                        let tx = event_tx.clone();
-                                        accumulated_text.clear();
-                                        in_thinking = false;
-                                        let handle = tokio::spawn(async move {
-                                            forward_agent_stream(agent, text, tx).await;
-                                        });
-                                        agent_handle = Some(handle);
-                                    } else {
-                                        transcript.push(TranscriptEntry::error(
-                                            "No LLM agent available. Check your config.",
-                                        ));
-                                    }
+                                    transcript.push_error(
+                                        "No LLM agent available. Check your config.",
+                                    );
                                 }
                             }
                         }
-                        EditorAction::Quit => break,
-                        EditorAction::None => {}
                     }
-                } else {
-                    show_welcome = false;
+                    EditorAction::Quit => break,
+                    EditorAction::None => {}
                 }
             }
             InputEvent::Mouse(mouse) => {
                 use crossterm::event::MouseEventKind;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        if !show_welcome {
-                            transcript.scroll_up(3);
-                        }
+                        transcript.scroll_up(3);
                     }
                     MouseEventKind::ScrollDown => {
-                        if !show_welcome {
-                            transcript.scroll_down(3);
-                        }
+                        transcript.scroll_down(3);
                     }
                     _ => {}
                 }
@@ -387,16 +366,16 @@ async fn forward_agent_stream(
 }
 
 /// Handle slash commands locally. Returns `true` if the user wants to quit.
-fn handle_slash_command(text: &str, transcript: &mut crate::tui::transcript::Transcript) -> bool {
+fn handle_slash_command(text: &str, transcript: &mut Transcript) -> bool {
     let parts: Vec<&str> = text.splitn(2, ' ').collect();
     let cmd = parts[0];
     let _args = parts.get(1).copied().unwrap_or("");
 
     match cmd {
         "/help" | "/h" | "/?" => {
-            transcript.push(TranscriptEntry::system(
+            transcript.push_system(
                 "Available commands:\n  /help          Show this help\n  /clear         Clear transcript\n  /model <name>  Switch model\n  /compact       Compact conversation\n  /quit          Exit",
-            ));
+            );
         }
         "/clear" | "/cls" => {
             transcript.clear();
@@ -405,9 +384,9 @@ fn handle_slash_command(text: &str, transcript: &mut crate::tui::transcript::Tra
             return true;
         }
         _ => {
-            transcript.push(TranscriptEntry::error(
+            transcript.push_error(
                 format!("Unknown command: {cmd}. Type /help for available commands.")
-            ));
+            );
         }
     }
     false
@@ -417,7 +396,7 @@ fn handle_slash_command(text: &str, transcript: &mut crate::tui::transcript::Tra
 
 const MAX_TOOL_DISPLAY_LINES: usize = 100;
 
-/// Format a tool call for display, aligned with ~/Projects/flown style.
+/// Format a tool call for display.
 fn format_tool_call(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read" => {

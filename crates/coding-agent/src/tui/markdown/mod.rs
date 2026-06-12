@@ -17,8 +17,6 @@ pub(crate) mod width;
 mod wrapping;
 
 use tables::{TableBuf, handle_table_event, start_table};
-pub(crate) use width::line_plain_text;
-
 use crate::tui::theme::MarkdownTheme;
 use pulldown_cmark::{
     BlockQuoteKind, CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd,

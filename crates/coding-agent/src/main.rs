@@ -4,8 +4,6 @@ mod config;
 mod core;
 mod interactive_mode;
 mod native_env;
-mod skills;
-mod system_prompt;
 mod tui;
 
 use clap::Parser;
