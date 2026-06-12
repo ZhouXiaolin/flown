@@ -1,0 +1,60 @@
+[package]
+name = "flown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal coding agent powered by LLM"
+
+[[bin]]
+name = "flown"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+flown-ai = { path = "../ai" }
+flown-agent = { path = "../agent" }
+
+# Async runtime
+tokio.workspace = true
+futures.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Terminal UI
+ratatui = "0.30"
+crossterm.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Markdown parsing + rendering
+pulldown-cmark = "0.13.4"
+mmdflux = "2.5"
+unicodeit = "0.2"
+
+# Syntax highlighting
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+
+# Clipboard
+arboard = "3"
+
+# JavaScript runtime (for workflow)
+rquickjs.workspace = true
+async-trait = "0.1"
+
+# Utilities
+chrono.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true

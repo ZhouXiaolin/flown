@@ -1,0 +1,33 @@
+[package]
+name = "flown-agent"
+description = "General-purpose agent with tool execution and state management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[example]]
+name = "agent"
+path = "examples/agent.rs"
+
+[dependencies]
+flown-ai = { path = "../ai" }
+tokio = { workspace = true }
+futures = { workspace = true }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+yaml_serde = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true }
+uuid = { version = "1", features = ["v4", "v7"] }
+async-trait = "0.1"
+async-stream = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rstest = "0.25"

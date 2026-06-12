@@ -1,0 +1,33 @@
+[package]
+name = "flown-ai"
+description = "Unified LLM API with provider abstraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[example]]
+name = "openai"
+path = "examples/openai.rs"
+
+[[example]]
+name = "anthropic"
+path = "examples/anthropic.rs"
+
+[dependencies]
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+once_cell = { workspace = true }
+reqwest = { workspace = true }
+reqwest-eventsource = { workspace = true }
+eventsource-stream = { workspace = true }
+futures-timer = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-stream = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }
