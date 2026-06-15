@@ -1,5 +1,5 @@
 use crate::tui::theme::MarkdownTheme;
-use ratatui::text::Line;
+use iodilos::prelude::Line;
 
 use super::LINK_MARKER;
 use super::width::display_width;

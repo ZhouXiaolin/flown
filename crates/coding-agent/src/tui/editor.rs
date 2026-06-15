@@ -1,66 +1,123 @@
+//! Editor — pure state + key handling for the multi-line input editor.
+//!
+//! This module holds the editor's *logic* (buffer, cursor, slash-autocomplete
+//! state) with no rendering. The key handler is a pure function over
+//! `EditorState`, so it's testable without a renderer and callable from the
+//! App's `on_key` router. Rendering (the `RichText` view of the display rows,
+//! the slash popup overlay, and the CJK/wrap-aware cursor provider) lives in
+//! `components/editor.rs` (Phase 3).
+//!
+//! Ported from the old hand-written `tui/editor.rs`. The buffer/cursor/popup
+//! logic is unchanged; only the rendering (`render_frame`, `display_rows`→view)
+//! moved out. `EditorState` replaces the old `Editor` struct so it can live
+//! inside an iodilos `RwSignal`.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
+
+/// A subcommand definition (e.g. `list`, `status` for `/mcp`).
+#[derive(Debug, Clone)]
+pub struct SubcommandDef {
+    pub name: &'static str,
+    pub description: &'static str,
+}
 
 /// Slash command definition for autocomplete.
 #[derive(Debug, Clone)]
 pub struct SlashCommand {
     pub name: &'static str,
     pub description: &'static str,
+    pub subcommands: &'static [SubcommandDef],
 }
 
 /// Built-in slash commands.
-const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand { name: "/help", description: "Show available commands" },
-    SlashCommand { name: "/clear", description: "Clear the transcript" },
-    SlashCommand { name: "/model", description: "Switch model" },
-    SlashCommand { name: "/compact", description: "Compact conversation" },
-    SlashCommand { name: "/quit", description: "Exit the application" },
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        description: "Show available commands",
+        subcommands: &[],
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear the transcript",
+        subcommands: &[],
+    },
+    SlashCommand {
+        name: "/model",
+        description: "Switch model",
+        subcommands: &[],
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Compact conversation",
+        subcommands: &[],
+    },
+    SlashCommand {
+        name: "/mcp",
+        description: "Manage MCP servers",
+        subcommands: &[
+            SubcommandDef {
+                name: "list",
+                description: "List configured servers",
+            },
+            SubcommandDef {
+                name: "status",
+                description: "Show server connection status",
+            },
+            SubcommandDef {
+                name: "help",
+                description: "Show MCP help",
+            },
+        ],
+    },
+    SlashCommand {
+        name: "/skills",
+        description: "List available skills",
+        subcommands: &[],
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit the application",
+        subcommands: &[],
+    },
 ];
 
-const MAX_INPUT_BODY_LINES: usize = 8;
-const INPUT_PROMPT_PRIMARY: &str = " ";
-const INPUT_PROMPT_CONTINUE: &str = " ";
-
-/// Multi-line input editor with CJK-aware cursor, visual line wrapping,
-/// and slash command autocomplete.
-pub struct Editor {
-    /// Lines of text (each line is a string without newline)
-    lines: Vec<String>,
-    /// Current cursor row (logical line index)
-    cursor_row: usize,
-    /// Current cursor column (character index within line, NOT byte offset)
-    cursor_col: usize,
-    /// Whether the editor is focused
-    focused: bool,
-    /// Slash autocomplete state
-    slash_popup: Option<SlashPopup>,
+/// What kind of items the popup is showing.
+#[derive(Debug, Clone)]
+pub enum PopupKind {
+    /// Completing top-level command names (items = indices into SLASH_COMMANDS).
+    Command,
+    /// Completing subcommands for a specific command.
+    Subcommand(usize),
 }
 
-struct SlashPopup {
-    /// Filtered commands matching current input
-    items: Vec<usize>,
-    /// Currently selected index in filtered list
-    selected: usize,
-    /// Current filter text (after '/')
-    filter: String,
+#[derive(Debug, Clone)]
+pub struct SlashPopup {
+    /// Filtered items matching current input (indices depend on kind).
+    pub items: Vec<usize>,
+    /// Currently selected index in the filtered list.
+    pub selected: usize,
+    /// What kind of completion is active.
+    pub kind: PopupKind,
 }
 
-/// A single display row after visual line wrapping.
-struct DisplayRow {
-    prefix: &'static str,
-    text: String,
-    logical_line: usize,
-    start_col: usize,
-    end_col: usize,
+/// The editor's reactive state. Lives inside `RwSignal<EditorState>` in
+/// `UiState`; the App's `on_key` calls `handle_key` and writes the result back.
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    /// Lines of text (each line without a trailing newline).
+    pub lines: Vec<String>,
+    /// Current cursor row (logical line index).
+    pub cursor_row: usize,
+    /// Current cursor column (character index within line, NOT byte offset).
+    pub cursor_col: usize,
+    /// Whether the editor is focused (affects border rendering).
+    pub focused: bool,
+    /// Slash-autocomplete state, if a popup is open.
+    pub slash_popup: Option<SlashPopup>,
 }
 
-impl Editor {
-    pub fn new() -> Self {
+impl Default for EditorState {
+    fn default() -> Self {
         Self {
             lines: vec![String::new()],
             cursor_row: 0,
@@ -69,17 +126,15 @@ impl Editor {
             slash_popup: None,
         }
     }
+}
 
-    pub fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
-    }
-
-    /// Get the full text content.
+impl EditorState {
+    /// Get the full text content (lines joined by `\n`).
     pub fn text(&self) -> String {
         self.lines.join("\n")
     }
 
-    /// Set the text content.
+    /// Set the text content (e.g. after accepting an autocomplete item).
     pub fn set_text(&mut self, text: &str) {
         self.lines = text.lines().map(String::from).collect();
         if self.lines.is_empty() {
@@ -113,7 +168,7 @@ impl Editor {
 
     /// Handle a key event. Returns an action for the app to process.
     pub fn handle_key(&mut self, key: KeyEvent) -> EditorAction {
-        // If slash popup is open, route navigation there
+        // If slash popup is open, route navigation there.
         if self.slash_popup.is_some() {
             return self.handle_slash_popup_key(key);
         }
@@ -122,16 +177,18 @@ impl Editor {
             // Submit on Enter (no modifiers)
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 if self.lines.join("\n").trim().is_empty() {
-                    return EditorAction::None;
+                    EditorAction::None
+                } else {
+                    EditorAction::Submit
                 }
-                EditorAction::Submit
             }
-            // Newline: Shift+Enter, Alt+Enter, or Ctrl+Enter
-            (KeyCode::Enter, m)
-                if m.contains(KeyModifiers::SHIFT)
-                    || m.contains(KeyModifiers::ALT)
-                    || m.contains(KeyModifiers::CONTROL) =>
-            {
+            // Newline: Shift+Enter, Alt+Enter, Ctrl+Enter, or terminals that
+            // report Ctrl+Enter as Ctrl+J.
+            (KeyCode::Enter, m) if is_newline_modifier(m) => {
+                self.insert_newline();
+                EditorAction::None
+            }
+            (KeyCode::Char('j'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.insert_newline();
                 EditorAction::None
             }
@@ -187,15 +244,6 @@ impl Editor {
                 self.accept_slash_popup();
                 EditorAction::None
             }
-            // Ctrl+C — cancel/clear
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if self.lines.join("\n").is_empty() {
-                    EditorAction::Quit
-                } else {
-                    self.clear();
-                    EditorAction::None
-                }
-            }
             // Ctrl+U — clear line
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 self.lines[self.cursor_row].clear();
@@ -220,10 +268,10 @@ impl Editor {
         }
     }
 
-    // ── Slash command autocomplete ─────────────────────────────────
+    // ── Slash command autocomplete ─────────────────────────────────────
 
     fn try_open_slash_popup(&mut self) {
-        // Only open at the very start of the first line
+        // Only open at the very start of the first line.
         if self.cursor_row != 0 {
             self.slash_popup = None;
             return;
@@ -233,11 +281,52 @@ impl Editor {
             self.slash_popup = None;
             return;
         }
-        // Don't open if there's a space (command already complete)
-        if line.contains(' ') {
-            self.slash_popup = None;
+
+        // Check if we're past the command name (space present).
+        if let Some(space_idx) = line.find(' ') {
+            let cmd_name = &line[..space_idx];
+            let after_space = line[space_idx + 1..].trim();
+
+            let cmd_idx = SLASH_COMMANDS.iter().position(|c| c.name == cmd_name);
+            let Some(cmd_idx) = cmd_idx else {
+                self.slash_popup = None;
+                return;
+            };
+            let cmd = &SLASH_COMMANDS[cmd_idx];
+
+            if cmd.subcommands.is_empty() {
+                self.slash_popup = None;
+                return;
+            }
+
+            let lower_filter = after_space.to_lowercase();
+            let items: Vec<usize> = cmd
+                .subcommands
+                .iter()
+                .enumerate()
+                .filter(|(_, sub)| {
+                    if lower_filter.is_empty() {
+                        return true;
+                    }
+                    sub.name.starts_with(&lower_filter)
+                        || sub.description.to_lowercase().contains(&lower_filter)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if items.is_empty() {
+                self.slash_popup = None;
+            } else {
+                self.slash_popup = Some(SlashPopup {
+                    items,
+                    selected: 0,
+                    kind: PopupKind::Subcommand(cmd_idx),
+                });
+            }
             return;
         }
+
+        // No space — complete command names.
         let filter = line[1..].to_string(); // text after '/'
         let lower_filter = filter.to_lowercase();
         let items: Vec<usize> = SLASH_COMMANDS
@@ -257,28 +346,52 @@ impl Editor {
         if items.is_empty() {
             self.slash_popup = None;
         } else {
-            let selected = 0;
-            self.slash_popup = Some(SlashPopup { items, selected, filter });
+            self.slash_popup = Some(SlashPopup {
+                items,
+                selected: 0,
+                kind: PopupKind::Command,
+            });
         }
     }
 
     fn update_slash_popup(&mut self) {
-        // Re-filter based on current text
         self.try_open_slash_popup();
     }
 
     fn accept_slash_popup(&mut self) {
         if let Some(popup) = self.slash_popup.take() {
-            if let Some(&cmd_idx) = popup.items.get(popup.selected) {
-                let cmd = &SLASH_COMMANDS[cmd_idx];
-                // Replace current line with the command name + space
-                self.lines[0] = format!("{} ", cmd.name);
-                self.cursor_col = self.lines[0].chars().count();
+            match popup.kind {
+                PopupKind::Command => {
+                    if let Some(&cmd_idx) = popup.items.get(popup.selected) {
+                        let cmd = &SLASH_COMMANDS[cmd_idx];
+                        self.lines[0] = format!("{} ", cmd.name);
+                        self.cursor_col = self.lines[0].chars().count();
+                    }
+                }
+                PopupKind::Subcommand(cmd_idx) => {
+                    let cmd = &SLASH_COMMANDS[cmd_idx];
+                    if let Some(&sub_idx) = popup.items.get(popup.selected) {
+                        let sub = &cmd.subcommands[sub_idx];
+                        self.lines[0] = format!("{} {} ", cmd.name, sub.name);
+                        self.cursor_col = self.lines[0].chars().count();
+                    }
+                }
             }
         }
     }
 
     fn handle_slash_popup_key(&mut self, key: KeyEvent) -> EditorAction {
+        if key.code == KeyCode::Enter && is_newline_modifier(key.modifiers) {
+            self.slash_popup = None;
+            self.insert_newline();
+            return EditorAction::None;
+        }
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.slash_popup = None;
+            self.insert_newline();
+            return EditorAction::None;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.slash_popup = None;
@@ -301,11 +414,17 @@ impl Editor {
                 EditorAction::None
             }
             KeyCode::Enter => {
+                let was_subcommand = matches!(
+                    self.slash_popup.as_ref().map(|p| &p.kind),
+                    Some(PopupKind::Subcommand(_))
+                );
                 self.accept_slash_popup();
-                // If it's a complete command (like /help, /clear, /quit), submit immediately
+                // Commands without args (like /help, /clear, /quit) submit
+                // immediately. Subcommand completions (like /mcp list) also
+                // submit immediately.
                 let text = self.text();
                 let trimmed = text.trim();
-                if !trimmed.contains(' ') && trimmed.starts_with('/') {
+                if was_subcommand || (!trimmed.contains(' ') && trimmed.starts_with('/')) {
                     return EditorAction::Submit;
                 }
                 EditorAction::None
@@ -315,14 +434,14 @@ impl Editor {
                 EditorAction::None
             }
             _ => {
-                // Forward other keys to normal handling
+                // Forward other keys to normal handling.
                 self.slash_popup = None;
                 self.handle_key(key)
             }
         }
     }
 
-    // ── Character operations (CJK-aware, char-index based) ────────
+    // ── Character operations (CJK-aware, char-index based) ─────────────
 
     fn insert_char(&mut self, c: char) {
         let byte_offset = char_to_byte_offset(&self.lines[self.cursor_row], self.cursor_col);
@@ -402,278 +521,14 @@ impl Editor {
             self.cursor_col = self.cursor_col.min(char_count);
         }
     }
-
-    // ── Visual line wrapping ───────────────────────────────────────
-
-    /// Compute display rows with visual line wrapping for the given inner width.
-    fn display_rows(&self, inner_width: usize) -> Vec<DisplayRow> {
-        let inner_width = inner_width.max(1);
-        let mut rows = Vec::new();
-        for (logical_line, line) in self.lines.iter().enumerate() {
-            rows.extend(Self::wrap_logical_line(logical_line, line, inner_width));
-        }
-        rows
-    }
-
-    /// Wrap a single logical line into multiple display rows.
-    fn wrap_logical_line(
-        logical_line: usize,
-        line: &str,
-        inner_width: usize,
-    ) -> Vec<DisplayRow> {
-        let mut rows = Vec::new();
-        let mut seg_idx = 0usize;
-        let mut col = 0usize;
-        let char_count = line.chars().count();
-
-        loop {
-            let prefix = if logical_line == 0 && seg_idx == 0 {
-                INPUT_PROMPT_PRIMARY
-            } else {
-                INPUT_PROMPT_CONTINUE
-            };
-            let avail = inner_width.saturating_sub(display_width_str(prefix)).max(1);
-            let mut chunk = String::new();
-            let mut used_width = 0usize;
-            let mut end_col = col;
-
-            for ch in line.chars().skip(col) {
-                let ch_width = ch.width().unwrap_or(0);
-                if !chunk.is_empty() && used_width + ch_width > avail {
-                    break;
-                }
-                if chunk.is_empty() && ch_width > avail {
-                    chunk.push(ch);
-                    end_col += 1;
-                    break;
-                }
-                chunk.push(ch);
-                used_width += ch_width;
-                end_col += 1;
-            }
-
-            rows.push(DisplayRow {
-                prefix,
-                text: chunk,
-                logical_line,
-                start_col: col,
-                end_col,
-            });
-
-            if end_col >= char_count {
-                break;
-            }
-            col = end_col;
-            seg_idx += 1;
-        }
-
-        if rows.is_empty() {
-            rows.push(DisplayRow {
-                prefix: if logical_line == 0 {
-                    INPUT_PROMPT_PRIMARY
-                } else {
-                    INPUT_PROMPT_CONTINUE
-                },
-                text: String::new(),
-                logical_line,
-                start_col: 0,
-                end_col: 0,
-            });
-        }
-
-        rows
-    }
-
-    /// Compute the visual column (terminal cells) for a char offset within a string.
-    fn screen_col_for_char_offset(text: &str, char_offset: usize) -> usize {
-        let mut col = 0usize;
-        for c in text.chars().take(char_offset) {
-            col += c.width().unwrap_or(0);
-        }
-        col
-    }
-
-    /// Compute the cursor's screen position (row, col) accounting for wrapping.
-    fn cursor_screen_position(&self, inner_width: usize) -> (usize, usize) {
-        let display_rows = self.display_rows(inner_width);
-        for (screen_row, row) in display_rows.iter().enumerate() {
-            if row.logical_line != self.cursor_row {
-                continue;
-            }
-            let char_count = self.lines[self.cursor_row].chars().count();
-            let contains = if row.end_col >= char_count {
-                self.cursor_col >= row.start_col && self.cursor_col <= row.end_col
-            } else {
-                self.cursor_col >= row.start_col && self.cursor_col < row.end_col
-            };
-            if contains {
-                let offset_in_chunk = self.cursor_col.saturating_sub(row.start_col);
-                let col = display_width_str(row.prefix)
-                    + Self::screen_col_for_char_offset(&row.text, offset_in_chunk);
-                return (screen_row, col);
-            }
-        }
-        (
-            display_rows.len().saturating_sub(1),
-            display_width_str(INPUT_PROMPT_PRIMARY),
-        )
-    }
-
-    /// Compute the total height needed for the input widget (including slash popup if active).
-    pub fn input_height(&self, width: u16) -> u16 {
-        let inner_width = width.saturating_sub(2).max(1) as usize;
-        let rows = self
-            .display_rows(inner_width)
-            .len()
-            .clamp(1, MAX_INPUT_BODY_LINES);
-        let editor_height = rows as u16 + 2; // +2 for top and bottom borders
-
-        // Add slash popup height if active
-        let popup_height = self
-            .slash_popup
-            .as_ref()
-            .map(|p| {
-                let visible_items = p.items.len().min(6);
-                (visible_items as u16) + 2 // +2 for border
-            })
-            .unwrap_or(0);
-
-        editor_height + popup_height
-    }
-
-    // ── Rendering ──────────────────────────────────────────────────
-
-    /// Get the height of the slash popup if active.
-    fn slash_popup_height(&self) -> u16 {
-        self.slash_popup
-            .as_ref()
-            .map(|p| {
-                let visible_items = p.items.len().min(6);
-                (visible_items as u16) + 2 // +2 for border
-            })
-            .unwrap_or(0)
-    }
-
-    /// Render the editor widget to a ratatui `Frame`.
-    pub fn render_frame(&self, f: &mut Frame, area: Rect) {
-        let popup_height = self.slash_popup_height();
-
-        // Popup area is at the top of the given area
-        let popup_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: popup_height,
-        };
-
-        // Editor area is below the popup
-        let editor_area = Rect {
-            x: area.x,
-            y: area.y + popup_height,
-            width: area.width,
-            height: area.height.saturating_sub(popup_height),
-        };
-
-        // Render slash popup if active
-        if let Some(ref popup) = self.slash_popup {
-            self.render_slash_popup(f, popup_area, popup);
-        }
-
-        // Editor border style
-        let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style);
-
-        let inner_width = editor_area.width.saturating_sub(2) as usize;
-        if inner_width == 0 {
-            f.render_widget(block, editor_area);
-            return;
-        }
-
-        // Build display lines with visual wrapping
-        let prompt_style = Style::default().fg(Color::DarkGray);
-        let input_style = Style::default().fg(Color::White);
-        let wrapped_lines: Vec<Line> = self
-            .display_rows(inner_width)
-            .into_iter()
-            .map(|row| {
-                Line::from(vec![
-                    Span::styled(row.prefix, prompt_style),
-                    Span::styled(row.text, input_style),
-                ])
-            })
-            .collect();
-
-        let paragraph = Paragraph::new(wrapped_lines).block(block);
-        f.render_widget(paragraph, editor_area);
-
-        // Position cursor (CJK-aware, wrapping-aware)
-        // Block with Borders::ALL: content starts at (x+1, y+1)
-        if self.focused {
-            let (cursor_row, cursor_col) = self.cursor_screen_position(inner_width);
-            let max_row = editor_area.height.saturating_sub(2);
-            let max_col = editor_area.width.saturating_sub(3);
-            f.set_cursor_position((
-                editor_area.x + 1 + (cursor_col as u16).min(max_col),
-                editor_area.y + 1 + (cursor_row as u16).min(max_row),
-            ));
-        }
-    }
-
-    fn render_slash_popup(&self, f: &mut Frame, area: Rect, popup: &SlashPopup) {
-        // Clear background
-        f.render_widget(Clear, area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Commands ");
-
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        // Render items
-        let visible_count = inner.height as usize;
-        let mut lines = Vec::new();
-        for (vis_idx, &cmd_idx) in popup.items.iter().take(visible_count).enumerate() {
-            let cmd = &SLASH_COMMANDS[cmd_idx];
-            let is_selected = vis_idx == popup.selected;
-            let prefix = if is_selected { "▸ " } else { "  " };
-            let style = if is_selected {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let desc_style = Style::default().fg(Color::DarkGray);
-            lines.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(&cmd.name[1..], style), // without '/'
-                Span::styled(format!("  {}", cmd.description), desc_style),
-            ]));
-        }
-
-        let paragraph = Paragraph::new(lines);
-        f.render_widget(paragraph, inner);
-    }
 }
 
 /// Actions the editor can signal to the app.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorAction {
     None,
     Submit,
-    Quit,
-}
-
-/// Compute the display width of a string in terminal cells.
-fn display_width_str(text: &str) -> usize {
-    text.chars().map(|ch| ch.width().unwrap_or(0)).sum()
+    // (Quit is handled at the App level via Ctrl+C / Ctrl+Q, not the editor.)
 }
 
 /// Convert character index to byte offset within a string.
@@ -682,4 +537,101 @@ fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT)
+        || modifiers.contains(KeyModifiers::ALT)
+        || modifiers.contains(KeyModifiers::CONTROL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_and_submit() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(e.text(), "hi");
+        let action = e.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, EditorAction::Submit);
+    }
+
+    #[test]
+    fn multiline_via_shift_enter() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        e.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(e.text(), "a\nb");
+    }
+
+    #[test]
+    fn multiline_via_ctrl_enter() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        e.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(e.text(), "a\nb");
+    }
+
+    #[test]
+    fn multiline_via_ctrl_j() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        e.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(e.text(), "a\nb");
+    }
+
+    #[test]
+    fn empty_input_does_not_submit() {
+        let mut e = EditorState::default();
+        let action = e.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, EditorAction::None);
+    }
+
+    #[test]
+    fn backspace_deletes() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn slash_popup_opens_then_navigates() {
+        let mut e = EditorState::default();
+        // Type "/" → popup opens with all commands.
+        e.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(e.slash_popup.is_some());
+        let len = e.slash_popup.as_ref().unwrap().items.len();
+        assert!(len > 1);
+        // Down → selected advances.
+        e.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(e.slash_popup.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn tab_accepts_slash_completion() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        e.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // After accepting the first completion, the line is "<cmd> ".
+        assert!(e.lines[0].ends_with(' '));
+        assert!(e.lines[0].starts_with('/'));
+    }
+
+    #[test]
+    fn ctrl_enter_in_slash_popup_inserts_newline() {
+        let mut e = EditorState::default();
+        e.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(e.slash_popup.is_some());
+        e.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(e.lines.len(), 2);
+        assert_eq!(e.cursor_row, 1);
+        assert!(e.slash_popup.is_none());
+    }
 }

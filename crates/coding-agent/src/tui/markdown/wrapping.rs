@@ -1,8 +1,5 @@
 use super::width::display_width;
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use iodilos::prelude::{Line, Span, Style};
 use unicode_width::UnicodeWidthChar;
 
 pub(super) fn push_wrapped_prefixed_lines(

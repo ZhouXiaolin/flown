@@ -1,9 +1,9 @@
 mod cli;
-mod clipboard;
 mod config;
 mod core;
 mod interactive_mode;
 mod native_env;
+mod slash_commands;
 mod tui;
 
 use clap::Parser;
@@ -38,8 +38,13 @@ async fn main() -> anyhow::Result<()> {
     let provider_override = cli.provider;
     let _verbose = cli.verbose;
 
-    match cli.command.unwrap_or(cli::Commands::Chat { prompt: vec![] }) {
-        cli::Commands::Chat { prompt } => cli::cmd_chat(model_override, provider_override, prompt).await,
+    match cli
+        .command
+        .unwrap_or(cli::Commands::Chat { prompt: vec![] })
+    {
+        cli::Commands::Chat { prompt } => {
+            cli::cmd_chat(model_override, provider_override, prompt).await
+        }
         cli::Commands::Config { action } => cli::cmd_config(action),
         cli::Commands::Mcp { action } => cli::cmd_mcp(action).await,
         cli::Commands::Completions { shell } => cli::cmd_completions(shell),

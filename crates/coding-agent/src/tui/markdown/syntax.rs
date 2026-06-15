@@ -1,9 +1,6 @@
 use super::width::{display_width, expand_tabs};
-use ratatui::style::Color;
-use ratatui::{
-    style::{Modifier, Style},
-    text::Span,
-};
+use iodilos::prelude::Color;
+use iodilos::prelude::{Modifier, Span, Style};
 use syntect::{
     easy::HighlightLines, highlighting::Theme, parsing::SyntaxSet, util::LinesWithEndings,
 };

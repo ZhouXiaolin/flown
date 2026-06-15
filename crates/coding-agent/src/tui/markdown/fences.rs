@@ -49,7 +49,9 @@ pub(super) fn normalize_code_fences(src: &str) -> Cow<'_, str> {
             j += 1;
         }
 
-        if max_inner_fence >= fence_len && let Some((cl, cl_prefix)) = close_line {
+        if max_inner_fence >= fence_len
+            && let Some((cl, cl_prefix)) = close_line
+        {
             let new_fence = "`".repeat(max_inner_fence + 1);
             result[open_line] = format!("{}{}{}", open_prefix, new_fence, fi.info);
             result[cl] = format!("{}{}", cl_prefix, new_fence);

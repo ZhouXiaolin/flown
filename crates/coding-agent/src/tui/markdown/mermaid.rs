@@ -1,6 +1,6 @@
 use crate::tui::theme::MarkdownTheme;
+use iodilos::prelude::{Span, Style};
 use mmdflux::{OutputFormat, RenderConfig, render_diagram};
-use ratatui::{style::Style, text::Span};
 use std::fmt::Write;
 
 pub(crate) fn render(content: &str) -> Option<String> {

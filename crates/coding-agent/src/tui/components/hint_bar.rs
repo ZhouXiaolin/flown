@@ -1,24 +1,30 @@
-//! HintBar component — bottom bar showing keyboard shortcuts.
+//! HintBar — bottom bar showing keyboard shortcuts.
+//!
+//! Reads `state.busy` and renders one of two hint lines as a `RichText`. The
+//! busy variant shows the abort hint; the idle variant shows the full shortcut
+//! list. Mirrors the old `HintBar` component.
+//!
+//! The component body runs once at mount; to make the line swap reactively when
+//! `busy` flips, a `create_effect` re-derives the line (reading `busy`) and
+//! calls `set_lines` whenever it changes. This is the iodilos idiom for a
+//! node whose content depends on a signal.
 
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use std::rc::Rc;
 
-use super::component::Component;
+use iodilos::prelude::*;
 
-/// Bottom hint bar showing keyboard shortcuts.
-pub struct HintBar {
-    pub busy: bool,
-}
+use crate::tui::state::UiState;
 
-impl HintBar {
-    pub fn new() -> Self {
-        Self { busy: false }
-    }
-}
+#[component]
+pub fn HintBar() -> Node {
+    let state = use_context::<Rc<UiState>>();
+    let busy = state.busy;
 
-impl Component for HintBar {
-    fn render(&mut self, _width: u16) -> Vec<Line<'static>> {
-        let hints = if self.busy {
+    let node = Node::new_richtext();
+    // Seed the initial line (idle), then keep it in sync with `busy`.
+    let seed_node = node.clone();
+    create_effect(move || {
+        let line = if busy.get() {
             Line::from(vec![
                 Span::styled("  ⟳ ", Style::default().fg(Color::Yellow)),
                 Span::styled("thinking…", Style::default().fg(Color::Yellow)),
@@ -39,6 +45,7 @@ impl Component for HintBar {
                 Span::styled("cancel", Style::default().fg(Color::Green)),
             ])
         };
-        vec![hints]
-    }
+        seed_node.set_lines(vec![line]);
+    });
+    node
 }

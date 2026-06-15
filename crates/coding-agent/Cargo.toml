@@ -14,16 +14,19 @@ path = "src/main.rs"
 flown-ai = { path = "../ai" }
 flown-agent = { path = "../agent" }
 
+# TUI framework (SolidJS-inspired reactive TUI; path dep to ~/iodilos)
+iodilos = { path = "../../../iodilos/crates/iodilos" }
+
 # Async runtime
 tokio.workspace = true
 futures.workspace = true
+flume.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
 
-# Terminal UI
-ratatui = "0.30"
+# Terminal input/backend integration
 crossterm.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true

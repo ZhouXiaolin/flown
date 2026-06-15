@@ -1,9 +1,6 @@
 use crate::tui::theme::MarkdownTheme;
+use iodilos::prelude::{Modifier, Span, Style};
 use pulldown_cmark::{Event as MdEvent, Tag, TagEnd};
-use ratatui::{
-    style::{Modifier, Style},
-    text::Span,
-};
 
 use super::LINK_MARKER;
 use super::latex;

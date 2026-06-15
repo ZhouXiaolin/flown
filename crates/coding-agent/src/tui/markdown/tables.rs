@@ -1,9 +1,6 @@
 use crate::tui::theme::app_theme;
+use iodilos::prelude::{Line, Modifier, Span, Style};
 use pulldown_cmark::{Alignment, Event as MdEvent, Tag, TagEnd};
-use ratatui::{
-    style::{Modifier, Style},
-    text::{Line, Span},
-};
 
 use super::latex;
 use super::table_layout::{
@@ -324,6 +321,20 @@ impl TableBuf {
         self.end_row();
         self.header_count = self.rows.len();
         self.in_header = false;
+    }
+
+    pub(crate) fn render_partial(&mut self, render_width: usize) -> Vec<Line<'static>> {
+        if !self.current_cell.is_empty() {
+            self.end_cell();
+        }
+        if !self.current_row.is_empty() {
+            self.end_row();
+        }
+        if self.in_header {
+            self.header_count = self.rows.len();
+            self.in_header = false;
+        }
+        self.render(render_width)
     }
 
     pub(crate) fn render(&self, render_width: usize) -> Vec<Line<'static>> {

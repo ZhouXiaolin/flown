@@ -1,4 +1,4 @@
-use ratatui::text::Line;
+use iodilos::prelude::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(super) const TAB_STOP: usize = 4;
@@ -28,7 +28,7 @@ pub(super) fn is_code_gutter_span(content: &str) -> bool {
 pub(crate) fn line_searchable_text(line: &Line<'_>) -> String {
     use super::LINK_MARKER;
 
-    fn collect_filtered(spans: &[ratatui::text::Span<'_>]) -> String {
+    fn collect_filtered(spans: &[Span<'_>]) -> String {
         spans
             .iter()
             .filter(|s| s.content.as_ref() != LINK_MARKER)

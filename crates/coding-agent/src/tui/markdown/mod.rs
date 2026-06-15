@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::borrow::Cow;
+
 mod blocks;
 mod fences;
 mod frontmatter;
@@ -16,15 +18,13 @@ pub(crate) mod toc;
 pub(crate) mod width;
 mod wrapping;
 
-use tables::{TableBuf, handle_table_event, start_table};
 use crate::tui::theme::MarkdownTheme;
+use iodilos::prelude::{Color, Line, Modifier, Span, Style};
 use pulldown_cmark::{
     BlockQuoteKind, CodeBlockKind, Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-};
+use syntect::{highlighting::Theme, parsing::SyntaxSet};
+use tables::{TableBuf, handle_table_event, start_table};
 use toc::{TocEntry, normalize_toc};
 
 use blocks::{
@@ -106,6 +106,76 @@ fn start_code_block(
         CodeBlockKind::Fenced(lang) => lang.to_string(),
         CodeBlockKind::Indented => String::new(),
     };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_code_block(
+    lines: &mut Vec<Line<'static>>,
+    code_buf: &mut String,
+    code_lang: &mut String,
+    ss: &SyntaxSet,
+    syntax_theme: &Theme,
+    render_width: usize,
+    theme_colors: &MarkdownTheme,
+    blockquote_depth: usize,
+    list_stack: &[ListKind],
+    item_stack: &mut [ItemState],
+    file_mode: bool,
+) {
+    let lang = code_lang.as_str();
+    if lang == "latex" || lang == "tex" {
+        push_latex_block_lines(
+            lines,
+            code_buf,
+            render_width,
+            theme_colors,
+            blockquote_depth,
+            list_stack,
+            item_stack,
+        );
+        code_buf.clear();
+        code_lang.clear();
+    } else if lang == "mermaid" {
+        push_mermaid_block_lines(
+            lines,
+            code_buf,
+            render_width,
+            theme_colors,
+            blockquote_depth,
+            list_stack,
+            item_stack,
+        );
+        code_buf.clear();
+        code_lang.clear();
+    } else if lang == DIFF_BLOCK_LANG {
+        push_diff_block_lines(
+            lines,
+            code_buf,
+            render_width,
+            theme_colors,
+            blockquote_depth,
+            list_stack,
+            item_stack,
+        );
+        code_buf.clear();
+        code_lang.clear();
+    } else {
+        push_code_block_lines(
+            lines,
+            code_buf,
+            code_lang,
+            CodeBlockRenderContext {
+                ss,
+                theme: syntax_theme,
+                render_width,
+                theme_colors,
+                blockquote_depth,
+                list_stack,
+                file_mode,
+            },
+            item_stack,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,6 +304,7 @@ pub(crate) fn parse_markdown_with_width(
 
     let normalized = normalize_code_fences(src);
     let normalized = normalize_diff_blocks(&normalized);
+    let normalized = synthesize_streaming_closures(&normalized);
     for ev in Parser::new_ext(&normalized, Options::all()) {
         if table.is_some()
             && handle_table_event(&mut table, &ev, &mut lines, render_width, &mut link_urls)
@@ -296,59 +367,19 @@ pub(crate) fn parse_markdown_with_width(
             }
             MdEvent::End(TagEnd::CodeBlock) => {
                 in_code = false;
-                if code_lang == "latex" || code_lang == "tex" {
-                    push_latex_block_lines(
-                        &mut lines,
-                        &code_buf,
-                        render_width,
-                        theme_colors,
-                        blockquote_depth,
-                        &list_stack,
-                        &mut item_stack,
-                    );
-                    code_buf.clear();
-                    code_lang.clear();
-                } else if code_lang == "mermaid" {
-                    push_mermaid_block_lines(
-                        &mut lines,
-                        &code_buf,
-                        render_width,
-                        theme_colors,
-                        blockquote_depth,
-                        &list_stack,
-                        &mut item_stack,
-                    );
-                    code_buf.clear();
-                    code_lang.clear();
-                } else if code_lang == DIFF_BLOCK_LANG {
-                    push_diff_block_lines(
-                        &mut lines,
-                        &code_buf,
-                        render_width,
-                        theme_colors,
-                        blockquote_depth,
-                        &list_stack,
-                        &mut item_stack,
-                    );
-                    code_buf.clear();
-                    code_lang.clear();
-                } else {
-                    push_code_block_lines(
-                        &mut lines,
-                        &mut code_buf,
-                        &mut code_lang,
-                        CodeBlockRenderContext {
-                            ss,
-                            theme,
-                            render_width,
-                            theme_colors,
-                            blockquote_depth,
-                            list_stack: &list_stack,
-                            file_mode,
-                        },
-                        &mut item_stack,
-                    );
-                }
+                finish_code_block(
+                    &mut lines,
+                    &mut code_buf,
+                    &mut code_lang,
+                    ss,
+                    theme,
+                    render_width,
+                    theme_colors,
+                    blockquote_depth,
+                    &list_stack,
+                    &mut item_stack,
+                    file_mode,
+                );
                 last_block = LastBlock::Other;
             }
             MdEvent::Code(text) => {
@@ -481,6 +512,24 @@ pub(crate) fn parse_markdown_with_width(
         }
     }
 
+    if let Some(tb) = table.as_mut() {
+        lines.extend(tb.render_partial(render_width));
+    }
+    if in_code {
+        finish_code_block(
+            &mut lines,
+            &mut code_buf,
+            &mut code_lang,
+            ss,
+            theme,
+            render_width,
+            theme_colors,
+            blockquote_depth,
+            &list_stack,
+            &mut item_stack,
+            file_mode,
+        );
+    }
     if !spans.is_empty() {
         flush_wrapped_spans(
             &mut lines,
@@ -500,4 +549,112 @@ pub(crate) fn parse_markdown_with_width(
 fn normalize_diff_blocks(src: &str) -> String {
     src.replace(DIFF_BLOCK_START, &format!("```{DIFF_BLOCK_LANG}\n"))
         .replace(DIFF_BLOCK_END, "```")
+}
+
+fn synthesize_streaming_closures(src: &str) -> Cow<'_, str> {
+    let mut open_fence: Option<(usize, String)> = None;
+    let mut in_display_math = false;
+
+    for line in src.lines() {
+        if let Some(fence) = fences::parse_fence_line(line) {
+            if let Some((open_len, _)) = open_fence {
+                if fence.info.is_empty() && fence.backtick_count >= open_len {
+                    open_fence = None;
+                }
+            } else if !fence.info.is_empty() {
+                open_fence = Some((fence.backtick_count, fence.prefix.to_string()));
+            }
+            continue;
+        }
+
+        if open_fence.is_none() && line.trim() == "$$" {
+            in_display_math = !in_display_math;
+        }
+    }
+
+    if open_fence.is_none() && !in_display_math {
+        return Cow::Borrowed(src);
+    }
+
+    let mut out = src.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if let Some((ticks, prefix)) = open_fence {
+        out.push_str(&prefix);
+        out.push_str(&"`".repeat(ticks));
+    } else if in_display_math {
+        out.push_str("$$");
+    }
+    Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::{app_theme, current_syntect_theme};
+    use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
+
+    fn render(src: &str) -> Vec<String> {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let syntax_theme = current_syntect_theme(&themes);
+        let app_theme = app_theme();
+        let (lines, _, _) =
+            parse_markdown_with_width(src, &ss, syntax_theme, 80, &app_theme.markdown, false);
+
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renders_unclosed_code_fence_while_streaming() {
+        let lines = render("```rust\nfn main() {\n");
+
+        assert!(lines.iter().any(|line| line.contains("fn main")));
+    }
+
+    #[test]
+    fn renders_unclosed_mermaid_fence_while_streaming() {
+        let lines = render("```mermaid\nflowchart TD\nA --> B\n");
+
+        assert!(lines.iter().any(|line| line.contains("A")));
+        assert!(lines.iter().any(|line| line.contains("B")));
+    }
+
+    #[test]
+    fn renders_unclosed_diff_block_while_streaming() {
+        let lines = render("<diff>\n+1,1 added\n");
+
+        assert!(lines.iter().any(|line| line.contains("added")));
+    }
+
+    #[test]
+    fn renders_unclosed_display_math_while_streaming() {
+        let lines = render("$$\nx^2\n");
+
+        assert!(lines.iter().any(|line| line.contains("x")));
+    }
+
+    #[test]
+    fn renders_partial_table_while_streaming() {
+        let lines = render("| name | value |\n| --- | --- |\n| alpha |");
+
+        assert!(lines.iter().any(|line| line.contains("name")));
+        assert!(lines.iter().any(|line| line.contains("alpha")));
+    }
+
+    #[test]
+    fn renders_partial_list_item_while_streaming() {
+        let lines = render("- streaming item");
+
+        assert!(lines.iter().any(|line| line.contains("streaming item")));
+    }
 }

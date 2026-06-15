@@ -1,5 +1,5 @@
 use crate::tui::theme::MarkdownTheme;
-use ratatui::{style::Style, text::Span};
+use iodilos::prelude::{Span, Style};
 
 pub(super) struct CustomMarker {
     pub(super) open: &'static str,

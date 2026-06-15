@@ -27,7 +27,10 @@ pub async fn load_skills(dirs: &[&str]) -> Result<Vec<Skill>, String> {
     Ok(skills)
 }
 
-async fn load_skills_from_dir(dir: &std::path::Path, skills: &mut Vec<Skill>) -> Result<(), String> {
+async fn load_skills_from_dir(
+    dir: &std::path::Path,
+    skills: &mut Vec<Skill>,
+) -> Result<(), String> {
     let mut entries = tokio::fs::read_dir(dir)
         .await
         .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
@@ -131,7 +134,9 @@ pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
 
     let mut output = Vec::new();
 
-    output.push("The following skills provide specialized instructions for specific tasks.".to_string());
+    output.push(
+        "The following skills provide specialized instructions for specific tasks.".to_string(),
+    );
     output.push("Read the full skill file when the task matches its description.".to_string());
     output.push("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string());
     output.push(String::new());
@@ -139,8 +144,14 @@ pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
     for skill in &visible {
         output.push("  <skill>".to_string());
         output.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        output.push(format!("    <description>{}</description>", escape_xml(&skill.description)));
-        output.push(format!("    <location>{}</location>", escape_xml(&skill.file_path)));
+        output.push(format!(
+            "    <description>{}</description>",
+            escape_xml(&skill.description)
+        ));
+        output.push(format!(
+            "    <location>{}</location>",
+            escape_xml(&skill.file_path)
+        ));
         output.push("  </skill>".to_string());
     }
     output.push("</available_skills>".to_string());
@@ -211,6 +222,12 @@ fn validate_description(description: &str) -> Vec<String> {
 }
 
 /// Parse YAML-like frontmatter from markdown content.
+pub fn parse_frontmatter_static(
+    content: &str,
+) -> Result<(HashMap<String, String>, String), String> {
+    parse_frontmatter(content)
+}
+
 fn parse_frontmatter(content: &str) -> Result<(HashMap<String, String>, String), String> {
     let mut frontmatter = HashMap::new();
     let normalized = content.replace("\r\n", "\n").replace('\r', "\n");

@@ -1,7 +1,4 @@
-use ratatui::{
-    style::{Modifier, Style},
-    text::Span,
-};
+use iodilos::prelude::{Modifier, Span, Style};
 use unicode_width::UnicodeWidthChar;
 
 use super::LINK_MARKER;

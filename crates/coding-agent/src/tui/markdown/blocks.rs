@@ -1,8 +1,5 @@
 use crate::tui::theme::MarkdownTheme;
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-};
+use iodilos::prelude::{Color, Line, Modifier, Span, Style};
 use syntect::{highlighting::Theme, parsing::SyntaxSet};
 use unicode_width::UnicodeWidthStr;
 

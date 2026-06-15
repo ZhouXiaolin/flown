@@ -1,8 +1,5 @@
 use crate::tui::theme::MarkdownTheme;
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use iodilos::prelude::{Color, Line, Span, Style};
 
 use super::LastBlock;
 use super::blocks::{block_prefix, trim_paragraph_gap_before_block};
@@ -26,7 +23,7 @@ pub(super) fn list_item_prefix(
     list_stack: &[ListKind],
     item_stack: &mut [ItemState],
     theme: &MarkdownTheme,
-    marker_color: Option<ratatui::style::Color>,
+    marker_color: Option<Color>,
 ) -> Vec<Span<'static>> {
     let mut prefix = block_prefix(in_bq, theme, marker_color);
     let Some(item) = item_stack.last_mut() else {
@@ -81,7 +78,7 @@ pub(super) fn flush_list_item_spans(
     blockquote_depth: usize,
     render_width: usize,
     theme: &MarkdownTheme,
-    marker_color: Option<ratatui::style::Color>,
+    marker_color: Option<Color>,
 ) {
     if spans.is_empty() {
         return;
@@ -147,7 +144,7 @@ pub(super) fn end_item(
     blockquote_depth: usize,
     render_width: usize,
     theme: &MarkdownTheme,
-    marker_color: Option<ratatui::style::Color>,
+    marker_color: Option<Color>,
 ) {
     flush_list_item_spans(
         lines,

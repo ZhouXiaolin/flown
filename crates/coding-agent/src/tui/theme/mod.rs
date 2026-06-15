@@ -1,4 +1,4 @@
-use ratatui::style::Color;
+use iodilos::prelude::Color;
 use std::borrow::Cow;
 use syntect::highlighting::{Theme, ThemeSet};
 
