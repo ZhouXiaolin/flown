@@ -4,14 +4,9 @@
 //! the global `on_key` router. Reads the shared [`UiState`] plus the agent
 //! handle, event sender, and persistence sender from iodilos context.
 //!
-//! Key handling: the editor's `handle_key` is a pure function over
-//! `EditorState`; the App calls it (capturing the result via a `Cell` since
-//! `RwSignal::update` returns `()`), writes the result back to the `input`
-//! signal, and reacts to `Submit` (spawn agent prompt + ship a persistence
-//! request). `Esc` aborts a running agent or quits when idle; `Ctrl-Q` always
-//! quits. The full cursor-provider editor rendering lands in Phase 3.
+//! Key handling: the editor's `handle_key` composes iodilos `TextAreaState`
+//! with agent-specific slash completion, then App reacts to `Submit`.
 
-use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -29,7 +24,7 @@ use crate::tui::components::editor::InputEditorProps;
 use crate::tui::components::hint_bar::HintBarProps;
 use crate::tui::components::status_line::StatusLineProps;
 use crate::tui::components::transcript::TranscriptProps;
-use crate::tui::editor::EditorAction;
+use crate::tui::editor::{self, EditorAction};
 use crate::tui::runtime::PersistReq;
 use crate::tui::state::UiState;
 
@@ -102,11 +97,10 @@ fn handle_app_key(
     // Ctrl-C clears a non-empty input first; when the editor is already empty it
     // falls back to application exit.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        let has_input = state
-            .input
-            .with(|es| es.lines.iter().any(|line| !line.is_empty()));
+        let has_input = state.input.with(|input| !input.is_empty());
         if has_input {
-            state.input.update(|es| es.clear());
+            state.input.update(|input| input.clear());
+            state.slash_popup.set(None);
         } else {
             iodilos::quit();
         }
@@ -121,14 +115,12 @@ fn handle_app_key(
         return true;
     }
 
-    // Route everything else to the editor. `update` returns `()`, so capture
-    // the action via a Cell shared into the closure.
-    let action_cell = Cell::new(EditorAction::None);
-    let action_ref = &action_cell;
-    state.input.update(|es| {
-        action_ref.set(es.handle_key(key));
-    });
-    let action = action_cell.get();
+    // Route everything else to the editor glue.
+    let mut input = state.input.get();
+    let mut popup = state.slash_popup.get();
+    let action = editor::handle_key(&mut input, &mut popup, key);
+    state.input.set(input);
+    state.slash_popup.set(popup);
 
     match action {
         EditorAction::Submit => {
@@ -137,12 +129,13 @@ fn handle_app_key(
             if text.is_empty() {
                 return true;
             }
-            state.input.update(|es| es.clear());
+            state.input.update(|input| input.clear());
+            state.slash_popup.set(None);
 
             if text.starts_with('/') {
                 let mut handle: Rc<UiState> = Rc::clone(state);
                 let should_quit =
-                    crate::slash_commands::handle_slash_command(&text, &mut handle, config);
+                    crate::tui::slash_commands::handle_slash_command(&text, &mut handle, config);
                 if should_quit {
                     iodilos::quit();
                 }

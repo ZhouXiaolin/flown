@@ -32,7 +32,6 @@ use iodilos::prelude::*;
 use crate::cli;
 use crate::config::Config;
 use crate::tui::components::app::{App, AppProps};
-use crate::tui::editor::EditorState;
 use crate::tui::state::{BUSY_FRAMES, StatusInfo, UiState};
 
 /// Run the TUI. Called from `interactive_mode.rs` after the agent + config are
@@ -135,7 +134,7 @@ pub async fn run_tui(
 
     renderer.mount(move || {
         // The shared reactive state, seeded with the initial status + busy flag.
-        let state = Rc::new(UiState::new(EditorState::default()));
+        let state = Rc::new(UiState::new(TextAreaState::default()));
         state.status.update(|s| *s = mount_status.clone());
         state.busy.set(mount_busy);
 
@@ -187,7 +186,7 @@ pub async fn run_tui(
         view! { App() }
     });
 
-    renderer.run_blocking()?;
+    renderer.run().await?;
     Ok(())
 }
 

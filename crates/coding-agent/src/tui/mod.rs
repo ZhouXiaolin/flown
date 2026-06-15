@@ -4,7 +4,7 @@
 //! - [`state`] — reactive state model (`UiState`, signals, push helpers).
 //! - [`runtime`] — the `run_tui` entry point + cross-runtime flume bridge
 //!   (tokio agent driver ↔ iodilos event pump).
-//! - [`editor`] — pure editor logic (`EditorState`, `handle_key`).
+//! - [`editor`] — slash-completion glue over iodilos `TextAreaState`.
 //! - [`tool_format`] — pure tool-call formatting helpers.
 //! - [`components`] — the iodilos components (App, Transcript, MessageBlock,
 //!   StatusLine, HintBar; editor rendering lands in Phase 3).
@@ -18,3 +18,4 @@ pub mod runtime;
 pub mod state;
 pub mod theme;
 pub mod tool_format;
+mod slash_commands;

@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-use super::editor::EditorState;
+use super::editor::SlashPopup;
 use super::tool_format::format_tool_call;
 
 // ── Conversation model ────────────────────────────────────────────────
@@ -91,7 +91,9 @@ pub struct UiState {
     /// Status-line snapshot.
     pub status: RwSignal<StatusInfo>,
     /// The editor buffer (text, cursor, slash popup).
-    pub input: RwSignal<EditorState>,
+    pub input: RwSignal<TextAreaState>,
+    /// Slash-completion popup state for the editor.
+    pub slash_popup: RwSignal<Option<SlashPopup>>,
     /// Scroll offset in lines from the bottom; `usize::MAX` means "stuck to
     /// bottom" (auto-follow). The transcript component resolves this against
     /// the viewport height to pick the visible window.
@@ -105,13 +107,14 @@ pub struct UiState {
 
 impl UiState {
     /// Build a fresh state with empty signals. `editor` is the initial editor
-    /// state (usually `EditorState::default()`).
-    pub fn new(editor: EditorState) -> Self {
+    /// state (usually `TextAreaState::default()`).
+    pub fn new(editor: TextAreaState) -> Self {
         Self {
             entries: create_rw_signal(Vec::new()),
             busy: create_rw_signal(false),
             status: create_rw_signal(StatusInfo::default()),
             input: create_rw_signal(editor),
+            slash_popup: create_rw_signal(None),
             scroll_offset: create_rw_signal(usize::MAX),
             thinking_acc: create_rw_signal(String::new()),
             in_thinking: create_rw_signal(false),
@@ -261,7 +264,7 @@ mod tests {
     #[test]
     fn assistant_stream_keeps_manual_scroll_position() {
         let (offset, owner) = create_root(|| {
-            let state = UiState::new(EditorState::default());
+            let state = UiState::new(TextAreaState::default());
             state.push_assistant("first");
             state.scroll_up(4);
 
@@ -277,7 +280,7 @@ mod tests {
     #[test]
     fn assistant_stream_follows_when_stuck_to_bottom() {
         let (offset, owner) = create_root(|| {
-            let state = UiState::new(EditorState::default());
+            let state = UiState::new(TextAreaState::default());
             state.push_assistant("first");
 
             assert!(state.append_to_assistant(" second"));

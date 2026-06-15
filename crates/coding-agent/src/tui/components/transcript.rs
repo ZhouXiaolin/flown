@@ -18,7 +18,7 @@ use crate::tui::state::{ConversationEntry, UiState};
 const RESERVED_ROWS: u16 = 7;
 
 #[component]
-pub fn Transcript() -> Node {
+pub fn Transcript() -> impl IntoView {
     let state = use_context::<Rc<UiState>>();
     let terminal_size = use_terminal_size();
     let scroll_state = Rc::clone(&state);
@@ -38,39 +38,14 @@ pub fn Transcript() -> Node {
         });
     });
 
-    view! {
-        View(
-            flex_direction: FlexDirection::Column,
-            flex_grow: 1.0,
-            flex_shrink: 1.0,
-            min_height: 0.0,
-            border: Borders::ALL,
-            border_color: Color::Rgb(40, 40, 48),
-            padding_all: 0.0,
-            on_mouse: move |ev: NodeMouseEvent| {
-                if let NodeMouseEvent::Scroll { direction, .. } = ev {
-                    match direction {
-                        ScrollDirection::Up => scroll_state.scroll_up(3),
-                        ScrollDirection::Down => scroll_state.scroll_down(3),
-                        ScrollDirection::Left | ScrollDirection::Right => {}
-                    }
-                }
-            },
-        ) {
-            View(
-                flex_direction: FlexDirection::Column,
-                flex_grow: 1.0,
-                flex_shrink: 1.0,
-                min_height: 0.0,
-                padding_left: 1.0,
-                padding_right: 1.0,
-                padding_top: 0.0,
-                padding_bottom: 0.0,
-            ) {
-                @(content)
-            }
-        }
-    }
+    let on_scroll = Callback::new(move |direction| match direction {
+        ScrollDirection::Up => scroll_state.scroll_up(3),
+        ScrollDirection::Down => scroll_state.scroll_down(3),
+        ScrollDirection::Left | ScrollDirection::Right => {}
+    });
+    let mut props = ScrollableViewportProps::new(content, on_scroll);
+    props.border_color = Color::Rgb(40, 40, 48);
+    ScrollableViewport::new(props)
 }
 
 fn transcript_viewport_lines(terminal_height: u16) -> usize {

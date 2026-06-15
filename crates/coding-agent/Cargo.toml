@@ -45,7 +45,7 @@ mmdflux = "2.5"
 unicodeit = "0.2"
 
 # Syntax highlighting
-syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+syntect = { version = "5.2", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
 
 # Clipboard
 arboard = "3"

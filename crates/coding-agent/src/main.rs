@@ -3,7 +3,6 @@ mod config;
 mod core;
 mod interactive_mode;
 mod native_env;
-mod slash_commands;
 mod tui;
 
 use clap::Parser;
