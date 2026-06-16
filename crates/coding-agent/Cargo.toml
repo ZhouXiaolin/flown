@@ -14,8 +14,8 @@ path = "src/main.rs"
 flown-ai = { path = "../ai" }
 flown-agent = { path = "../agent" }
 
-# TUI framework (SolidJS-inspired reactive TUI; path dep to ~/iodilos)
-iodilos = { path = "../../../iodilos/crates/iodilos" }
+# TUI framework (SolidJS-inspired reactive TUI; git submodule at vendor/iodilos)
+iodilos = { path = "../../vendor/iodilos/crates/iodilos" }
 
 # Async runtime
 tokio.workspace = true
