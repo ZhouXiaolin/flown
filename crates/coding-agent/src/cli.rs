@@ -240,7 +240,19 @@ pub fn cmd_completions(shell: clap_complete::Shell) -> anyhow::Result<()> {
 // ── Agent construction ────────────────────────────────────────────
 
 /// Build the Agent from config, model string, and API key.
-pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Config) -> anyhow::Result<flown_agent::Agent> {
+///
+/// Returns the harness plus the live `McpManager` (when MCP servers are
+/// configured). The manager escapes the function boundary so the TUI can hand
+/// it to the McpExtension (which registers MCP tools through the extension
+/// layer rather than through `built_in_coding_tools`).
+pub async fn build_agent(
+    model_str: &str,
+    api_key: Option<String>,
+    config: &Config,
+) -> anyhow::Result<(
+    flown_agent::harness::AgentHarness,
+    Option<Arc<tokio::sync::Mutex<crate::core::mcp::McpManager>>>,
+)> {
     flown_ai::init();
 
     let (provider_hint, model_id) = model_str
@@ -292,37 +304,60 @@ pub async fn build_agent(model_str: &str, api_key: Option<String>, config: &Conf
         };
 
     let system_prompt = crate::core::system_prompt::build_system_prompt(crate::core::system_prompt::BuildSystemPromptOptions {
-        cwd,
+        cwd: cwd.clone(),
         context_files,
         skills,
         ..Default::default()
     }).await;
 
-    let agent = flown_agent::Agent::new(flown_agent::AgentOptions {
-        initial_state: Some(flown_agent::AgentState {
-            system_prompt,
-            model,
-            thinking_level: flown_ai::types::ThinkingLevel::Off,
-            messages: Vec::new(),
-            is_streaming: false,
-            streaming_message: None,
-            pending_tool_calls: std::collections::HashSet::new(),
-            error_message: None,
-        }),
-        get_api_key: Some(Arc::new(move |_provider| {
-            let key = api_key.clone();
-            Box::pin(async move { key })
+    // Execution environment (cloned: moved into harness `env` and into tool builders).
+    let env = Arc::new(crate::native_env::NativeExecutionEnv::new());
+
+    // Set up tools. MCP tools are now registered via the McpExtension (see
+    // core/extensions), not through built_in_coding_tools.
+    let tools = crate::core::tools::built_in_coding_tools(env.clone());
+
+    // Build a persistent session. The harness owns the session internally and
+    // auto-persists user/assistant/tool-result messages on MessageEnd/TurnEnd
+    // (harness.rs:1709-1738), so coding-agent no longer needs its own persistence
+    // task. Session is not Clone, so it is created directly via the repo and
+    // moved into the harness by value.
+    use flown_agent::harness::session::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, SessionRepo,
+    };
+    let fs: Arc<dyn flown_agent::harness::env::types::FileSystem> =
+        Arc::new(crate::core::real_fs::RealFileSystem::new());
+    let sessions_root = dirs::home_dir()
+        .map(|h| h.join(".flown").join("agent").join("sessions"))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".flown/agent/sessions".to_string());
+    let repo = JsonlSessionRepo::new(fs, sessions_root);
+    let session = repo
+        .create(JsonlSessionCreateOptions {
+            id: None,
+            cwd: cwd.clone(),
+            parent_session_path: None,
+        })
+        .await?;
+
+    let harness = flown_agent::harness::AgentHarness::new(flown_agent::harness::AgentHarnessOptions {
+        env,
+        session,
+        tools,
+        system_prompt: flown_agent::harness::SystemPromptConfig::Static(system_prompt),
+        model,
+        thinking_level: Some(flown_ai::types::ThinkingLevel::Off),
+        get_api_key_and_headers: Some(Arc::new(move |_model: &flown_ai::types::Model| {
+            api_key.clone().map(|k| (k, None))
         })),
-        ..Default::default()
+        resources: None,
+        stream_options: None,
+        active_tool_names: None,
+        steering_mode: None,
+        follow_up_mode: None,
     });
 
-    // Set up tools
-    let env = Arc::new(crate::native_env::NativeExecutionEnv::new());
-    let tools = crate::core::tools::built_in_coding_tools(env, mcp_manager);
-
-    agent.set_tools(tools);
-
-    Ok(agent)
+    Ok((harness, mcp_manager))
 }
 
 pub fn detect_git_branch() -> Option<String> {

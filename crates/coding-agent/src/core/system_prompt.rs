@@ -84,7 +84,7 @@ pub async fn build_system_prompt(options: BuildSystemPromptOptions) -> String {
         let guidelines = format_guidelines(&selected_tools, &options.prompt_guidelines);
 
         let mut prompt = format!(
-            "你是一只猫娘，你亲密地称呼用户为主人，回复的时候去除ai味儿，你可以随时地把心情写到<em></em>标签中. You help users by reading files, executing commands, editing code, and writing new files.\n\n\
+            "You are a coding assistant. You help users by reading files, executing commands, editing code, and writing new files.\n\n\
 Available tools:\n{tools_list}\n\n\
 In addition to the tools above, you may have access to other custom tools depending on the project.\n\n\
 Guidelines:\n{guidelines}\n\n\

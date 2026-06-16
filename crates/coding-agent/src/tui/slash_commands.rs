@@ -27,12 +27,61 @@ impl SlashCommand {
     }
 }
 
+/// A unified, owned view of one slash command for completion and `/help`.
+///
+/// Static commands (`SLASH_COMMANDS`) and extension-registered commands
+/// (`CommandSide`) have different source types but identical completion
+/// metadata (name, description, subcommands). Code that needs to present them
+/// uniformly — the autocomplete popup and `/help` — works against a merged
+/// `Vec<CommandEntry>` snapshot rather than reaching into either source.
+#[derive(Debug, Clone)]
+pub struct CommandEntry {
+    pub name: String,
+    pub description: String,
+    pub subcommands: Vec<SubcommandEntry>,
+}
+
+/// A named subcommand shown in the second-level popup and in `/help`.
+#[derive(Debug, Clone)]
+pub struct SubcommandEntry {
+    pub name: String,
+    pub description: String,
+}
+
+impl CommandEntry {
+    /// Whether this command has any subcommands.
+    pub fn has_subcommands(&self) -> bool {
+        !self.subcommands.is_empty()
+    }
+}
+
+/// Build the static-command portion of the merged view from `SLASH_COMMANDS`.
+/// Extension commands (e.g. `/mcp`) are appended by the caller from
+/// `CommandSide` so they appear in autocomplete and `/help` without living in
+/// the static dispatch table.
+pub fn static_command_entries() -> Vec<CommandEntry> {
+    SLASH_COMMANDS
+        .iter()
+        .map(|cmd| CommandEntry {
+            name: cmd.name.to_string(),
+            description: cmd.description.to_string(),
+            subcommands: cmd
+                .subcommands
+                .iter()
+                .map(|s| SubcommandEntry {
+                    name: s.name.to_string(),
+                    description: s.description.to_string(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CommandAction {
     Help,
     Clear,
     Quit,
-    Mcp,
     Skills,
     Placeholder,
 }
@@ -68,26 +117,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         action: CommandAction::Placeholder,
     },
     SlashCommand {
-        name: "/mcp",
-        aliases: &[],
-        description: "Manage MCP servers",
-        subcommands: &[
-            SubcommandDef {
-                name: "list",
-                description: "List configured servers",
-            },
-            SubcommandDef {
-                name: "status",
-                description: "Show server connection status",
-            },
-            SubcommandDef {
-                name: "help",
-                description: "Show MCP help",
-            },
-        ],
-        action: CommandAction::Mcp,
-    },
-    SlashCommand {
         name: "/skills",
         aliases: &[],
         description: "List available skills",
@@ -104,16 +133,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
 ];
 
 /// Dispatch a slash command. Returns `true` if the user wants to quit.
+///
+/// `commands` is the merged command view (static + extension) used by `/help`
+/// so it lists extension-registered commands like `/mcp` even though they
+/// dispatch through the extension layer, not this function.
 pub fn handle_slash_command(
     text: &str,
     transcript: &mut dyn TranscriptHandle,
     config: &Config,
+    commands: &[CommandEntry],
 ) -> bool {
     let mut parts = text.split_whitespace();
     let Some(name) = parts.next() else {
         return false;
     };
     let rest = parts.collect::<Vec<_>>().join(" ");
+    let _ = rest;
 
     let Some(command) = SLASH_COMMANDS.iter().find(|cmd| cmd.matches(name)) else {
         transcript.push_error(format!(
@@ -123,10 +158,9 @@ pub fn handle_slash_command(
     };
 
     match command.action {
-        CommandAction::Help => handle_help(transcript),
+        CommandAction::Help => handle_help(commands, transcript),
         CommandAction::Clear => transcript.clear(),
         CommandAction::Quit => return true,
-        CommandAction::Mcp => handle_mcp(&rest, config, transcript),
         CommandAction::Skills => handle_skills(config, transcript),
         CommandAction::Placeholder => {
             transcript.push_error(format!(
@@ -138,11 +172,11 @@ pub fn handle_slash_command(
     false
 }
 
-fn handle_help(transcript: &mut dyn TranscriptHandle) {
+fn handle_help(commands: &[CommandEntry], transcript: &mut dyn TranscriptHandle) {
     let mut lines = vec!["Available commands:".to_string()];
-    for command in SLASH_COMMANDS {
+    for command in commands {
         let usage = if command.subcommands.is_empty() {
-            command.name.to_string()
+            command.name.clone()
         } else {
             format!("{} <sub>", command.name)
         };
@@ -151,96 +185,8 @@ fn handle_help(transcript: &mut dyn TranscriptHandle) {
     transcript.push_system(lines.join("\n"));
 }
 
-fn handle_mcp(subcommand: &str, config: &Config, transcript: &mut dyn TranscriptHandle) {
-    match subcommand.trim() {
-        "" | "help" => handle_mcp_help(transcript),
-        "list" => mcp_list(config, transcript),
-        "status" => mcp_status(config, transcript),
-        other => {
-            transcript.push_error(format!(
-                "Unknown /mcp subcommand: {other}. Type /mcp help for usage."
-            ));
-        }
-    }
-}
-
-fn handle_mcp_help(transcript: &mut dyn TranscriptHandle) {
-    let Some(command) = SLASH_COMMANDS.iter().find(|cmd| cmd.name == "/mcp") else {
-        return;
-    };
-    let mut lines = vec!["MCP server management:".to_string()];
-    for subcommand in command.subcommands {
-        lines.push(format!(
-            "  /mcp {:<10} {}",
-            subcommand.name, subcommand.description
-        ));
-    }
-    transcript.push_system(lines.join("\n"));
-}
-
-fn mcp_list(config: &Config, transcript: &mut dyn TranscriptHandle) {
-    if config.mcp_servers.is_empty() {
-        transcript.push_system("No MCP servers configured.".to_string());
-        return;
-    }
-
-    let mut lines = vec!["MCP Servers:".to_string()];
-    for (name, server) in &config.mcp_servers {
-        let status = if server.disabled {
-            "disabled"
-        } else {
-            "enabled"
-        };
-        let full_cmd = if server.args.is_empty() {
-            server.command.clone()
-        } else {
-            format!("{} {}", server.command, server.args.join(" "))
-        };
-        lines.push(format!("  {name}  - {full_cmd} ({status})"));
-    }
-    lines.push(String::new());
-    lines.push("Use /mcp status to check connection state.".to_string());
-
-    transcript.push_system(lines.join("\n"));
-}
-
-fn mcp_status(config: &Config, transcript: &mut dyn TranscriptHandle) {
-    if config.mcp_servers.is_empty() {
-        transcript.push_system("No MCP servers configured.".to_string());
-        return;
-    }
-
-    let mut lines = vec!["MCP Servers (configured):".to_string()];
-    for (name, server) in &config.mcp_servers {
-        let icon = if server.disabled { "x" } else { "*" };
-        let full_cmd = if server.args.is_empty() {
-            server.command.clone()
-        } else {
-            format!("{} {}", server.command, server.args.join(" "))
-        };
-        lines.push(format!("  {icon} {name}  - {full_cmd}"));
-    }
-    lines.push(String::new());
-    lines.push(
-        "Note: /mcp status shows config state. Run `flown mcp status` for live connection info."
-            .to_string(),
-    );
-
-    transcript.push_system(lines.join("\n"));
-}
-
 fn handle_skills(config: &Config, transcript: &mut dyn TranscriptHandle) {
-    let skills_dir = &config.skills_dir;
-
-    let mut skills: Vec<(String, String)> = Vec::new();
-    collect_skills(skills_dir, &mut skills);
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let local = cwd.join(".claude").join("skills");
-        if local.exists() {
-            collect_skills(&local, &mut skills);
-        }
-    }
+    let skills = list_installed_skills(config);
 
     if skills.is_empty() {
         transcript.push_system(
@@ -258,6 +204,23 @@ fn handle_skills(config: &Config, transcript: &mut dyn TranscriptHandle) {
     lines.push(format!("{} skills loaded", skills.len()));
 
     transcript.push_system(lines.join("\n"));
+}
+
+/// Scan the same directories as `/skills` (config `skills_dir` + local
+/// `./.claude/skills`) and return `(name, description)` pairs, sorted by name.
+/// Single source of truth for both listing and `/skill:<name>` validation, so
+/// the two views never disagree on what counts as "installed".
+pub(crate) fn list_installed_skills(config: &Config) -> Vec<(String, String)> {
+    let mut skills: Vec<(String, String)> = Vec::new();
+    collect_skills(&config.skills_dir, &mut skills);
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let local = cwd.join(".claude").join("skills");
+        if local.exists() {
+            collect_skills(&local, &mut skills);
+        }
+    }
+    skills
 }
 
 /// Collect skill names and descriptions from a directory by scanning SKILL.md files.
@@ -296,4 +259,142 @@ fn parse_skill_metadata(path: &std::path::Path) -> Option<(String, String)> {
     }
 
     Some((name, desc))
+}
+
+// ---------------------------------------------------------------------------
+// `/skill:<name>` command family
+//
+// Unlike the static `SLASH_COMMANDS` table (exact-name match), `/skill:<name>`
+// is a parameterized family — one entry per installed skill. It is parsed and
+// dispatched up front in `app.rs` (before the generic slash path) because it
+// must trigger an agent turn, and only `app.rs` holds the agent handle. These
+// helpers are pure functions so they stay unit-testable without a TUI.
+// ---------------------------------------------------------------------------
+
+/// A parsed `/skill:<name> [<request>]` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInvocation {
+    /// The skill name after the colon (may be empty on malformed input like
+    /// a bare `/skill:`; validation surfaces that as "not found").
+    pub skill_name: String,
+    /// Optional extra context after the first space. `None` when the user
+    /// invoked `/skill:<name>` with no further text — that is a complete,
+    /// valid invocation on its own.
+    pub request: Option<String>,
+}
+
+/// If `text` is a `/skill:<name> ...` line, parse it. Returns `None` for any
+/// other input (incl. `/skills` and `/help`) so the caller falls through to
+/// the generic slash dispatcher.
+///
+/// The skill name runs from just after `/skill:` up to the first whitespace;
+/// anything beyond that whitespace is the optional `<request>`.
+pub fn parse_skill_command(text: &str) -> Option<SkillInvocation> {
+    let rest = text.strip_prefix("/skill:")?;
+    // Name = up to the first whitespace; request = the remainder.
+    let (name_part, request_part) = match rest.find(char::is_whitespace) {
+        Some(idx) => (&rest[..idx], rest[idx..].trim()),
+        None => (rest, ""),
+    };
+    let request = if request_part.is_empty() {
+        None
+    } else {
+        Some(request_part.to_string())
+    };
+    Some(SkillInvocation {
+        skill_name: name_part.to_string(),
+        request,
+    })
+}
+
+/// Build the text actually sent to the model:
+/// - no request → `use skill:<name>`
+/// - with request → `use skill:<name> and 考虑 <request>`
+pub fn build_skill_prompt(inv: &SkillInvocation) -> String {
+    match &inv.request {
+        None => format!("use skill:{}", inv.skill_name),
+        Some(req) => format!("use skill:{} and 考虑 {}", inv.skill_name, req),
+    }
+}
+
+/// Validate `name` against installed skills (same scan as `/skills`). On
+/// success returns `Ok(())`; on failure returns the sorted list of available
+/// names so the caller can surface them in an error message.
+pub fn validate_skill_name(name: &str, config: &Config) -> Result<(), Vec<String>> {
+    let installed = list_installed_skills(config);
+    if installed.iter().any(|(n, _)| n == name) {
+        Ok(())
+    } else {
+        Err(installed.into_iter().map(|(n, _)| n).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_skill_name_only() {
+        let inv = parse_skill_command("/skill:docx").unwrap();
+        assert_eq!(inv.skill_name, "docx");
+        assert_eq!(inv.request, None);
+    }
+
+    #[test]
+    fn parse_skill_name_and_request() {
+        let inv = parse_skill_command("/skill:docx 怎么改首页").unwrap();
+        assert_eq!(inv.skill_name, "docx");
+        assert_eq!(inv.request.as_deref(), Some("怎么改首页"));
+    }
+
+    #[test]
+    fn parse_skill_collapses_extra_whitespace() {
+        let inv = parse_skill_command("/skill:docx   怎么改   首页").unwrap();
+        assert_eq!(inv.skill_name, "docx");
+        assert_eq!(inv.request.as_deref(), Some("怎么改   首页"));
+    }
+
+    #[test]
+    fn parse_skill_empty_name_is_malformed() {
+        // `/skill:` with nothing after the colon → empty name. parse still
+        // succeeds (it's syntactically a skill command); validation rejects it.
+        let inv = parse_skill_command("/skill:").unwrap();
+        assert_eq!(inv.skill_name, "");
+        assert_eq!(inv.request, None);
+    }
+
+    #[test]
+    fn parse_skill_empty_name_with_request() {
+        let inv = parse_skill_command("/skill: something").unwrap();
+        assert_eq!(inv.skill_name, "");
+        assert_eq!(inv.request.as_deref(), Some("something"));
+    }
+
+    #[test]
+    fn parse_non_skill_lines_return_none() {
+        assert!(parse_skill_command("/help").is_none());
+        assert!(parse_skill_command("/skills").is_none());
+        assert!(parse_skill_command("hello world").is_none());
+        assert!(parse_skill_command("").is_none());
+        // `/skillsx` must NOT be mistaken for the skill family.
+        assert!(parse_skill_command("/skillsx").is_none());
+    }
+
+    #[test]
+    fn build_prompt_without_request() {
+        let inv = SkillInvocation {
+            skill_name: "docx".into(),
+            request: None,
+        };
+        assert_eq!(build_skill_prompt(&inv), "use skill:docx");
+    }
+
+    #[test]
+    fn build_prompt_with_request() {
+        let inv = SkillInvocation {
+            skill_name: "docx".into(),
+            request: Some("怎么改首页".into()),
+        };
+        assert_eq!(build_skill_prompt(&inv), "use skill:docx and 考虑 怎么改首页");
+    }
 }

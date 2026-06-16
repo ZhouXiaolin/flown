@@ -1,3 +1,4 @@
+pub mod extensions;
 pub mod mcp;
 pub mod real_fs;
 pub mod session_manager;
