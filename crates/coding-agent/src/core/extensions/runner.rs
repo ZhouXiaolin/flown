@@ -13,6 +13,7 @@
 //! See `docs/m2a-extension-api-draft.md` and the threading-model note in
 //! [`super::types`].
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -20,7 +21,8 @@ use flown_agent::harness::AgentHarness;
 use flown_agent::types::AgentTool;
 
 use super::types::{
-    CommandEffect, CommandHandler, Extension, ExtensionApi, RegisteredCommand, ToolHandle,
+    CommandEffect, ControlRuntime, Extension, ExtensionApi, RegisteredCommand,
+    ToolHandle,
 };
 
 /// Run every extension's `register` on the tokio side, then split the result
@@ -121,9 +123,17 @@ impl CommandTable {
         CommandSide {
             commands: self.commands,
             sink,
+            control: None,
+            control_handlers: HashMap::new(),
         }
     }
 }
+
+/// An iodilos-side control handler: receives the args (everything after the
+/// command name) and the [`ControlRuntime`]. Bound at mount (not during
+/// `register`, which runs on tokio) because it drives `Rc`-based state. NOT
+/// `Send`.
+type ControlHandler = Rc<dyn Fn(&str, &dyn ControlRuntime)>;
 
 /// iodilos-side runtime: dispatches extension slash commands and interprets
 /// their [`CommandEffect`]s into `UiState` operations. NOT `Send` — it owns the
@@ -131,6 +141,13 @@ impl CommandTable {
 pub struct CommandSide {
     commands: Vec<RegisteredCommand>,
     sink: Rc<CommandSink>,
+    /// The conversation-stack capability, bound at mount. Present when a
+    /// `RuntimeControl` exists (i.e. the TUI is mounted with a live stack).
+    control: Option<Rc<dyn ControlRuntime>>,
+    /// Per-name control handlers (`/btw` → its enter/exit logic). Populated by
+    /// [`Self::bind_control`] at mount; looked up for commands whose
+    /// `needs_control` is `true`.
+    control_handlers: HashMap<String, ControlHandler>,
 }
 
 /// Sink the iodilos side uses to apply [`CommandEffect`]s. Holds the live
@@ -149,6 +166,29 @@ impl CommandSide {
         &self.commands
     }
 
+    /// Bind the conversation-stack capability and a control handler for a
+    /// command name. Called once at mount, after the [`ControlRuntime`] exists.
+    /// `name` must match a registered command with `needs_control == true`.
+    pub fn bind_control(&mut self, name: &str, runtime: Rc<dyn ControlRuntime>, handler: ControlHandler) {
+        self.control = Some(runtime);
+        self.control_handlers.insert(name.to_string(), handler);
+    }
+
+    /// Whether a control capability is bound (i.e. `/btw` can run).
+    pub fn has_control(&self) -> bool {
+        self.control.is_some()
+    }
+
+    /// Exit the active btw layer, if any. Reaches the bound [`ControlRuntime`]
+    /// (the same one `/btw` uses). Called by `app.rs`'s Ctrl-C handler when the
+    /// active layer is a btw layer. No-op when no control is bound or the
+    /// active layer is Main (the runtime's `exit_btw` guards on that itself).
+    pub fn exit_active_btw(&self) {
+        if let Some(rt) = self.control.as_ref() {
+            rt.exit_btw();
+        }
+    }
+
     /// Resolve `text` against registered commands. `text` is the full input
     /// (e.g. `/mcp list`). Returns the command + args if the name matches a
     /// registered command or one of its aliases.
@@ -163,13 +203,25 @@ impl CommandSide {
         Some((cmd, args))
     }
 
-    /// Dispatch a command: call its handler with the args and apply the
-    /// returned [`CommandEffect`] to the transcript. Returns `true` if a
-    /// registered command handled it.
+    /// Dispatch a command. For effect commands (`/mcp`) it calls the handler
+    /// and applies the returned [`CommandEffect`]. For control commands
+    /// (`/btw`) it calls the bound control handler with the [`ControlRuntime`].
+    /// Returns `true` if a registered command handled it.
     pub fn dispatch(&self, text: &str) -> bool {
         let Some((cmd, args)) = self.resolve(text) else {
             return false;
         };
+        if cmd.needs_control {
+            if let (Some(rt), Some(handler)) =
+                (self.control.as_ref(), self.control_handlers.get(&cmd.name))
+            {
+                handler(&args, rt.as_ref());
+                return true;
+            }
+            // needs_control but no runtime bound (session-only mode): fall
+            // through to the effect handler so the placeholder can surface an
+            // error rather than silently no-op'ing.
+        }
         let effect = (cmd.handler)(&args);
         self.apply(effect);
         true

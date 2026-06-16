@@ -13,11 +13,12 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-use crate::tui::state::{BUSY_FRAMES, StatusInfo, UiState};
+use crate::tui::state::{BUSY_FRAMES, StatusInfo};
 
 #[component]
 pub fn StatusLine() -> Node {
-    let state = use_context::<Rc<UiState>>();
+    let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
+    let state = Rc::clone(&stack.active().state);
     let status = state.status;
 
     let node = Node::new_richtext();

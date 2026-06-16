@@ -30,17 +30,17 @@ use flown_agent::harness::AgentHarness;
 
 #[component]
 pub fn App() -> Node {
-    let state = use_context::<Rc<UiState>>();
+    let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
     let agent = use_context::<Option<Arc<AgentHarness>>>();
     let config = use_context::<crate::config::Config>();
 
     // The global key router. Runs under this component's owner (registered at
     // mount); captures the handles by move.
-    let key_state = Rc::clone(&state);
+    let key_stack = Rc::clone(&stack);
     let key_agent = agent;
     let key_config = config;
     on_key(move |key: KeyEvent| -> bool {
-        handle_app_key(key, &key_state, key_agent.as_ref(), &key_config)
+        handle_app_key(key, &key_stack, key_agent.as_ref(), &key_config)
     });
 
     view! {
@@ -58,13 +58,17 @@ pub fn App() -> Node {
     }
 }
 
-/// The global key router. Returns `true` if the key was consumed.
+/// The global key router. Returns `true` if the key was consumed. Operates on
+/// the conversation stack's **active** layer, so all input/streaming targets
+/// whichever view is visible (main or btw).
 fn handle_app_key(
     key: KeyEvent,
-    state: &Rc<UiState>,
+    stack: &Rc<crate::tui::conversation::ConversationStack>,
     agent: Option<&Arc<AgentHarness>>,
     config: &crate::config::Config,
 ) -> bool {
+    let state = Rc::clone(&stack.active().state);
+
     // Esc cancels the current transient state in priority order:
     //   1. slash popup open  → close it, stay in input
     //   2. input non-empty   → clear it
@@ -92,13 +96,20 @@ fn handle_app_key(
         iodilos::quit();
         return true;
     }
-    // Ctrl-C clears a non-empty input first; when the editor is already empty it
-    // falls back to application exit.
+    // Ctrl-C: in a btw layer with empty input, exit btw (discard). Otherwise
+    // clear non-empty input, or quit the app (main layer, empty input).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         let has_input = state.input.with(|input| !input.is_empty());
         if has_input {
             state.input.update(|input| input.clear());
             state.slash_popup.set(None);
+        } else if stack.active_is_btw() {
+            // In a btw layer: Ctrl+C exits btw (discards it). CommandSide
+            // holds the bound RuntimeControl; expose exit through it.
+            let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
+            if let Some(cs) = command_side.as_ref() {
+                cs.exit_active_btw();
+            }
         } else {
             iodilos::quit();
         }
@@ -115,8 +126,9 @@ fn handle_app_key(
 
     // Route everything else to the editor glue.
     // Build the merged command view for autocomplete: static commands first,
-    // then extension-registered commands (e.g. /mcp) appended in registration
-    // order. The popup captures a snapshot of this each time it opens.
+    // then extension-registered commands (e.g. /mcp, /btw) appended in
+    // registration order. The popup captures a snapshot of this each time it
+    // opens.
     let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
     let mut commands = crate::tui::slash_commands::static_command_entries();
     if let Some(cs) = command_side.as_ref() {
@@ -191,18 +203,18 @@ fn handle_app_key(
                     }
                 }
             } else if text.starts_with('/') {
-                // Extension commands (e.g. /mcp) get first crack at dispatch.
-                // The extension's CommandSide owns its handlers and interprets
-                // their CommandEffects into UiState ops. If it claims the line,
-                // skip the static SLASH_COMMANDS path entirely — `/mcp` no
-                // longer lives in that table.
-                let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
+                // Extension commands (e.g. /mcp, /btw) get first crack at
+                // dispatch. CommandSide routes control commands (/btw) to the
+                // bound RuntimeControl and effect commands (/mcp) to their
+                // handler. If it claims the line, skip the static path.
+                let command_side =
+                    use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
                 if let Some(cs) = command_side.as_ref() {
                     if cs.dispatch(&text) {
                         return true;
                     }
                 }
-                let mut handle: Rc<UiState> = Rc::clone(state);
+                let mut handle: Rc<UiState> = Rc::clone(&state);
                 let should_quit = crate::tui::slash_commands::handle_slash_command(
                     &text,
                     &mut handle,
@@ -220,15 +232,20 @@ fn handle_app_key(
                     return true;
                 }
                 state.push_user(&text);
-                if let Some(agent) = agent {
+                // Use the ACTIVE layer's harness (may differ from the main
+                // agent handle when in a btw layer). Fall back to the main
+                // agent only when the active layer has no harness.
+                let active_layer = stack.active();
+                let target = active_layer.harness.as_ref().or(agent);
+                if let Some(agent) = target {
                     state.busy.set(true);
                     state.status.update(|s| s.busy = true);
                     let agent = Arc::clone(agent);
                     let prompt = text;
                     // Spawn the harness driver on tokio. We're on the iodilos
                     // thread; tokio::spawn hands the future to the runtime.
-                    // Events arrive via the subscriber registered at mount
-                    // (runtime.rs), not via this task's return value.
+                    // Events arrive via the subscriber registered for this
+                    // layer (runtime.rs for main; enter_btw for btw).
                     tokio::spawn(async move {
                         let _ = agent.prompt(&prompt, None).await;
                     });

@@ -12,6 +12,7 @@
 //!   (`parse_markdown_with_width`, color themes).
 
 pub mod components;
+pub mod conversation;
 pub mod editor;
 pub mod markdown;
 pub mod runtime;

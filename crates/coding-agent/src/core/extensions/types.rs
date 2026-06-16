@@ -32,7 +32,6 @@ use std::sync::Arc;
 
 use flown_agent::types::AgentTool;
 
-use crate::config::Config;
 
 // ── Extension trait ─────────────────────────────────────────────────────
 
@@ -115,6 +114,43 @@ pub struct RegisteredCommand {
     pub name: String,
     pub meta: CommandMeta,
     pub handler: CommandHandler,
+    /// When `true`, the command needs the iodilos-side [`ControlRuntime`] to
+    /// drive the conversation stack (e.g. `/btw`). The effect `handler` is
+    /// ignored for such commands; [`super::CommandSide`] looks up a
+    /// [`ControlHandler`] bound at mount by name and dispatches through it.
+    /// Effect-only commands (`/mcp`) leave this `false` and use `handler`.
+    pub needs_control: bool,
+}
+
+// ── Control-runtime (iodilos-side capability, for commands like /btw) ────
+
+/// Iodilos-side capability handed to *control* commands (those registered with
+/// [`ExtensionApi::register_control_command`]). Lets a command drive the
+/// conversation stack — enter/exit a btw layer, submit a turn, notify —
+/// without returning a plain [`CommandEffect`], because "enter btw then
+/// optionally send a message" is sequential logic over live runtime state.
+///
+/// This mirrors pi-mono's `ExtensionCommandContext` (handler receives a
+/// stateful `ctx`, not a pure effect). Implementations live on the iodilos
+/// thread and hold `Rc`-based state, so this trait is **not** `Send` and is
+/// never constructed during `register` (which runs on tokio). `CommandSide`
+/// builds the impl at mount and binds it to the command by name.
+pub trait ControlRuntime {
+    /// Enter a btw layer, forking the active session's history. If `prompt` is
+    /// `Some`, submit it as a turn on the new layer immediately.
+    fn enter_btw(&self, prompt: Option<String>);
+    /// Exit the active btw layer (aborts it, discards it). No-op on Main.
+    fn exit_btw(&self);
+    /// Submit `text` as a user turn on the active layer's harness.
+    fn send_to_active(&self, text: String);
+    /// Push an informational line into the active layer's transcript.
+    fn notify_active(&self, text: String);
+    /// Push an error line into the active layer's transcript.
+    fn notify_error_active(&self, text: String);
+    /// Clear the active layer's transcript.
+    fn clear_active(&self);
+    /// Whether the active layer is a btw layer.
+    fn active_is_btw(&self) -> bool;
 }
 
 // ── ToolHandle (runtime add/remove) ─────────────────────────────────────
@@ -250,12 +286,34 @@ impl ExtensionApi {
         }
     }
 
-    /// Register a slash command. `name` includes the leading `/` (e.g. `"/mcp"`).
+    /// Register an effect-only slash command (`/mcp`). `name` includes the
+    /// leading `/` (e.g. `"/mcp"`). The handler returns a [`CommandEffect`].
     pub fn register_command(&mut self, name: &str, meta: CommandMeta, handler: CommandHandler) {
         self.commands.push(RegisteredCommand {
             name: name.to_string(),
             meta,
             handler,
+            needs_control: false,
+        });
+    }
+
+    /// Register a control slash command (`/btw`) that needs the iodilos-side
+    /// [`ControlRuntime`] to drive the conversation stack. Only the metadata
+    /// (`name`/`meta`) is captured here; the actual handler is an
+    /// iodilos-side closure bound at mount (see [`super::CommandSide`]),
+    /// because it holds `Rc`-based state and cannot be `Send`. The placeholder
+    /// `handler` is a no-op used only so the `Send + Sync` shape is uniform.
+    pub fn register_control_command(
+        &mut self,
+        name: &str,
+        meta: CommandMeta,
+        placeholder: CommandHandler,
+    ) {
+        self.commands.push(RegisteredCommand {
+            name: name.to_string(),
+            meta,
+            handler: placeholder,
+            needs_control: true,
         });
     }
 

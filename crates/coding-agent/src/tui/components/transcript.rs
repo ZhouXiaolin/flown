@@ -13,7 +13,7 @@ use std::rc::Rc;
 use iodilos::prelude::*;
 
 use crate::tui::components::message_block::render_entry;
-use crate::tui::state::{ConversationEntry, UiState};
+use crate::tui::state::ConversationEntry;
 
 const RESERVED_ROWS: u16 = 7;
 /// Columns consumed by the `ScrollableViewport` chrome: left/right border (1+1)
@@ -24,7 +24,8 @@ const TRANSCRIPT_CHROME_COLS: u16 = 4;
 
 #[component]
 pub fn Transcript() -> impl IntoView {
-    let state = use_context::<Rc<UiState>>();
+    let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
+    let state = Rc::clone(&stack.active().state);
     let terminal_size = use_terminal_size();
     let scroll_state = Rc::clone(&state);
 

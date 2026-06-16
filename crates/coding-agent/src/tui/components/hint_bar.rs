@@ -13,11 +13,11 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-use crate::tui::state::UiState;
 
 #[component]
 pub fn HintBar() -> Node {
-    let state = use_context::<Rc<UiState>>();
+    let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
+    let state = Rc::clone(&stack.active().state);
     let busy = state.busy;
 
     let node = Node::new_richtext();

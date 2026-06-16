@@ -283,7 +283,7 @@ impl Shell for NativeExecutionEnv {
 
         let child = cmd
             .spawn()
-            .map_err(|e| ExecutionError {
+            .map_err(|_e| ExecutionError {
                 code: ExecutionErrorCode::SpawnError,
             })?;
 
@@ -291,7 +291,7 @@ impl Shell for NativeExecutionEnv {
             let timeout = std::time::Duration::from_millis(timeout);
             match tokio::time::timeout(timeout, child.wait_with_output()).await {
                 Ok(result) => {
-                    result.map_err(|e| ExecutionError {
+                    result.map_err(|_e| ExecutionError {
                         code: ExecutionErrorCode::SpawnError,
                     })?
                 }
@@ -305,7 +305,7 @@ impl Shell for NativeExecutionEnv {
             child
                 .wait_with_output()
                 .await
-                .map_err(|e| ExecutionError {
+                .map_err(|_e| ExecutionError {
                     code: ExecutionErrorCode::SpawnError,
                 })?
         };

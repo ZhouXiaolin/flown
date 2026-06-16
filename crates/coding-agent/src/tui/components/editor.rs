@@ -5,11 +5,11 @@ use std::rc::Rc;
 use iodilos::prelude::*;
 
 use crate::tui::editor;
-use crate::tui::state::UiState;
 
 #[component]
 pub fn InputEditor() -> Node {
-    let state = use_context::<Rc<UiState>>();
+    let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
+    let state = Rc::clone(&stack.active().state);
     let input = state.input;
     let slash_popup = state.slash_popup;
 

@@ -15,6 +15,7 @@
 //! `/skill:xxx`, …) stays in its existing modules and does **not** go through
 //! this layer.
 
+pub mod btw;
 pub mod mcp;
 pub mod runner;
 pub mod types;
@@ -28,9 +29,10 @@ use crate::config::Config;
 
 pub use runner::{build, CommandSide, CommandSink, CommandTable, ToolSide};
 pub use types::{
-    CommandEffect, CommandHandler, CommandMeta, Extension, ExtensionApi, RegisteredCommand,
-    SubcommandDef, ToolHandle,
+    ControlRuntime, Extension,
 };
+
+pub use btw::parse_btw_args;
 
 /// Run every extension's `register` on the tokio side and split the result.
 ///
@@ -48,9 +50,9 @@ pub fn build_runner(
     built_in_tools: Vec<AgentTool>,
     mcp: Option<Arc<tokio::sync::Mutex<crate::core::mcp::McpManager>>>,
 ) -> (ToolSide, CommandTable) {
-    let extensions: Vec<Box<dyn Extension>> = vec![Box::new(mcp::McpExtension::new(
-        _config.clone(),
-        mcp,
-    ))];
+    let extensions: Vec<Box<dyn Extension>> = vec![
+        Box::new(mcp::McpExtension::new(_config.clone(), mcp)),
+        Box::new(btw::BtwExtension::new()),
+    ];
     build(harness, built_in_tools, extensions)
 }
