@@ -1,9 +1,6 @@
-use flown_agent::{
-    Agent, AgentEvent, AgentMessage, AgentOptions, AgentState, AgentTool, AgentToolResult,
-};
-use omp_ai::init;
-use omp_ai::types::*;
-use futures::stream::StreamExt;
+use flown_agent::{Agent, AgentEvent, AgentMessage, AgentOptions, AgentTool, AgentToolResult};
+use flown_ai::register_built_in_api_providers;
+use flown_ai::types::*;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -84,118 +81,74 @@ fn create_bash_tool() -> AgentTool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init();
+    register_built_in_api_providers();
 
-    let agent = Agent::new(AgentOptions {
-        initial_state: Some(AgentState {
-            system_prompt: "You are a helpful assistant that can execute bash commands. Use the bash tool to run commands and help the user accomplish their tasks.".to_string(),
-            model: omp_ai::get_model("deepseek", "deepseek-v4-flash")
-                .expect("MiMo-V2.5  model not found"),
-            thinking_level: ThinkingLevel::Minimal,
-            messages: Vec::new(),
-            is_streaming: false,
-            streaming_message: None,
-            pending_tool_calls: Vec::new(),
-            error_message: None,
-        }),
-        get_api_key: Some(Arc::new(|_provider| {
-            Box::pin(async { std::env::var("DEEPSEEK_API_KEY").ok() })
-        })),
-        ..Default::default()
-    });
-
+    let mut options = AgentOptions::default();
+    options.get_api_key = Some(Arc::new(|_provider| {
+        Box::pin(async { std::env::var("DEEPSEEK_API_KEY").ok() })
+    }));
+    let agent = Agent::new(options);
     agent.set_tools(vec![create_bash_tool()]);
-
-    println!("Agent created!");
-    println!("System prompt: {}", agent.state().system_prompt);
-    println!("Model: {}", agent.state().model.name);
-    println!();
-
-    println!("Sending prompt to agent...");
-    let mut stream = agent.prompt(
-        "Write a Python script to calculate fibonacci(100) and run it. Show me the result."
+    agent.set_system_prompt(
+        "You are a helpful coding agent. Use the bash tool to run commands."
             .to_string(),
     );
 
-    let mut in_thinking = false;
+    println!("Agent ready. Model: {}", agent.state().model.name);
+    println!();
 
-    while let Some(event) = stream.next().await {
-        match event {
-            AgentEvent::AgentStart => {
-                println!("Agent started processing...");
-            }
-            AgentEvent::MessageStart { message } => match &message {
-                AgentMessage::User(user) => {
-                    if let MessageContent::Text(text) = &user.content {
-                        println!("User: {}", text);
+    // Subscribe to lifecycle events (callback model). Listeners are awaited in
+    // subscription order and are part of the run's settlement — wait_for_idle()
+    // does not resolve until the agent_end listener returns.
+    let _sub = agent.subscribe(Arc::new(|event, _signal| {
+        Box::pin(async move {
+            match event {
+                AgentEvent::MessageStart { message } => {
+                    if let AgentMessage::User(user) = &message {
+                        if let MessageContent::Text(text) = &user.content {
+                            println!("User: {}", text);
+                        }
+                    } else if matches!(message, AgentMessage::Assistant(_)) {
+                        print!("Assistant: ");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
                     }
                 }
-                AgentMessage::Assistant(_) => {
-                    print!("Assistant: ");
-                }
-                _ => {}
-            },
-            AgentEvent::MessageUpdate {
-                assistant_message_event,
-                ..
-            } => match assistant_message_event {
-                AssistantMessageEvent::TextDelta { delta, .. } => {
-                    if in_thinking {
+                AgentEvent::MessageUpdate {
+                    assistant_message_event,
+                    ..
+                } => match assistant_message_event {
+                    AssistantMessageEvent::TextDelta { delta, .. } => {
+                        print!("{delta}");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                    }
+                    _ => {}
+                },
+                AgentEvent::MessageEnd { message } => {
+                    if let AgentMessage::Assistant(assistant) = &message {
                         println!();
-                        in_thinking = false;
-                    }
-                    print!("{}", delta);
-                }
-                AssistantMessageEvent::ThinkingStart { .. } => {
-                    print!("[thinking] ");
-                    in_thinking = true;
-                }
-                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                    print!("{}", delta);
-                }
-                AssistantMessageEvent::ThinkingEnd { .. } => {
-                    println!();
-                    in_thinking = false;
-                }
-                _ => {}
-            },
-            AgentEvent::MessageEnd { message } => match &message {
-                AgentMessage::Assistant(assistant) => {
-                    if in_thinking {
-                        println!();
-                        in_thinking = false;
-                    }
-                    println!();
-                    println!("--- Stop reason: {:?} ---", assistant.stop_reason);
-                    if let Some(err) = &assistant.error_message {
-                        println!("Error: {}", err);
-                    }
-                }
-                AgentMessage::ToolResult(result) => {
-                    println!("Tool result:");
-                    for content in &result.content {
-                        if let ToolResultContent::Text(text) = content {
-                            println!("{}", text.text);
+                        println!("--- stop reason: {:?} ---", assistant.stop_reason);
+                        if let Some(err) = &assistant.error_message {
+                            println!("Error: {}", err);
                         }
                     }
-                    println!("---");
                 }
+                AgentEvent::TurnEnd { .. } => println!(),
+                AgentEvent::AgentEnd { .. } => println!("\n[agent done]"),
                 _ => {}
-            },
-            AgentEvent::ToolExecutionStart {
-                tool_name, args, ..
-            } => {
-                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                println!("[Executing tool: {}] $ {}", tool_name, cmd);
             }
-            AgentEvent::ToolExecutionEnd { .. } => {}
-            AgentEvent::AgentEnd { messages } => {
-                println!();
-                println!("=== Agent finished! Total messages: {} ===", messages.len());
-            }
-            _ => {}
-        }
-    }
+        })
+    }));
+
+    let prompt = std::env::args().nth(1).unwrap_or_else(|| {
+        "List the files in the current directory using bash.".to_string()
+    });
+    agent
+        .prompt(flown_agent::PromptInput::Text(prompt))
+        .await
+        .expect("prompt failed");
+    agent.wait_for_idle().await;
 
     Ok(())
 }
