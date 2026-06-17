@@ -354,11 +354,6 @@ pub enum AgentError {
     CannotContinueFromAssistant,
     #[error("{0}")]
     Other(String),
-    // Legacy variants — removed in Task 6 when `Agent` is rewritten:
-    #[error("agent is busy")]
-    Busy,
-    #[error("no assistant response")]
-    NoResponse,
 }
 
 /// Input to [`crate::Agent::prompt`]. Mirrors pi-mono's three `prompt`
@@ -392,6 +387,13 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Construct a guard whose `Drop`/`unsubscribe` runs `on_drop`.
+    pub(crate) fn new(on_drop: Box<dyn FnOnce() + Send + Sync>) -> Self {
+        Self {
+            unsubscribe: Some(on_drop),
+        }
+    }
+
     /// Remove the listener eagerly.
     pub fn unsubscribe(mut self) {
         if let Some(f) = self.unsubscribe.take() {
