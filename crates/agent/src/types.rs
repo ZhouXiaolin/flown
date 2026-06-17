@@ -120,7 +120,9 @@ pub struct AgentLoopConfig {
     >,
     pub prepare_next_turn: Option<
         Arc<
-            dyn Fn(Option<AbortSignal>)
+            dyn Fn(
+                    Option<AbortSignal>,
+                )
                     -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
                 + Send
                 + Sync,
@@ -320,4 +322,26 @@ pub enum AgentEvent {
         result: serde_json::Value,
         is_error: bool,
     },
+}
+
+/// Error returned by [`crate::Agent`] operations.
+///
+/// Mirrors pi-mono's `agent.ts` thrown errors: re-entrant `prompt`/`continue`
+/// throws, and the "cannot continue from assistant" guard. `Busy` and
+/// `NoResponse` are retained only until Task 6 rewrites `Agent` and drops them.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AgentError {
+    #[error("Agent is already processing a prompt. Use steer() or follow_up() to queue messages, or wait for completion.")]
+    AlreadyProcessing,
+    #[error("No messages to continue from")]
+    NoMessages,
+    #[error("Cannot continue from message role: assistant")]
+    CannotContinueFromAssistant,
+    #[error("{0}")]
+    Other(String),
+    // Legacy variants — removed in Task 6 when `Agent` is rewritten:
+    #[error("agent is busy")]
+    Busy,
+    #[error("no assistant response")]
+    NoResponse,
 }
