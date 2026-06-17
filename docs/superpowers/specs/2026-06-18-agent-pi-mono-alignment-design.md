@@ -35,7 +35,7 @@
 1. **Agent API 范式**：对齐 pi-mono callback 模型（`prompt()->Result<(),AgentError>`、`subscribe`、`wait_for_idle`、失败 emit errorMessage 序列）。移除 stream/result 式 `run`。
 2. **清理尺度**：严格移除 pi-mono 没有的 public API。
 3. **state 访问**：`state()->AgentState` 快照读 + 细粒度 setter（`set_model` 等）作为 JS `state.x = y` 直接赋值在 Rust 的映射。
-4. **ai 模块边界**：按需修 ai。经核查，6 个编译错误全部可在 agent 侧解决（`.to_string()`、迭代+`result()`、新 `parse_streaming_json` 签名），**预期不改 ai**；若发现确需 ai 暴露能力再回头补。
+4. **ai 模块边界**：按需修 ai。经核查（第 4 节），6 个编译错误中有一个确需 ai 暴露 `AssistantMessageEventStream::from_stream` pub 构造函数（`proxy.rs`/`harness.rs` 从 boxed stream 构造），其余（`.to_string()`、删 `into_inner()`）在 agent 侧解决。ai 改动仅此一个构造函数，不重构无关代码。
 5. **listener 并发**：顺序 `await` 每个 listener，单任务驱动，listener 是 run settlement 的一部分（`agent_end` 后所有 listener 结束才算 idle）。
 
 ## 第 1 节 — 对齐判据（验收标准）
@@ -190,18 +190,21 @@ pub async fn run_agent_loop_continue(
 - stream 版：首事件 emit 一条 error assistant message（`message_start→message_end→turn_end→agent_end`），不 panic。
 - `run_*` 版：同样走事件序列返回空 `Vec`（与 pi-mono `runLoop` 在 error stopReason 时的 `return` 一致），不 panic。
 
-## 第 4 节 — 修复编译错误（agent 侧，预期不改 ai）
+## 第 4 节 — 修复编译错误（agent 侧 + ai 最小补一个构造函数）
+
+> **修订**（写计划时核查）：原假设"预期不改 ai"不成立。`AssistantMessageEventStream` 需要一个**从 boxed stream 构造的 pub 构造函数**，因为 `proxy.rs:402` 和 `harness.rs:1619` 都用 `AssistantMessageEventStream::new(Box::pin(async_stream!))` 构造，而当前 `new()` 无参、`from_raw` 是 `pub(crate)`（跨 crate 不可见）。这是 ai 的最小改动，符合决策 #4「按需修 ai」。
 
 6 个错误根因与修法：
 
 1. **`AssistantMessageEventStream::into_inner` 不存在**（`agent_loop.rs:394,397`、`harness.rs:1683`）：
-   `stream_assistant_response` 改为 pi-mono 风格的两步消费——先用 `&mut` 引用 `while let Some(event) = stream.next().await { …emit… }` 迭代事件，再 `let final = stream.result().await;` 消费 self 取最终 message（`result(self)` 消费所有权，故必须先借后消费，不能颠倒）。`stream_fn(config.model, …)` 返回的 `AssistantMessageEventStream` 即 `Stream` + `result`。
+   该类型现已直接 `impl Stream`，无需 `into_inner()` 解包。3 处 `.into_inner()` 直接删除。`stream_assistant_response` 已用 `while let Some(event) = event_stream.next().await` 迭代并在 `Done`/`Error` 事件里 return 最终 message（已有逻辑正确），只是入口多了个不存在的 `into_inner()`。
 
-2. **`String: From<AiError>` 不满足**（`agent_loop.rs:652`）：`AiError` 已是 `thiserror::Error`，把 `.into()`（期望 String）改为 `.to_string()`。
+2. **ai 补 pub 构造函数**（解决 `proxy.rs:402`、`harness.rs:1619` 的 E0061）：
+   在 `crates/ai/src/api_registry.rs` 给 `AssistantMessageEventStream` 加 pub 构造函数（`from_raw` 改为 `pub`，或新增 `pub fn from_stream(stream: RawEventStream)`）。同时把 `RawEventStream` 类型别名也 pub（供 agent 构造 boxed stream）。agent 侧 `proxy.rs`/`harness.rs` 把 `AssistantMessageEventStream::new(Box::pin(...))` 改为 `AssistantMessageEventStream::from_stream(Box::pin(...))`。
 
-3. **`parse_streaming_json` 签名变**（`proxy.rs:402` 及 harness 调用）：现签名 `(&str) -> Value`，无 buffer 参数。调用点去掉多余参数。
+3. **`String: From<AiError>` 不满足**（`agent_loop.rs:652`）：`AiError` 已是 `thiserror::Error`，把 `.into()`（期望 String）改为 `.to_string()`。
 
-4. **harness `stream_simple` 调用参数数错**（`harness.rs:1619`）：对齐 `stream_simple(&model, &context, Option<&SimpleStreamOptions>)` 现签名。
+4. **`parse_streaming_json` 签名变**（`proxy.rs:338` 用 flown_ai 版）：现签名 `(&str) -> Value`，无 buffer 参数。`proxy.rs` 有同名本地函数（`proxy.rs:542`，已正确签名）；检查 `proxy.rs:338` 是否误引 flown_ai 版，统一用本地版或 flown_ai 版（均为单参）。无 buffer 多余参数。
 
 ## 第 5 节 — 错误类型人体工程学
 
@@ -273,4 +276,4 @@ pub enum AgentError {
 
 - **`run_loop` 内部用 `prepare_next_turn`/`stream_fn` 的旧调用点多**：重写 Agent 时需同步更新 `create_loop_config`。逐个核对调用点。
 - **listener 顺序 await + run settlement**：需用 `Notify`/oneshot 正确表达"agent_end 后 listener 完成才 idle"，避免竞态。单任务驱动（不在 listener 回调里 spawn）以保证顺序。
-- **ai 边界**：若重写中发现确需 ai 暴露新能力（如非消费版 `result`），回头补 ai；但当前判断 agent 侧可解。
+- **ai 边界**：已确认需 ai 暴露 `AssistantMessageEventStream::from_stream` pub 构造函数（第 4 节）。改动面小但跨 crate，需同步改 `proxy.rs`/`harness.rs` 调用点。
