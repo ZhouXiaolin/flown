@@ -1440,7 +1440,7 @@ impl AgentHarness {
 
         let prepare_next_turn = {
             let h = harness.clone();
-            Arc::new(move |_signal: Option<AbortSignal>| {
+            Arc::new(move |_ctx: PrepareNextTurnContext, _signal: Option<AbortSignal>| {
                 let h = h.clone();
                 Box::pin(async move {
                     h.flush_pending_writes().await.ok()?;
@@ -1757,7 +1757,7 @@ impl AgentHarness {
         };
 
         // Run the agent loop
-        let mut stream = agent_loop(initial_messages, context, config, Some(abort_signal));
+        let mut stream = agent_loop(initial_messages, context, config, Some(abort_signal), None);
         let mut last_message = None;
 
         while let Some(event) = stream.next().await {

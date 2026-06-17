@@ -78,6 +78,20 @@ pub struct ShouldStopAfterTurnContext {
     pub new_messages: Vec<AgentMessage>,
 }
 
+/// Context passed to `prepare_next_turn`.
+///
+/// Mirrors pi-mono's `PrepareNextTurnContext` (which extends
+/// `ShouldStopAfterTurnContext`): the completed turn's assistant message, its
+/// tool results, the current agent context, and the messages produced by this
+/// loop invocation.
+#[derive(Debug, Clone)]
+pub struct PrepareNextTurnContext {
+    pub message: AssistantMessage,
+    pub tool_results: Vec<ToolResultMessage>,
+    pub context: AgentContext,
+    pub new_messages: Vec<AgentMessage>,
+}
+
 /// Replacement runtime state for next turn
 #[derive(Debug, Clone)]
 pub struct AgentLoopTurnUpdate {
@@ -121,6 +135,7 @@ pub struct AgentLoopConfig {
     pub prepare_next_turn: Option<
         Arc<
             dyn Fn(
+                    PrepareNextTurnContext,
                     Option<AbortSignal>,
                 )
                     -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>

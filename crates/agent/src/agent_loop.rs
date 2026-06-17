@@ -18,11 +18,12 @@ pub fn agent_loop(
     context: AgentContext,
     config: AgentLoopConfig,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
     let (tx, rx) = unbounded();
     let event_sink = create_event_sink(tx);
     let run = async move {
-        let _ = run_agent_loop(prompts, context, config, event_sink, signal).await;
+        let _ = run_agent_loop(prompts, context, config, event_sink, signal, stream_fn).await;
     };
 
     Box::pin(agent_loop_events(run, rx))
@@ -33,20 +34,12 @@ pub fn agent_loop_continue(
     context: AgentContext,
     config: AgentLoopConfig,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
-    if context.messages.is_empty() {
-        panic!("Cannot continue: no messages in context");
-    }
-
-    let last_message = context.messages.last().unwrap();
-    if matches!(last_message, AgentMessage::Assistant(_)) {
-        panic!("Cannot continue from message role: assistant");
-    }
-
     let (tx, rx) = unbounded();
     let event_sink = create_event_sink(tx);
     let run = async move {
-        let _ = run_agent_loop_continue(context, config, event_sink, signal).await;
+        let _ = run_agent_loop_continue(context, config, event_sink, signal, stream_fn).await;
     };
 
     Box::pin(agent_loop_events(run, rx))
@@ -59,6 +52,7 @@ pub async fn run_agent_loop(
     mut config: AgentLoopConfig,
     sink: AgentEventSink,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) -> Vec<AgentMessage> {
     let mut new_messages = prompts.clone();
     let mut current_context = AgentContext {
@@ -92,6 +86,7 @@ pub async fn run_agent_loop(
         &mut config,
         &sink,
         signal,
+        stream_fn,
     )
     .await;
     new_messages
@@ -103,20 +98,25 @@ pub async fn run_agent_loop_continue(
     mut config: AgentLoopConfig,
     sink: AgentEventSink,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) -> Vec<AgentMessage> {
-    if context.messages.is_empty() {
-        panic!("Cannot continue: no messages in context");
-    }
+    emit(&sink, AgentEvent::AgentStart).await;
 
+    if context.messages.is_empty() {
+        let m = make_error_assistant(&config.model, "Cannot continue: no messages in context");
+        emit_error_sequence(&sink, m).await;
+        return Vec::new();
+    }
     let last_message = context.messages.last().unwrap();
     if matches!(last_message, AgentMessage::Assistant(_)) {
-        panic!("Cannot continue from message role: assistant");
+        let m = make_error_assistant(&config.model, "Cannot continue from message role: assistant");
+        emit_error_sequence(&sink, m).await;
+        return Vec::new();
     }
 
     let mut new_messages = Vec::new();
     let mut current_context = context;
 
-    emit(&sink, AgentEvent::AgentStart).await;
     emit(&sink, AgentEvent::TurnStart).await;
 
     run_loop(
@@ -125,6 +125,7 @@ pub async fn run_agent_loop_continue(
         &mut config,
         &sink,
         signal,
+        stream_fn,
     )
     .await;
     new_messages
@@ -173,12 +174,51 @@ async fn emit(sink: &AgentEventSink, event: AgentEvent) {
     sink(event).await;
 }
 
+/// Build an assistant message that carries a terminal error (`stop_reason:
+/// Error`). Used by `run_agent_loop_continue`'s validation guards and by the
+/// stream-error branch so failures surface as events rather than panics,
+/// mirroring pi-mono's failure handling.
+fn make_error_assistant(model: &Model, message: &str) -> AssistantMessage {
+    AssistantMessage {
+        role: "assistant".to_string(),
+        content: vec![],
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some(message.to_string()),
+        diagnostics: None,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// Emit the canonical failure sequence for a single error assistant message:
+/// `message_start` → `message_end` → `turn_end` → `agent_end`.
+async fn emit_error_sequence(sink: &AgentEventSink, m: AssistantMessage) {
+    let msg = AgentMessage::Assistant(m);
+    emit(sink, AgentEvent::MessageStart { message: msg.clone() }).await;
+    emit(sink, AgentEvent::MessageEnd { message: msg.clone() }).await;
+    emit(
+        sink,
+        AgentEvent::TurnEnd {
+            message: msg.clone(),
+            tool_results: vec![],
+        },
+    )
+    .await;
+    emit(sink, AgentEvent::AgentEnd { messages: vec![msg] }).await;
+}
+
 async fn run_loop(
     context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
     config: &mut AgentLoopConfig,
     emit: &AgentEventSink,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) {
     let mut has_more_tool_calls = true;
     let mut first_turn = true;
@@ -214,7 +254,9 @@ async fn run_loop(
             }
 
             // Stream assistant response (updates context.messages internally)
-            let message = stream_assistant_response(context, config, emit, signal.clone()).await;
+            let message =
+                stream_assistant_response(context, config, emit, signal.clone(), stream_fn.clone())
+                    .await;
             new_messages.push(AgentMessage::Assistant(message.clone()));
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -275,7 +317,13 @@ async fn run_loop(
             };
 
             if let Some(prepare_next_turn) = &config.prepare_next_turn {
-                if let Some(update) = prepare_next_turn(signal.clone()).await {
+                let prepare_ctx = PrepareNextTurnContext {
+                    message: next_turn_context.message.clone(),
+                    tool_results: next_turn_context.tool_results.clone(),
+                    context: next_turn_context.context.clone(),
+                    new_messages: next_turn_context.new_messages.clone(),
+                };
+                if let Some(update) = prepare_next_turn(prepare_ctx, signal.clone()).await {
                     if let Some(new_context) = update.context {
                         *context = new_context;
                     }
@@ -337,6 +385,7 @@ async fn stream_assistant_response(
     config: &AgentLoopConfig,
     emit: &AgentEventSink,
     signal: Option<AbortSignal>,
+    stream_fn: Option<StreamFn>,
 ) -> AssistantMessage {
     // Apply context transform if configured (AgentMessage[] → AgentMessage[])
     let messages = if let Some(transform) = &config.transform_context {
@@ -390,7 +439,7 @@ async fn stream_assistant_response(
         thinking_budgets: config.thinking_budgets.clone(),
     };
 
-    let mut event_stream = if let Some(stream_fn) = &config.stream_fn {
+    let mut event_stream = if let Some(stream_fn) = stream_fn.as_ref().or(config.stream_fn.as_ref()) {
         stream_fn(config.model.clone(), llm_context, Some(stream_options))
     } else {
         match flown_ai::stream_simple(&config.model, &llm_context, Some(&stream_options)) {

@@ -2,10 +2,21 @@ use crate::agent_loop::{agent_loop, agent_loop_continue};
 use crate::types::*;
 use flown_ai::types::*;
 use futures::stream::Stream;
+use futures::StreamExt;
+use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
+/// Agent execution phase
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgentPhase {
+    Idle = 0,
+    Turn = 1,
+}
 
 /// Agent options for construction
 pub struct AgentOptions {
@@ -51,7 +62,9 @@ pub struct AgentOptions {
     >,
     pub prepare_next_turn: Option<
         Arc<
-            dyn Fn(Option<AbortSignal>)
+            dyn Fn(
+                    Option<AbortSignal>,
+                )
                     -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
                 + Send
                 + Sync,
@@ -90,13 +103,14 @@ impl Default for AgentOptions {
     }
 }
 
-/// Pending message queue
-struct PendingMessageQueue {
+/// Pending message queue (steer / follow-up).
+/// Written from the TUI thread, drained by the agent loop.
+struct MessageQueue {
     messages: Vec<AgentMessage>,
     mode: QueueMode,
 }
 
-impl PendingMessageQueue {
+impl MessageQueue {
     fn new(mode: QueueMode) -> Self {
         Self {
             messages: Vec::new(),
@@ -104,21 +118,9 @@ impl PendingMessageQueue {
         }
     }
 
-    fn enqueue(&mut self, message: AgentMessage) {
-        self.messages.push(message);
-    }
-
-    fn has_items(&self) -> bool {
-        !self.messages.is_empty()
-    }
-
     fn drain(&mut self) -> Vec<AgentMessage> {
         match self.mode {
-            QueueMode::All => {
-                let drained = self.messages.clone();
-                self.messages.clear();
-                drained
-            }
+            QueueMode::All => std::mem::take(&mut self.messages),
             QueueMode::OneAtATime => {
                 if self.messages.is_empty() {
                     Vec::new()
@@ -128,18 +130,27 @@ impl PendingMessageQueue {
             }
         }
     }
-
-    fn clear(&mut self) {
-        self.messages.clear();
-    }
 }
 
-/// Stateful agent
+/// Stateful agent.
+///
+/// Interior mutability summary:
+/// - `state` (RwLock) — the only true shared-mutable lock; protects model,
+///   thinking_level, system_prompt, and the message history.
+/// - `tools` (RwLock) — set at startup, updated by MCP reconcile at runtime.
+/// - `steering_queue` / `follow_up_queue` (RwLock) — brief lock; TUI writes,
+///   agent loop drains.
+/// - `phase` (AtomicU8) — lock-free Idle/Turn flag.
+/// - `run_abort` (RwLock<Option<AbortSignal>>) — set per-turn by `run()`,
+///   cancelled by `abort()`. RwLock because it's Option-wrapped; AbortSignal
+///   itself is internally atomic.
 pub struct Agent {
     state: Arc<RwLock<AgentState>>,
     tools: Arc<RwLock<Vec<AgentTool>>>,
-    steering_queue: Arc<RwLock<PendingMessageQueue>>,
-    follow_up_queue: Arc<RwLock<PendingMessageQueue>>,
+    steering_queue: Arc<RwLock<MessageQueue>>,
+    follow_up_queue: Arc<RwLock<MessageQueue>>,
+    phase: AtomicU8,
+    run_abort: Arc<RwLock<Option<AbortSignal>>>,
     convert_to_llm: Arc<dyn Fn(Vec<AgentMessage>) -> Vec<Message> + Send + Sync>,
     transform_context: Option<
         Arc<
@@ -181,7 +192,9 @@ pub struct Agent {
     >,
     prepare_next_turn: Option<
         Arc<
-            dyn Fn(Option<AbortSignal>)
+            dyn Fn(
+                    Option<AbortSignal>,
+                )
                     -> Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
                 + Send
                 + Sync,
@@ -196,7 +209,7 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(options: AgentOptions) -> Self {
-        flown_ai::init();
+        flown_ai::register_built_in_api_providers();
         let initial_state = options.initial_state.unwrap_or_else(|| AgentState {
             system_prompt: String::new(),
             model: flown_ai::models::get_model("deepseek", "deepseek-v4-flash")
@@ -212,12 +225,14 @@ impl Agent {
         Self {
             state: Arc::new(RwLock::new(initial_state)),
             tools: Arc::new(RwLock::new(Vec::new())),
-            steering_queue: Arc::new(RwLock::new(PendingMessageQueue::new(
+            steering_queue: Arc::new(RwLock::new(MessageQueue::new(
                 options.steering_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
-            follow_up_queue: Arc::new(RwLock::new(PendingMessageQueue::new(
+            follow_up_queue: Arc::new(RwLock::new(MessageQueue::new(
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
+            phase: AtomicU8::new(AgentPhase::Idle as u8),
+            run_abort: Arc::new(RwLock::new(None)),
             convert_to_llm: options.convert_to_llm.unwrap_or_else(|| {
                 Arc::new(|messages| {
                     messages
@@ -253,64 +268,176 @@ impl Agent {
         }
     }
 
-    /// Get current agent state
+    // ── Phase ───────────────────────────────────────────────────────
+
+    /// Current execution phase.
+    pub fn phase(&self) -> AgentPhase {
+        match self.phase.load(Ordering::Acquire) {
+            0 => AgentPhase::Idle,
+            _ => AgentPhase::Turn,
+        }
+    }
+
+    /// Whether the agent is idle (not running a turn).
+    pub fn is_idle(&self) -> bool {
+        self.phase() == AgentPhase::Idle
+    }
+
+    fn set_phase(&self, p: AgentPhase) {
+        self.phase.store(p as u8, Ordering::Release);
+    }
+
+    // ── State getters ───────────────────────────────────────────────
+
+    /// Current agent state snapshot.
     pub fn state(&self) -> AgentState {
-        self.state.read().unwrap().clone()
+        self.state.read().clone()
     }
 
-    /// Set tools for the agent
+    /// Current model.
+    pub fn model(&self) -> Model {
+        self.state.read().model.clone()
+    }
+
+    /// Current thinking level.
+    pub fn thinking_level(&self) -> ThinkingLevel {
+        self.state.read().thinking_level.clone()
+    }
+
+    /// Current system prompt.
+    pub fn system_prompt(&self) -> String {
+        self.state.read().system_prompt.clone()
+    }
+
+    // ── State setters ───────────────────────────────────────────────
+
+    /// Set model.
+    pub fn set_model(&self, model: Model) {
+        self.state.write().model = model;
+    }
+
+    /// Set thinking level.
+    pub fn set_thinking_level(&self, level: ThinkingLevel) {
+        self.state.write().thinking_level = level;
+    }
+
+    /// Set system prompt.
+    pub fn set_system_prompt(&self, prompt: String) {
+        self.state.write().system_prompt = prompt;
+    }
+
+    // ── Tools ───────────────────────────────────────────────────────
+
+    /// Set tools (full replace).
     pub fn set_tools(&self, tools: Vec<AgentTool>) {
-        *self.tools.write().unwrap() = tools;
+        *self.tools.write() = tools;
     }
 
-    /// Get current tools
+    /// Get current tools.
     pub fn tools(&self) -> Vec<AgentTool> {
-        self.tools.read().unwrap().clone()
+        self.tools.read().clone()
     }
 
-    /// Set steering mode
-    pub fn set_steering_mode(&self, mode: QueueMode) {
-        self.steering_queue.write().unwrap().mode = mode;
-    }
+    // ── Message queues ──────────────────────────────────────────────
 
-    /// Set follow-up mode
-    pub fn set_follow_up_mode(&self, mode: QueueMode) {
-        self.follow_up_queue.write().unwrap().mode = mode;
-    }
-
-    /// Queue a steering message
+    /// Queue a steering message (injected before the next LLM call).
     pub fn steer(&self, message: AgentMessage) {
-        self.steering_queue.write().unwrap().enqueue(message);
+        self.steering_queue.write().messages.push(message);
     }
 
-    /// Queue a follow-up message
+    /// Queue a follow-up message (injected when the agent would stop).
     pub fn follow_up(&self, message: AgentMessage) {
-        self.follow_up_queue.write().unwrap().enqueue(message);
+        self.follow_up_queue.write().messages.push(message);
     }
 
-    /// Clear steering queue
-    pub fn clear_steering_queue(&self) {
-        self.steering_queue.write().unwrap().clear();
-    }
-
-    /// Clear follow-up queue
-    pub fn clear_follow_up_queue(&self) {
-        self.follow_up_queue.write().unwrap().clear();
-    }
-
-    /// Clear all queues
+    /// Clear all queued messages.
     pub fn clear_all_queues(&self) {
-        self.clear_steering_queue();
-        self.clear_follow_up_queue();
+        self.steering_queue.write().messages.clear();
+        self.follow_up_queue.write().messages.clear();
     }
 
-    /// Check if queues have pending messages
-    pub fn has_queued_messages(&self) -> bool {
-        self.steering_queue.read().unwrap().has_items()
-            || self.follow_up_queue.read().unwrap().has_items()
+    /// Set steering queue mode.
+    pub fn set_steering_mode(&self, mode: QueueMode) {
+        self.steering_queue.write().mode = mode;
     }
 
-    /// Start a new prompt
+    /// Set follow-up queue mode.
+    pub fn set_follow_up_mode(&self, mode: QueueMode) {
+        self.follow_up_queue.write().mode = mode;
+    }
+
+    // ── Abort ───────────────────────────────────────────────────────
+
+    /// Abort the current run. Clears queues and cancels the in-flight
+    /// stream via its AbortSignal.
+    pub fn abort(&self) {
+        self.clear_all_queues();
+        if let Some(signal) = self.run_abort.write().take() {
+            signal.cancel();
+        }
+    }
+
+    // ── Run to completion (primary API) ─────────────────────────────
+
+    /// Run the agent with text and optional images. Consumes the event
+    /// stream internally and returns the final assistant message.
+    ///
+    /// Creates a fresh AbortSignal per turn (stored on `run_abort`) so
+    /// `abort()` can interrupt it. Manages phase transitions
+    /// (Idle → Turn → Idle). Returns `AgentError::Busy` if already running.
+    pub async fn run(
+        &self,
+        text: &str,
+        images: Option<Vec<ImageContent>>,
+    ) -> Result<AssistantMessage, AgentError> {
+        self.ensure_idle()?;
+
+        let signal = AbortSignal::new();
+        *self.run_abort.write() = Some(signal.clone());
+
+        let result = self.execute_turn(text, images, signal).await;
+
+        self.run_abort.write().take();
+        self.set_phase(AgentPhase::Idle);
+
+        result
+    }
+
+    /// Run with pre-built messages (for steer/follow-up/next-turn patterns).
+    pub async fn run_messages(
+        &self,
+        messages: Vec<AgentMessage>,
+    ) -> Result<AssistantMessage, AgentError> {
+        self.ensure_idle()?;
+
+        let signal = AbortSignal::new();
+        *self.run_abort.write() = Some(signal.clone());
+
+        let result = self.execute_turn_messages(messages, signal).await;
+
+        self.run_abort.write().take();
+        self.set_phase(AgentPhase::Idle);
+
+        result
+    }
+
+    // ── Stream-based API ────────────────────────────────────────────
+
+    /// Start a prompt, returning a stream. Creates and stores an
+    /// AbortSignal so `abort()` works. Caller must manage phase if
+    /// needed — this method does NOT set phase (use `run()` for that).
+    pub fn prompt_messages(
+        &self,
+        messages: Vec<AgentMessage>,
+    ) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
+        let context = self.create_context_snapshot();
+        let config = self.create_loop_config();
+        let signal = AbortSignal::new();
+        *self.run_abort.write() = Some(signal.clone());
+        agent_loop(messages, context, config, Some(signal), None)
+    }
+
+    /// Start a prompt with text.
     pub fn prompt(&self, input: String) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
         let messages = vec![AgentMessage::User(UserMessage {
             role: "user".to_string(),
@@ -320,58 +447,64 @@ impl Agent {
         self.prompt_messages(messages)
     }
 
-    /// Start a new prompt with messages
-    pub fn prompt_messages(
-        &self,
-        messages: Vec<AgentMessage>,
-    ) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
-        let context = self.create_context_snapshot();
-        let config = self.create_loop_config();
-
-        agent_loop(messages, context, config, None)
-    }
-
-    /// Continue from current transcript
+    /// Continue from current transcript (drains steer/follow-up queues).
     pub fn continue_loop(&self) -> Pin<Box<dyn Stream<Item = AgentEvent> + Send>> {
-        let state = self.state.read().unwrap();
-        let last_message = state.messages.last();
+        let last_is_assistant = self
+            .state
+            .read()
+            .messages
+            .last()
+            .is_some_and(|m| matches!(m, AgentMessage::Assistant(_)));
 
-        if let Some(AgentMessage::Assistant(_)) = last_message {
-            // Try steering queue first
-            let steering = self.steering_queue.write().unwrap().drain();
+        if last_is_assistant {
+            let steering = self.steering_queue.write().drain();
             if !steering.is_empty() {
                 return self.prompt_messages(steering);
             }
-
-            // Try follow-up queue
-            let follow_up = self.follow_up_queue.write().unwrap().drain();
+            let follow_up = self.follow_up_queue.write().drain();
             if !follow_up.is_empty() {
                 return self.prompt_messages(follow_up);
             }
-
             panic!("Cannot continue from message role: assistant");
         }
 
         let context = self.create_context_snapshot();
         let config = self.create_loop_config();
-
-        agent_loop_continue(context, config, None)
+        let signal = AbortSignal::new();
+        *self.run_abort.write() = Some(signal.clone());
+        agent_loop_continue(context, config, Some(signal), None)
     }
 
-    /// Reset agent state
+    /// Reset agent state.
     pub fn reset(&self) {
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write();
         state.messages.clear();
         state.is_streaming = false;
         state.streaming_message = None;
         state.pending_tool_calls.clear();
         state.error_message = None;
+        drop(state);
         self.clear_all_queues();
     }
 
+    // ── Internal ────────────────────────────────────────────────────
+
+    fn ensure_idle(&self) -> Result<(), AgentError> {
+        if self.phase.compare_exchange(
+            AgentPhase::Idle as u8,
+            AgentPhase::Turn as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) != Ok(AgentPhase::Idle as u8)
+        {
+            return Err(AgentError::Busy);
+        }
+        Ok(())
+    }
+
     fn create_context_snapshot(&self) -> AgentContext {
-        let state = self.state.read().unwrap();
-        let tools = self.tools.read().unwrap();
+        let state = self.state.read();
+        let tools = self.tools.read();
         AgentContext {
             system_prompt: state.system_prompt.clone(),
             messages: state.messages.clone(),
@@ -380,7 +513,7 @@ impl Agent {
     }
 
     fn create_loop_config(&self) -> AgentLoopConfig {
-        let state = self.state.read().unwrap();
+        let state = self.state.read();
         let convert_to_llm = self.convert_to_llm.clone();
         let transform_context = self.transform_context.clone();
         let stream_fn = self.stream_fn.clone();
@@ -389,7 +522,6 @@ impl Agent {
         let on_response = self.on_response.clone();
         let before_tool_call = self.before_tool_call.clone();
         let after_tool_call = self.after_tool_call.clone();
-        let prepare_next_turn = self.prepare_next_turn.clone();
         let steering_queue = self.steering_queue.clone();
         let follow_up_queue = self.follow_up_queue.clone();
 
@@ -406,25 +538,109 @@ impl Agent {
             max_retry_delay_ms: self.max_retry_delay_ms,
             on_payload,
             on_response,
-            convert_to_llm: convert_to_llm,
-            transform_context: transform_context,
-            get_api_key: get_api_key,
+            convert_to_llm,
+            transform_context,
+            get_api_key,
             stream_fn,
             should_stop_after_turn: None,
-            prepare_next_turn,
+            // Task 6 rewrites Agent; until then the PrepareNextTurnContext-taking
+            // signature has no compatible source, so disable the hook here.
+            prepare_next_turn: None,
             get_steering_messages: Some(Arc::new(move || {
-                let msgs = steering_queue.write().unwrap().drain();
+                let msgs = steering_queue.write().drain();
                 Box::pin(async move { msgs })
                     as Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
             })),
             get_follow_up_messages: Some(Arc::new(move || {
-                let msgs = follow_up_queue.write().unwrap().drain();
+                let msgs = follow_up_queue.write().drain();
                 Box::pin(async move { msgs })
                     as Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
             })),
             tool_execution: self.tool_execution.clone(),
-            before_tool_call: before_tool_call,
-            after_tool_call: after_tool_call,
+            before_tool_call,
+            after_tool_call,
         }
+    }
+
+    async fn execute_turn(
+        &self,
+        text: &str,
+        images: Option<Vec<ImageContent>>,
+        signal: AbortSignal,
+    ) -> Result<AssistantMessage, AgentError> {
+        let content = if let Some(images) = images {
+            let mut blocks = vec![UserContentBlock::Text(TextContent {
+                content_type: "text".to_string(),
+                text: text.to_string(),
+                text_signature: None,
+            })];
+            for image in images {
+                blocks.push(UserContentBlock::Image(image));
+            }
+            MessageContent::Blocks(blocks)
+        } else {
+            MessageContent::Text(text.to_string())
+        };
+
+        let user_message = AgentMessage::User(UserMessage {
+            role: "user".to_string(),
+            content,
+            timestamp: chrono::Utc::now(),
+        });
+
+        self.execute_turn_messages(vec![user_message], signal).await
+    }
+
+    async fn execute_turn_messages(
+        &self,
+        messages: Vec<AgentMessage>,
+        signal: AbortSignal,
+    ) -> Result<AssistantMessage, AgentError> {
+        let context = self.create_context_snapshot();
+        let config = self.create_loop_config();
+
+        let mut stream = agent_loop(messages, context, config, Some(signal), None);
+        let mut last_message = None;
+
+        while let Some(event) = stream.next().await {
+            match &event {
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::Assistant(msg),
+                } => {
+                    last_message = Some(msg.clone());
+                    self.state
+                        .write()
+                        .messages
+                        .push(AgentMessage::Assistant(msg.clone()));
+                }
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::User(msg),
+                } => {
+                    self.state
+                        .write()
+                        .messages
+                        .push(AgentMessage::User(msg.clone()));
+                }
+                AgentEvent::MessageEnd {
+                    message: AgentMessage::Custom(msg),
+                } => {
+                    self.state
+                        .write()
+                        .messages
+                        .push(AgentMessage::Custom(msg.clone()));
+                }
+                AgentEvent::TurnEnd { tool_results, .. } => {
+                    for result in tool_results {
+                        self.state
+                            .write()
+                            .messages
+                            .push(AgentMessage::ToolResult(result.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        last_message.ok_or(AgentError::NoResponse)
     }
 }
