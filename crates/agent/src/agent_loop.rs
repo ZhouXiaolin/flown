@@ -391,9 +391,39 @@ async fn stream_assistant_response(
     };
 
     let mut event_stream = if let Some(stream_fn) = &config.stream_fn {
-        stream_fn(config.model.clone(), llm_context, Some(stream_options)).into_inner()
+        stream_fn(config.model.clone(), llm_context, Some(stream_options))
     } else {
-        flown_ai::stream_simple(&config.model, &llm_context, Some(&stream_options)).into_inner()
+        match flown_ai::stream_simple(&config.model, &llm_context, Some(&stream_options)) {
+            Ok(s) => s,
+            Err(error) => {
+                let message = AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: vec![],
+                    api: config.model.api.clone(),
+                    provider: config.model.provider.clone(),
+                    model: config.model.id.clone(),
+                    response_model: None,
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Error,
+                    error_message: Some(error.to_string()),
+                    diagnostics: None,
+                    timestamp: chrono::Utc::now(),
+                };
+                context
+                    .messages
+                    .push(AgentMessage::Assistant(message.clone()));
+                emit(AgentEvent::MessageStart {
+                    message: AgentMessage::Assistant(message.clone()),
+                })
+                .await;
+                emit(AgentEvent::MessageEnd {
+                    message: AgentMessage::Assistant(message.clone()),
+                })
+                .await;
+                return message;
+            }
+        }
     };
 
     let mut partial: Option<AssistantMessage> = None;
@@ -476,6 +506,7 @@ async fn stream_assistant_response(
         usage: Usage::default(),
         stop_reason: StopReason::Error,
         error_message: Some("no assistant response".to_string()),
+        diagnostics: None,
         timestamp: chrono::Utc::now(),
     });
 
@@ -618,7 +649,7 @@ async fn prepare_tool_call(
         Err(err) => {
             return PreparedToolCall::Immediate(FinalizedToolCall {
                 tool_call: tool_call.clone(),
-                result: create_named_error_tool_result(&tool_call.name, err),
+                result: create_named_error_tool_result(&tool_call.name, err.to_string()),
                 is_error: true,
             });
         }
@@ -809,8 +840,14 @@ async fn execute_tool_calls_sequential(
         })
         .await;
 
-        let prepared =
-            prepare_tool_call(context, assistant_message, tool_call, config, signal.clone()).await;
+        let prepared = prepare_tool_call(
+            context,
+            assistant_message,
+            tool_call,
+            config,
+            signal.clone(),
+        )
+        .await;
         let args = match &prepared {
             PreparedToolCall::Prepared { args, .. } => args.clone(),
             PreparedToolCall::Immediate(_) => serde_json::Value::Null,
@@ -828,7 +865,11 @@ async fn execute_tool_calls_sequential(
         messages.push(emit_finalized_tool_call(&finalized, emit).await);
         finalized_calls.push(finalized);
 
-        if signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false) {
+        if signal
+            .as_ref()
+            .map(|signal| signal.is_cancelled())
+            .unwrap_or(false)
+        {
             break;
         }
     }
@@ -858,8 +899,14 @@ async fn execute_tool_calls_parallel(
         })
         .await;
 
-        let prepared =
-            prepare_tool_call(context, assistant_message, tool_call, config, signal.clone()).await;
+        let prepared = prepare_tool_call(
+            context,
+            assistant_message,
+            tool_call,
+            config,
+            signal.clone(),
+        )
+        .await;
         let args = match &prepared {
             PreparedToolCall::Prepared { args, .. } => args.clone(),
             PreparedToolCall::Immediate(_) => serde_json::Value::Null,

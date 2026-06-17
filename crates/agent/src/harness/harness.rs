@@ -14,7 +14,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-type EventHandler = Box<dyn Fn(&HarnessEvent) + Send + Sync>;
+type EventHandler = Arc<dyn Fn(&HarnessEvent) + Send + Sync>;
 type HookHandler = Arc<
     dyn Fn(HarnessEvent) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
         + Send
@@ -621,12 +621,45 @@ impl AgentHarness {
         text: &str,
         images: Option<Vec<ImageContent>>,
     ) -> Result<AssistantMessage, HarnessError> {
-        self.assert_idle()?;
+        let phase = self.phase.read().clone();
+        tracing::info!(
+            target: "flown::harness",
+            phase = ?phase,
+            text_len = text.len(),
+            has_images = images.as_ref().map(|images| !images.is_empty()).unwrap_or(false),
+            "harness prompt requested"
+        );
+        if phase != AgentHarnessPhase::Idle {
+            tracing::warn!(
+                target: "flown::harness",
+                phase = ?phase,
+                "harness prompt rejected: busy"
+            );
+            return Err(HarnessError::Busy(phase));
+        }
 
         self.set_phase(AgentHarnessPhase::Turn);
+        tracing::info!(target: "flown::harness", "harness prompt phase set to turn");
 
         let result = self.execute_turn(text, images).await;
+        match &result {
+            Ok(message) => {
+                tracing::info!(
+                    target: "flown::harness",
+                    stop_reason = ?message.stop_reason,
+                    "harness prompt execute_turn returned"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "flown::harness",
+                    error = ?error,
+                    "harness prompt execute_turn returned error"
+                );
+            }
+        }
         self.set_phase(AgentHarnessPhase::Idle);
+        tracing::info!(target: "flown::harness", "harness prompt phase set to idle");
 
         result
     }
@@ -1113,14 +1146,17 @@ impl AgentHarness {
     // ── Event System ────────────────────────────────────────────────
 
     /// Subscribe to all events, returns an unsubscribe function
-    pub fn subscribe(&self, handler: impl Fn(&HarnessEvent) + Send + Sync + 'static) -> Box<dyn Fn() + Send + Sync> {
+    pub fn subscribe(
+        &self,
+        handler: impl Fn(&HarnessEvent) + Send + Sync + 'static,
+    ) -> Box<dyn Fn() + Send + Sync> {
         let mut subscribers = self.subscribers.write();
         let mut next_id = self.next_subscriber_id.lock();
         let id = *next_id;
         *next_id += 1;
         subscribers.push(SubscriberEntry {
             id,
-            handler: Box::new(handler),
+            handler: Arc::new(handler),
         });
         let subscribers_ref = self.subscribers.clone();
         Box::new(move || {
@@ -1160,9 +1196,14 @@ impl AgentHarness {
     }
 
     fn emit(&self, event: &HarnessEvent) {
-        let subscribers = self.subscribers.read();
-        for entry in subscribers.iter() {
-            (entry.handler)(event);
+        let handlers: Vec<EventHandler> = self
+            .subscribers
+            .read()
+            .iter()
+            .map(|entry| Arc::clone(&entry.handler))
+            .collect();
+        for handler in handlers {
+            handler(event);
         }
     }
 
@@ -1575,7 +1616,7 @@ impl AgentHarness {
                     let h = h.clone();
                     let session_id = session_id.clone();
                     let stream_options = stream_options.clone();
-                    flown_ai::AssistantMessageEventStream::new(Box::pin(async_stream::stream! {
+                    flown_ai::AssistantMessageEventStream::from_stream(Box::pin(async_stream::stream! {
                         let mut options = options.unwrap_or_default();
 
                         // Get API key and headers
@@ -1638,7 +1679,29 @@ impl AgentHarness {
                             })
                         }));
 
-                        let mut stream = flown_ai::stream_simple(&model, &context, Some(&options));
+                        let mut stream = match flown_ai::stream_simple(&model, &context, Some(&options)) {
+                            Ok(s) => s,
+                            Err(error) => {
+                                yield AssistantMessageEvent::Error {
+                                    reason: StopReason::Error,
+                                    error: AssistantMessage {
+                                        role: "assistant".to_string(),
+                                        content: vec![],
+                                        api: model.api.clone(),
+                                        provider: model.provider.clone(),
+                                        model: model.id.clone(),
+                                        response_model: None,
+                                        response_id: None,
+                                        usage: Usage::default(),
+                                        stop_reason: StopReason::Error,
+                                        error_message: Some(error.to_string()),
+                                        diagnostics: None,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                };
+                                return;
+                            }
+                        };
 
                         while let Some(event) = stream.next().await {
                             yield event;
@@ -2051,9 +2114,14 @@ impl HarnessRefs {
     }
 
     fn emit(&self, event: &HarnessEvent) {
-        let subscribers = self.subscribers.read();
-        for entry in subscribers.iter() {
-            (entry.handler)(event);
+        let handlers: Vec<EventHandler> = self
+            .subscribers
+            .read()
+            .iter()
+            .map(|entry| Arc::clone(&entry.handler))
+            .collect();
+        for handler in handlers {
+            handler(event);
         }
     }
 }

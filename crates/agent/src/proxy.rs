@@ -157,6 +157,7 @@ pub fn create_proxy_partial(model: &Model) -> AssistantMessage {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        diagnostics: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -398,7 +399,7 @@ pub fn stream_proxy(
     context: Context,
     options: ProxyStreamOptions,
 ) -> AssistantMessageEventStream {
-    AssistantMessageEventStream::new(Box::pin(async_stream::stream! {
+    AssistantMessageEventStream::from_stream(Box::pin(async_stream::stream! {
         let mut partial = create_proxy_partial(&model);
         let mut state = ProxyPartialState::default();
         let client = reqwest::Client::new();
