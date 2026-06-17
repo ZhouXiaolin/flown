@@ -360,3 +360,56 @@ pub enum AgentError {
     #[error("no assistant response")]
     NoResponse,
 }
+
+/// Input to [`crate::Agent::prompt`]. Mirrors pi-mono's three `prompt`
+/// overloads: bare text, text + images, or pre-built messages.
+#[derive(Debug, Clone)]
+pub enum PromptInput {
+    /// Plain text user prompt.
+    Text(String),
+    /// Text prompt with attached images.
+    TextWithImages { text: String, images: Vec<ImageContent> },
+    /// Pre-built message batch (e.g. drained from steer/follow-up queues).
+    Messages(Vec<AgentMessage>),
+}
+
+/// Listener registered via [`crate::Agent::subscribe`]. Receives each
+/// [`AgentEvent`] plus the active run's abort signal. Listeners are awaited in
+/// subscription order and are part of the current run's settlement (the run is
+/// not idle until all `agent_end` listeners finish). Mirrors pi-mono's
+/// `subscribe(listener)` contract.
+pub type AgentListener = Arc<
+    dyn Fn(AgentEvent, Option<AbortSignal>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Guard returned by [`crate::Agent::subscribe`]. Dropping it (or calling
+/// [`unsubscribe`](Self::unsubscribe)) removes the listener. Mirrors pi-mono's
+/// `subscribe` returning an `unsubscribe` function.
+pub struct Subscription {
+    unsubscribe: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl Subscription {
+    /// Remove the listener eagerly.
+    pub fn unsubscribe(mut self) {
+        if let Some(f) = self.unsubscribe.take() {
+            f();
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(f) = self.unsubscribe.take() {
+            f();
+        }
+    }
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription").finish_non_exhaustive()
+    }
+}
