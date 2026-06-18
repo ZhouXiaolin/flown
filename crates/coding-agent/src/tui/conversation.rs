@@ -902,8 +902,13 @@ impl RuntimeControl {
                 }
             });
 
-            // 5. Push the overlay. Content is the standalone transcript bound
-            // to the forked state; the full-bleed geometry covers the main UI.
+            // 5. Push the overlay. The content is a FACTORY (not a pre-built
+            // node): App's OverlayLayer builds it once under the mount owner
+            // (where use_terminal_size/on_key/create_effect resolve), wrapped in
+            // a sub-Owner so it is not rebuilt on spurious re-runs. Building a
+            // node here (in this spawn_local task, where CURRENT_OWNER is unset)
+            // would leave the transcript's effect/on_key unregistered — the
+            // original "/btw doesn't appear" bug.
             let content_state = Rc::clone(&fork_state);
             let overlay = crate::tui::overlay_stack::ActiveOverlay {
                 geometry: iodilos::OverlayGeometry::FullBleed,
@@ -920,10 +925,10 @@ impl RuntimeControl {
         });
     }
 
-    /// Open the `/model` overlay. The overlay's content (model + thinking
-    /// picker) is built by ModelOverlay (Task 11); this method only reserves
-    /// the overlay slot and pushes an inset OverlayBox whose content node is
-    /// supplied by a caller-provided factory.
+    /// Open the `/model` overlay. `content_factory` builds the ModelOverlay
+    /// node; it is invoked exactly once by App's OverlayLayer (under the mount
+    /// owner), not here — so the overlay's `on_key`/effect register against the
+    /// correct owner and are not rebuilt on spurious re-runs.
     pub fn open_model_overlay(&self, content_factory: std::rc::Rc<dyn Fn() -> Node>) {
         if self.overlay_stack.is_active() {
             self.stack
@@ -941,9 +946,12 @@ impl RuntimeControl {
         self.overlay_stack.push(overlay);
     }
 
-    /// Handle the `OpenModelOverlay` runtime command: build the ModelOverlay
-    /// node (reading the live harness from context) and push it as an inset
-    /// overlay. Runs on the iodilos owner thread, so `use_context` resolves.
+    /// Handle the `OpenModelOverlay` runtime command: read the live harness from
+    /// context and push an inset overlay whose content factory builds the
+    /// ModelOverlay. The factory is NOT invoked here (this runs in the
+    /// command-pump `spawn_local` task, where CURRENT_OWNER is unset, so
+    /// `use_context`/`on_key` would not resolve); it runs once in App's
+    /// OverlayLayer render effect under the mount owner.
     pub fn handle_open_model_overlay(
         &self,
         reply: tokio::sync::oneshot::Sender<crate::core::extensions::types::CommandResult>,

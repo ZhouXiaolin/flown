@@ -5,19 +5,27 @@
 //! active overlay (we support depth 1 in v1); popping runs the overlay's
 //! optional `on_close` teardown first.
 //!
-//! This is the "pure UI layer tracking" extracted from the old
-//! ConversationStack's active-swap mechanism (see spec §2.1, §6.1).
+//! The overlay carries a **content factory** (`Fn() -> Node`), not a pre-built
+//! node. App's `OverlayLayer` builds the content ONCE — under the mount owner,
+//! wrapped in a sub-`Owner` (mirroring iodilos's `Show`) — when the active
+//! overlay changes, and caches that owner so spurious effect re-runs do not
+//! re-build (which would stack a fresh `on_key` per redraw). Building in the
+//! render effect (not in a `spawn_local` task) ensures `use_context` /
+//! `on_key` / `create_effect` resolve against the correct owner.
 
 use std::rc::Rc;
 
 use iodilos::prelude::*;
 use iodilos::OverlayGeometry;
 
-/// One active overlay.
+/// One active overlay. `content` is a factory because the node must be built
+/// inside App's render effect (the mount owner) — not in the `spawn_local`
+/// task that calls `push`.
 pub struct ActiveOverlay {
     pub geometry: OverlayGeometry,
     pub dismissible: bool,
-    /// Builds the overlay's content Node. Called from an effect each render.
+    /// Builds the overlay's content Node. Invoked exactly once per overlay
+    /// (when App mounts it), under the mount owner.
     pub content: Rc<dyn Fn() -> Node>,
     /// Optional teardown (btw uses it to drop its forked harness; model doesn't).
     pub on_close: Option<Rc<dyn Fn()>>,
@@ -74,15 +82,11 @@ impl OverlayStack {
 mod tests {
     use super::*;
 
-    fn dummy_content() -> Rc<dyn Fn() -> Node> {
-        Rc::new(|| Node::new_text())
-    }
-
     fn overlay() -> ActiveOverlay {
         ActiveOverlay {
             geometry: OverlayGeometry::Inset { ratio: 0.125 },
             dismissible: true,
-            content: dummy_content(),
+            content: Rc::new(|| Node::new_text()),
             on_close: None,
         }
     }
@@ -120,7 +124,7 @@ mod tests {
             let o = ActiveOverlay {
                 geometry: OverlayGeometry::FullBleed,
                 dismissible: true,
-                content: dummy_content(),
+                content: Rc::new(|| Node::new_text()),
                 on_close: Some(Rc::new(move || fired_for_close.set(true))),
             };
             stack.push(o);

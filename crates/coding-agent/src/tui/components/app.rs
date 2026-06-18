@@ -7,6 +7,7 @@
 //! Key handling: the editor's `handle_key` composes iodilos `TextAreaState`
 //! with agent-specific slash completion, then App reacts to `Submit`.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -66,17 +67,56 @@ pub fn App() -> Node {
 #[component]
 fn OverlayLayer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> Node {
     // Track the active overlay reactively. `active_signal` is an RwSignal; reading
-    // it inside an effect registers the dependency. We render the OverlayBox only
-    // while an overlay is present.
+    // it inside an effect registers the dependency.
+    //
+    // The content is built ONCE per overlay, inside `create_root` (mirroring
+    // iodilos's `Show`), and its sub-owner is cached. This matters for two
+    // reasons:
+    //   1. Building here (in the mount-owner render effect, not in the
+    //      `spawn_local` task that called `push`) lets the content's
+    //      `use_context` / `on_key` / `create_effect` resolve against the
+    //      correct owner — without this, /btw's overlay rendered blank and
+    //      /model's `on_key` never fired.
+    //   2. Caching the owner means a spurious effect re-run (e.g. from the
+    //      content's own signal writes) does NOT rebuild, which would stack a
+    //      fresh `on_key` handler on every redraw (the duplicate-overlay +
+    //      immediate-exit bug). We rebuild only when the active overlay identity
+    //      changes (a push or pop).
     let active = overlay.active_signal();
     let host = Node::new_view();
     let host_for_effect = host.clone();
+    // (mounted_overlay, owner): the overlay currently rendered + its sub-owner.
+    let mounted: Rc<RefCell<Option<(Rc<crate::tui::overlay_stack::ActiveOverlay>, Owner)>>> =
+        Rc::new(RefCell::new(None));
+    let mounted_for_effect = Rc::clone(&mounted);
+    let mounted_for_cleanup = Rc::clone(&mounted);
     create_effect(move || {
         let current = active.get();
+        // Only (re)build when the overlay identity actually changed. Comparing
+        // the `Rc` pointer is correct: push/pop swap the `Rc`; a spurious re-run
+        // sees the same pointer and skips the rebuild.
+        let same = mounted_for_effect
+            .borrow()
+            .as_ref()
+            .map(|(prev, _)| Rc::ptr_eq(prev, &current.clone().unwrap_or_else(|| prev.clone())))
+            .unwrap_or(false)
+            && current.is_some();
+        if same {
+            return;
+        }
+        // Dispose the previously mounted branch (runs its on_cleanup / drops its
+        // on_key registration).
+        if let Some((_, owner)) = mounted_for_effect.borrow_mut().take() {
+            owner.dispose();
+        }
         match current {
             Some(o) => {
                 let geometry = o.geometry;
-                let content = (o.content)();
+                let content_factory = Rc::clone(&o.content);
+                // Build the content under a fresh sub-owner so its effects/on_key
+                // are reclaimed on the next push/pop.
+                let (content, owner) = create_root(move || content_factory());
+                *mounted_for_effect.borrow_mut() = Some((o, owner));
                 let props = iodilos::OverlayBoxProps {
                     geometry,
                     background: Color::Reset,
@@ -90,6 +130,11 @@ fn OverlayLayer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> Node {
             None => {
                 host_for_effect.set_children(vec![]);
             }
+        }
+    });
+    on_cleanup(move || {
+        if let Some((_, owner)) = mounted_for_cleanup.borrow_mut().take() {
+            owner.dispose();
         }
     });
     host
