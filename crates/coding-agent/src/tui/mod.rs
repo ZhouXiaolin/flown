@@ -15,6 +15,7 @@ pub mod components;
 pub mod conversation;
 pub mod editor;
 pub mod markdown;
+pub mod overlay_stack;
 pub mod runtime;
 mod slash_commands;
 pub mod state;
