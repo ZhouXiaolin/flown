@@ -29,7 +29,10 @@ pub fn generate_images_openrouter(
             return Ok(output);
         };
         let Some(api_key) = options.api_key.clone() else {
-            output.stop_reason = if options.signal.as_ref().is_some_and(|signal| signal.is_cancelled())
+            output.stop_reason = if options
+                .signal
+                .as_ref()
+                .is_some_and(|signal| signal.is_cancelled())
             {
                 ImagesStopReason::Aborted
             } else {
@@ -73,7 +76,10 @@ pub fn generate_images_openrouter(
         }
 
         let mut request = client
-            .post(format!("{}/chat/completions", model.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                model.base_url.trim_end_matches('/')
+            ))
             .headers(headers)
             .json(&payload);
         if let Some(timeout_ms) = options.timeout_ms {
@@ -128,15 +134,12 @@ pub fn generate_images_openrouter(
                     let image_url = image
                         .get("image_url")
                         .and_then(|value| {
-                            value
-                                .as_str()
-                                .map(ToOwned::to_owned)
-                                .or_else(|| {
-                                    value
-                                        .get("url")
-                                        .and_then(|url| url.as_str())
-                                        .map(ToOwned::to_owned)
-                                })
+                            value.as_str().map(ToOwned::to_owned).or_else(|| {
+                                value
+                                    .get("url")
+                                    .and_then(|url| url.as_str())
+                                    .map(ToOwned::to_owned)
+                            })
                         })
                         .unwrap_or_default();
                     if !image_url.starts_with("data:") {

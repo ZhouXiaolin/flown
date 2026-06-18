@@ -1,8 +1,8 @@
 use crate::types::*;
 use flown_ai::{
-    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Model,
-    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingLevel, Tool, ToolCall,
-    ToolResultContent, ToolResultMessage, Usage, validate_tool_arguments,
+    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Model, SimpleStreamOptions,
+    StopReason, StreamOptions, TextContent, ThinkingLevel, Tool, ToolCall, ToolResultContent,
+    ToolResultMessage, Usage, validate_tool_arguments,
 };
 use futures::{
     Future, FutureExt,
@@ -113,7 +113,10 @@ pub async fn run_agent_loop_continue(
     }
     let last_message = context.messages.last().unwrap();
     if matches!(last_message, AgentMessage::Assistant(_)) {
-        let m = make_error_assistant(&config.model, "Cannot continue from message role: assistant");
+        let m = make_error_assistant(
+            &config.model,
+            "Cannot continue from message role: assistant",
+        );
         emit_error_sequence(&sink, m).await;
         return Vec::new();
     }
@@ -203,8 +206,20 @@ fn make_error_assistant(model: &Model, message: &str) -> AssistantMessage {
 /// `message_start` → `message_end` → `turn_end` → `agent_end`.
 async fn emit_error_sequence(sink: &AgentEventSink, m: AssistantMessage) {
     let msg = AgentMessage::Assistant(m);
-    emit(sink, AgentEvent::MessageStart { message: msg.clone() }).await;
-    emit(sink, AgentEvent::MessageEnd { message: msg.clone() }).await;
+    emit(
+        sink,
+        AgentEvent::MessageStart {
+            message: msg.clone(),
+        },
+    )
+    .await;
+    emit(
+        sink,
+        AgentEvent::MessageEnd {
+            message: msg.clone(),
+        },
+    )
+    .await;
     emit(
         sink,
         AgentEvent::TurnEnd {
@@ -213,7 +228,13 @@ async fn emit_error_sequence(sink: &AgentEventSink, m: AssistantMessage) {
         },
     )
     .await;
-    emit(sink, AgentEvent::AgentEnd { messages: vec![msg] }).await;
+    emit(
+        sink,
+        AgentEvent::AgentEnd {
+            messages: vec![msg],
+        },
+    )
+    .await;
 }
 
 async fn run_loop(
@@ -445,7 +466,8 @@ async fn stream_assistant_response(
         thinking_budgets: config.thinking_budgets.clone(),
     };
 
-    let mut event_stream = if let Some(stream_fn) = stream_fn.as_ref().or(config.stream_fn.as_ref()) {
+    let mut event_stream = if let Some(stream_fn) = stream_fn.as_ref().or(config.stream_fn.as_ref())
+    {
         stream_fn(config.model.clone(), llm_context, Some(stream_options))
     } else {
         match flown_ai::stream_simple(&config.model, &llm_context, Some(&stream_options)) {

@@ -21,9 +21,8 @@ const DEFAULT_MIN_TOKEN_SIZE: usize = 3;
 const DEFAULT_MAX_TOKEN_SIZE: usize = 5;
 
 type FauxResponseFuture = Pin<Box<dyn Future<Output = AssistantMessage> + Send>>;
-type FauxResponseFactory = Arc<
-    dyn Fn(Context, Option<StreamOptions>, usize, Model) -> FauxResponseFuture + Send + Sync,
->;
+type FauxResponseFactory =
+    Arc<dyn Fn(Context, Option<StreamOptions>, usize, Model) -> FauxResponseFuture + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FauxModelDefinition {
@@ -212,7 +211,11 @@ impl FauxProviderRegistration {
 
     pub fn get_model(&self, model_id: Option<&str>) -> Option<Model> {
         match model_id {
-            Some(model_id) => self.models.iter().find(|model| model.id == model_id).cloned(),
+            Some(model_id) => self
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .cloned(),
             None => self.models.first().cloned(),
         }
     }
@@ -438,7 +441,12 @@ fn build_models(
         .collect()
 }
 
-fn clone_message(message: AssistantMessage, api: &Api, provider: &Provider, model_id: &str) -> AssistantMessage {
+fn clone_message(
+    message: AssistantMessage,
+    api: &Api,
+    provider: &Provider,
+    model_id: &str,
+) -> AssistantMessage {
     AssistantMessage {
         role: message.role,
         content: message.content,
@@ -497,7 +505,9 @@ fn serialize_context(context: &Context) -> String {
     for message in &context.messages {
         parts.push(match message {
             Message::User(message) => format!("user:{}", message_to_text_content(&message.content)),
-            Message::Assistant(message) => format!("assistant:{}", assistant_content_to_text(&message.content)),
+            Message::Assistant(message) => {
+                format!("assistant:{}", assistant_content_to_text(&message.content))
+            }
             Message::ToolResult(message) => format!(
                 "toolResult:{}\n{}",
                 message.tool_name,
@@ -569,7 +579,10 @@ fn with_usage_estimate(
 
     if let Some(session_id) = options
         .and_then(|options| options.session_id.as_ref())
-        .filter(|_| options.and_then(|options| options.cache_retention.as_ref()) != Some(&CacheRetention::None))
+        .filter(|_| {
+            options.and_then(|options| options.cache_retention.as_ref())
+                != Some(&CacheRetention::None)
+        })
     {
         let mut cache = prompt_cache.lock().unwrap();
         if let Some(previous_prompt) = cache.get(session_id) {
@@ -642,17 +655,21 @@ async fn stream_with_deltas(
     for (index, block) in message.content.iter().enumerate() {
         match block {
             AssistantContent::Thinking(thinking) => {
-                partial.content.push(AssistantContent::Thinking(ThinkingContent {
-                    content_type: "thinking".to_string(),
-                    thinking: String::new(),
-                    thinking_signature: None,
-                    redacted: thinking.redacted,
-                }));
+                partial
+                    .content
+                    .push(AssistantContent::Thinking(ThinkingContent {
+                        content_type: "thinking".to_string(),
+                        thinking: String::new(),
+                        thinking_signature: None,
+                        redacted: thinking.redacted,
+                    }));
                 events.push(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
                     partial: partial.clone(),
                 });
-                for chunk in split_string_by_token_size(&thinking.thinking, min_token_size, max_token_size) {
+                for chunk in
+                    split_string_by_token_size(&thinking.thinking, min_token_size, max_token_size)
+                {
                     schedule_chunk(&chunk, tokens_per_second).await;
                     if signal.as_ref().is_some_and(AbortSignal::is_cancelled) {
                         let aborted = create_aborted_message(&partial);
@@ -662,7 +679,9 @@ async fn stream_with_deltas(
                         });
                         return events;
                     }
-                    if let Some(AssistantContent::Thinking(partial_thinking)) = partial.content.get_mut(index) {
+                    if let Some(AssistantContent::Thinking(partial_thinking)) =
+                        partial.content.get_mut(index)
+                    {
                         partial_thinking.thinking.push_str(&chunk);
                     }
                     events.push(AssistantMessageEvent::ThinkingDelta {
@@ -687,7 +706,8 @@ async fn stream_with_deltas(
                     content_index: index,
                     partial: partial.clone(),
                 });
-                for chunk in split_string_by_token_size(&text.text, min_token_size, max_token_size) {
+                for chunk in split_string_by_token_size(&text.text, min_token_size, max_token_size)
+                {
                     schedule_chunk(&chunk, tokens_per_second).await;
                     if signal.as_ref().is_some_and(AbortSignal::is_cancelled) {
                         let aborted = create_aborted_message(&partial);
@@ -697,7 +717,9 @@ async fn stream_with_deltas(
                         });
                         return events;
                     }
-                    if let Some(AssistantContent::Text(partial_text)) = partial.content.get_mut(index) {
+                    if let Some(AssistantContent::Text(partial_text)) =
+                        partial.content.get_mut(index)
+                    {
                         partial_text.text.push_str(&chunk);
                     }
                     events.push(AssistantMessageEvent::TextDelta {
@@ -725,7 +747,8 @@ async fn stream_with_deltas(
                     partial: partial.clone(),
                 });
                 for chunk in split_string_by_token_size(
-                    &serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string()),
+                    &serde_json::to_string(&tool_call.arguments)
+                        .unwrap_or_else(|_| "{}".to_string()),
                     min_token_size,
                     max_token_size,
                 ) {
@@ -744,7 +767,9 @@ async fn stream_with_deltas(
                         partial: partial.clone(),
                     });
                 }
-                if let Some(AssistantContent::ToolCall(partial_tool_call)) = partial.content.get_mut(index) {
+                if let Some(AssistantContent::ToolCall(partial_tool_call)) =
+                    partial.content.get_mut(index)
+                {
                     partial_tool_call.arguments = tool_call.arguments.clone();
                 }
                 events.push(AssistantMessageEvent::ToolCallEnd {
@@ -771,7 +796,11 @@ async fn stream_with_deltas(
     events
 }
 
-fn split_string_by_token_size(text: &str, min_token_size: usize, max_token_size: usize) -> Vec<String> {
+fn split_string_by_token_size(
+    text: &str,
+    min_token_size: usize,
+    max_token_size: usize,
+) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
@@ -779,7 +808,8 @@ fn split_string_by_token_size(text: &str, min_token_size: usize, max_token_size:
     let step = (min_token_size.max(1) + max_token_size.max(min_token_size)) / 2;
     let char_size = (step.max(1)) * 4;
     let chars: Vec<char> = text.chars().collect();
-    chars.chunks(char_size)
+    chars
+        .chunks(char_size)
         .map(|chunk| chunk.iter().collect())
         .collect()
 }

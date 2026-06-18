@@ -13,7 +13,7 @@ use std::rc::Rc;
 use iodilos::prelude::*;
 
 use crate::tui::components::message_block::render_entry;
-use crate::tui::state::ConversationEntry;
+use crate::tui::state::{ConversationEntry, EntryKind};
 
 const RESERVED_ROWS: u16 = 7;
 /// Columns consumed by the `ScrollableViewport` chrome: left/right border (1+1)
@@ -84,21 +84,40 @@ pub(crate) fn visible_transcript_lines(
         scroll_offset
     };
     let needed_lines = viewport_lines.saturating_add(requested_offset);
-    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+    // Collect (entry, rendered chunk) pairs so the separator decision below can
+    // see each entry's kind.
+    let mut chunks: Vec<(&ConversationEntry, Vec<Line<'static>>)> = Vec::new();
     let mut rendered_lines = 0usize;
 
     for entry in entries.iter().rev() {
         let chunk = render_entry(entry, render_width);
         rendered_lines = rendered_lines.saturating_add(chunk.len());
-        chunks.push(chunk);
+        chunks.push((entry, chunk));
         if rendered_lines >= needed_lines {
             break;
         }
     }
 
     let mut lines = Vec::with_capacity(rendered_lines);
-    for chunk in chunks.into_iter().rev() {
+    let mut prev_entry: Option<&ConversationEntry> = None;
+    for (entry, chunk) in chunks.into_iter().rev() {
+        // One blank line on a User↔Assistant turn boundary, in either
+        // direction: between a prompt and its reply (User→Assistant), and
+        // between a reply and the next prompt (Assistant→User). Assistant-
+        // internal rows (thinking/tool/text/error) stay tight — they belong to
+        // one assistant turn. System rows never get a separator.
+        if let Some(prev) = prev_entry {
+            let boundary = matches!(
+                (&prev.kind, &entry.kind),
+                (EntryKind::User(_), EntryKind::Assistant(_))
+                    | (EntryKind::Assistant(_), EntryKind::User(_))
+            );
+            if boundary {
+                lines.push(Line::from(""));
+            }
+        }
         lines.extend(chunk);
+        prev_entry = Some(entry);
     }
 
     if lines.is_empty() {
@@ -123,6 +142,12 @@ mod tests {
         }
     }
 
+    fn entry_of(make_kind: impl FnOnce(String) -> EntryKind, text: &str) -> ConversationEntry {
+        ConversationEntry {
+            kind: make_kind(text.to_string()),
+        }
+    }
+
     fn plain(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -143,5 +168,65 @@ mod tests {
         let lines = visible_transcript_lines(&entries, 2, 1, 80);
         assert_eq!(plain(&lines[0]), "ℹ two");
         assert_eq!(plain(&lines[1]), "ℹ three");
+    }
+
+    /// A user prompt and the assistant reply that follows it are separated by a
+    /// blank line — the visual turn boundary the user asked for.
+    #[test]
+    fn blank_line_separates_user_prompt_from_assistant_reply() {
+        let entries = vec![
+            entry_of(EntryKind::User, "list the files"),
+            entry_of(EntryKind::Assistant, "here they are"),
+        ];
+
+        let lines = visible_transcript_lines(&entries, 4, usize::MAX, 80);
+        assert_eq!(plain(&lines[0]), "> list the files");
+        assert_eq!(plain(&lines[1]), ""); // the separator
+        assert_eq!(plain(&lines[2]), "● here they are");
+    }
+
+    /// Assistant-side rows (thinking/tool/text) stay tight with no separator —
+    /// only the User→Assistant boundary gets the blank line.
+    #[test]
+    fn assistant_internal_rows_stay_tight_without_separator() {
+        let entries = vec![
+            entry_of(EntryKind::User, "go"),
+            entry_of(EntryKind::Assistant, "working"),
+            entry_of(EntryKind::Thinking, "planning..."),
+            entry_of(EntryKind::Tool, "bash: ls"),
+            entry_of(EntryKind::Assistant, "done"),
+        ];
+
+        let lines = visible_transcript_lines(&entries, 10, usize::MAX, 80);
+        // Index 0 = user prompt, 1 = separator (User→Assistant), 2 = assistant,
+        // then thinking/tool/assistant follow with NO separators between them.
+        assert_eq!(plain(&lines[0]), "> go");
+        assert_eq!(plain(&lines[1]), "");
+        assert_eq!(plain(&lines[2]), "● working");
+        assert_eq!(plain(&lines[3]), "💭 planning...");
+        assert_eq!(plain(&lines[4]), "🔧 bash: ls");
+        assert_eq!(plain(&lines[5]), "● done");
+    }
+
+    /// The second turn's User prompt is separated from the previous turn's
+    /// Assistant reply by a blank line too (Assistant→User boundary) — without
+    /// this, a follow-up prompt crowds the reply above it.
+    #[test]
+    fn blank_line_separates_assistant_reply_from_next_user_prompt() {
+        let entries = vec![
+            entry_of(EntryKind::User, "first"),
+            entry_of(EntryKind::Assistant, "reply one"),
+            entry_of(EntryKind::User, "second"),
+            entry_of(EntryKind::Assistant, "reply two"),
+        ];
+
+        let lines = visible_transcript_lines(&entries, 12, usize::MAX, 80);
+        assert_eq!(plain(&lines[0]), "> first");
+        assert_eq!(plain(&lines[1]), ""); // User→Assistant
+        assert_eq!(plain(&lines[2]), "● reply one");
+        assert_eq!(plain(&lines[3]), ""); // Assistant→User
+        assert_eq!(plain(&lines[4]), "> second");
+        assert_eq!(plain(&lines[5]), ""); // User→Assistant
+        assert_eq!(plain(&lines[6]), "● reply two");
     }
 }

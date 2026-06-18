@@ -47,7 +47,11 @@ impl FileError {
         }
     }
 
-    pub fn with_message(code: FileErrorCode, message: impl Into<String>, path: Option<String>) -> Self {
+    pub fn with_message(
+        code: FileErrorCode,
+        message: impl Into<String>,
+        path: Option<String>,
+    ) -> Self {
         Self {
             code,
             message: message.into(),

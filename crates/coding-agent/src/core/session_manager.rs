@@ -1,9 +1,9 @@
+use flown_agent::AgentMessage;
 use flown_agent::FileSystem;
 use flown_agent::{
     JsonlSessionCreateOptions, JsonlSessionForkOptions, JsonlSessionListOptions,
     JsonlSessionMetadata, JsonlSessionRepo, Session, SessionError, SessionRepo,
 };
-use flown_agent::AgentMessage;
 use std::sync::Arc;
 
 /// Manages conversation sessions with JSONL persistence.
@@ -206,9 +206,7 @@ impl SessionManager {
     // --- Context building ---
 
     /// Build LLM context from the current session's branch.
-    pub async fn build_context(
-        &self,
-    ) -> Result<flown_agent::SessionContext, SessionError> {
+    pub async fn build_context(&self) -> Result<flown_agent::SessionContext, SessionError> {
         let session = self
             .current_session
             .as_ref()

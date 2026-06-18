@@ -316,16 +316,13 @@ impl Shell for NativeExecutionEnv {
                 }
             }
         } else {
-            child
-                .wait_with_output()
-                .await
-                .map_err(|e| {
-                    ExecutionError::with_source(
-                        ExecutionErrorCode::SpawnError,
-                        format!("failed to wait for shell command: {command}"),
-                        e,
-                    )
-                })?
+            child.wait_with_output().await.map_err(|e| {
+                ExecutionError::with_source(
+                    ExecutionErrorCode::SpawnError,
+                    format!("failed to wait for shell command: {command}"),
+                    e,
+                )
+            })?
         };
 
         let exit_code = output.status.code().unwrap_or(-1);

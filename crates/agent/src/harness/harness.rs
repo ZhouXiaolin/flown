@@ -9,7 +9,7 @@ use crate::types::*;
 use flown_ai::{
     AbortSignal, AssistantContent, AssistantMessage, AssistantMessageEvent, Context, ImageContent,
     Message, MessageContent, Model, SimpleStreamOptions, StopReason, TextContent, ThinkingLevel,
-    Tool, ToolResultContent, UserContentBlock, UserMessage, Usage,
+    Tool, ToolResultContent, Usage, UserContentBlock, UserMessage,
 };
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
@@ -512,11 +512,14 @@ impl AgentHarness {
                 });
         }
 
-        self.emit(HarnessEvent::ModelUpdate {
-            model,
-            previous_model: Some(previous),
-            source: ModelUpdateSource::Set,
-        }, None)
+        self.emit(
+            HarnessEvent::ModelUpdate {
+                model,
+                previous_model: Some(previous),
+                source: ModelUpdateSource::Set,
+            },
+            None,
+        )
         .await;
     }
 
@@ -542,10 +545,13 @@ impl AgentHarness {
                 });
         }
 
-        self.emit(HarnessEvent::ThinkingLevelUpdate {
-            level,
-            previous_level: previous,
-        }, None)
+        self.emit(
+            HarnessEvent::ThinkingLevelUpdate {
+                level,
+                previous_level: previous,
+            },
+            None,
+        )
         .await;
     }
 
@@ -608,13 +614,16 @@ impl AgentHarness {
         self.persist_active_tools_change(next_active_names).await;
         let tool_names: Vec<String> = self.tools.read().keys().cloned().collect();
         let active_tool_names = self.active_tool_names.read().clone();
-        self.emit(HarnessEvent::ToolsUpdate {
-            tool_names,
-            previous_tool_names,
-            active_tool_names,
-            previous_active_tool_names,
-            source: ToolUpdateSource::Set,
-        }, None)
+        self.emit(
+            HarnessEvent::ToolsUpdate {
+                tool_names,
+                previous_tool_names,
+                active_tool_names,
+                previous_active_tool_names,
+                source: ToolUpdateSource::Set,
+            },
+            None,
+        )
         .await;
         Ok(())
     }
@@ -630,13 +639,16 @@ impl AgentHarness {
         self.persist_active_tools_change(names).await;
         let tool_names: Vec<String> = self.tools.read().keys().cloned().collect();
         let active_tool_names = self.active_tool_names.read().clone();
-        self.emit(HarnessEvent::ToolsUpdate {
-            tool_names,
-            previous_tool_names,
-            active_tool_names,
-            previous_active_tool_names,
-            source: ToolUpdateSource::Set,
-        }, None)
+        self.emit(
+            HarnessEvent::ToolsUpdate {
+                tool_names,
+                previous_tool_names,
+                active_tool_names,
+                previous_active_tool_names,
+                source: ToolUpdateSource::Set,
+            },
+            None,
+        )
         .await;
         Ok(())
     }
@@ -659,10 +671,13 @@ impl AgentHarness {
         let previous = current.clone();
         *current = resources.clone();
 
-        self.emit(HarnessEvent::ResourcesUpdate {
-            resources,
-            previous_resources: previous,
-        }, None)
+        self.emit(
+            HarnessEvent::ResourcesUpdate {
+                resources,
+                previous_resources: previous,
+            },
+            None,
+        )
         .await;
     }
 
@@ -842,10 +857,13 @@ impl AgentHarness {
         // Wait for the run to actually complete
         self.wait_for_idle().await;
 
-        self.emit(HarnessEvent::Abort {
-            cleared_steer: cleared_steer.clone(),
-            cleared_follow_up: cleared_follow_up.clone(),
-        }, None)
+        self.emit(
+            HarnessEvent::Abort {
+                cleared_steer: cleared_steer.clone(),
+                cleared_follow_up: cleared_follow_up.clone(),
+            },
+            None,
+        )
         .await;
 
         Ok(AbortResult {
@@ -998,10 +1016,13 @@ impl AgentHarness {
         let _session_context = self.session.build_context().await;
         let compaction_entry = self.session.get_entry(&entry_id).await;
 
-        self.emit(HarnessEvent::SessionCompact {
-            compaction_entry,
-            from_hook: from_hook == Some(true),
-        }, None)
+        self.emit(
+            HarnessEvent::SessionCompact {
+                compaction_entry,
+                from_hook: from_hook == Some(true),
+            },
+            None,
+        )
         .await;
     }
 
@@ -1168,12 +1189,15 @@ impl AgentHarness {
             None
         };
 
-        self.emit(HarnessEvent::SessionTree {
-            new_leaf_id: Some(new_leaf_id.clone()),
-            old_leaf_id: old_leaf_id.clone(),
-            summary_entry: summary_entry.clone(),
-            from_hook: from_hook_summary,
-        }, None)
+        self.emit(
+            HarnessEvent::SessionTree {
+                new_leaf_id: Some(new_leaf_id.clone()),
+                old_leaf_id: old_leaf_id.clone(),
+                summary_entry: summary_entry.clone(),
+                from_hook: from_hook_summary,
+            },
+            None,
+        )
         .await;
 
         // Get editor text from the target entry if it's a user message
@@ -1204,7 +1228,10 @@ impl AgentHarness {
     /// Subscribe to all events, returns an unsubscribe function
     pub fn subscribe(
         &self,
-        handler: impl Fn(HarnessEvent, Option<AbortSignal>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+        handler: impl Fn(HarnessEvent, Option<AbortSignal>) -> BoxFuture<'static, ()>
+        + Send
+        + Sync
+        + 'static,
     ) -> Box<dyn Fn() + Send + Sync> {
         let mut subscribers = self.subscribers.write();
         let mut next_id = self.next_subscriber_id.lock();
@@ -1512,23 +1539,25 @@ impl AgentHarness {
 
         let prepare_next_turn = {
             let h = harness.clone();
-            Arc::new(move |_ctx: PrepareNextTurnContext, _signal: Option<AbortSignal>| {
-                let h = h.clone();
-                Box::pin(async move {
-                    h.flush_pending_writes().await.ok()?;
-                    let new_state = h.create_turn_state().await;
-                    Some(AgentLoopTurnUpdate {
-                        context: Some(AgentContext {
-                            system_prompt: new_state.system_prompt.clone(),
-                            messages: new_state.messages.clone(),
-                            tools: Some(new_state.active_tools.clone()),
-                        }),
-                        model: Some(new_state.model.clone()),
-                        thinking_level: Some(new_state.thinking_level.clone()),
+            Arc::new(
+                move |_ctx: PrepareNextTurnContext, _signal: Option<AbortSignal>| {
+                    let h = h.clone();
+                    Box::pin(async move {
+                        h.flush_pending_writes().await.ok()?;
+                        let new_state = h.create_turn_state().await;
+                        Some(AgentLoopTurnUpdate {
+                            context: Some(AgentContext {
+                                system_prompt: new_state.system_prompt.clone(),
+                                messages: new_state.messages.clone(),
+                                tools: Some(new_state.active_tools.clone()),
+                            }),
+                            model: Some(new_state.model.clone()),
+                            thinking_level: Some(new_state.thinking_level.clone()),
+                        })
                     })
-                })
-                    as Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
-            })
+                        as Pin<Box<dyn Future<Output = Option<AgentLoopTurnUpdate>> + Send>>
+                },
+            )
         };
 
         let before_tool_call = {
@@ -1686,98 +1715,100 @@ impl AgentHarness {
                 move |model: Model, context: Context, options: Option<SimpleStreamOptions>| {
                     let h = h.clone();
                     let session_id = session_id.clone();
-                    flown_ai::AssistantMessageEventStream::from_stream(Box::pin(async_stream::stream! {
-                        let mut options = options.unwrap_or_default();
+                    flown_ai::AssistantMessageEventStream::from_stream(Box::pin(
+                        async_stream::stream! {
+                            let mut options = options.unwrap_or_default();
 
-                        // Get API key and headers
-                        let api_key_fn = h.get_api_key_and_headers.clone();
-                        let auth = api_key_fn.as_ref().and_then(|f| f(&model));
-                        if let Some((api_key, _headers)) = &auth {
-                            options.base.api_key = Some(api_key.clone());
-                        }
-
-                        // Emit before_provider_request hook
-                        let mut snapshot_options = h.stream_options.read().clone();
-                        snapshot_options.headers = merge_headers(
-                            snapshot_options.headers,
-                            auth.and_then(|(_api_key, headers)| headers),
-                        );
-                        let updated_options = h.emit_before_provider_request(&model, &session_id, &snapshot_options).await;
-
-                        // Apply updated options
-                        if let Some(headers) = updated_options.headers {
-                            options.base.headers = Some(headers);
-                        }
-                        if let Some(transport) = updated_options.transport {
-                            options.base.transport = Some(transport);
-                        }
-                        if let Some(timeout) = updated_options.timeout_ms {
-                            options.base.timeout_ms = Some(timeout);
-                        }
-                        if let Some(retries) = updated_options.max_retries {
-                            options.base.max_retries = Some(retries);
-                        }
-                        if let Some(delay) = updated_options.max_retry_delay_ms {
-                            options.base.max_retry_delay_ms = Some(delay);
-                        }
-                        if let Some(retention) = updated_options.cache_retention {
-                            options.base.cache_retention = Some(retention);
-                        }
-                        if let Some(metadata) = updated_options.metadata {
-                            options.base.metadata = Some(metadata);
-                        }
-
-                        // Wire up on_payload callback (before_provider_payload hook)
-                        let h_payload = h.clone();
-                        let model_payload = model.clone();
-                        options.base.on_payload = Some(Arc::new(move |payload| {
-                            let h = h_payload.clone();
-                            let model = model_payload.clone();
-                            Box::pin(async move {
-                                Some(h.emit_before_provider_payload(&model, payload).await)
-                            })
-                        }));
-
-                        let h_response = h.clone();
-                        options.base.on_response = Some(Arc::new(move |response| {
-                            let h = h_response.clone();
-                            Box::pin(async move {
-                                h.emit(HarnessEvent::AfterProviderResponse {
-                                    status: response.status,
-                                    headers: response.headers,
-                                }, None)
-                                .await;
-                            })
-                        }));
-
-                        let mut stream = match flown_ai::stream_simple(&model, &context, Some(&options)) {
-                            Ok(s) => s,
-                            Err(error) => {
-                                yield AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: AssistantMessage {
-                                        role: "assistant".to_string(),
-                                        content: vec![],
-                                        api: model.api.clone(),
-                                        provider: model.provider.clone(),
-                                        model: model.id.clone(),
-                                        response_model: None,
-                                        response_id: None,
-                                        usage: Usage::default(),
-                                        stop_reason: StopReason::Error,
-                                        error_message: Some(error.to_string()),
-                                        diagnostics: None,
-                                        timestamp: chrono::Utc::now(),
-                                    },
-                                };
-                                return;
+                            // Get API key and headers
+                            let api_key_fn = h.get_api_key_and_headers.clone();
+                            let auth = api_key_fn.as_ref().and_then(|f| f(&model));
+                            if let Some((api_key, _headers)) = &auth {
+                                options.base.api_key = Some(api_key.clone());
                             }
-                        };
 
-                        while let Some(event) = stream.next().await {
-                            yield event;
-                        }
-                    }))
+                            // Emit before_provider_request hook
+                            let mut snapshot_options = h.stream_options.read().clone();
+                            snapshot_options.headers = merge_headers(
+                                snapshot_options.headers,
+                                auth.and_then(|(_api_key, headers)| headers),
+                            );
+                            let updated_options = h.emit_before_provider_request(&model, &session_id, &snapshot_options).await;
+
+                            // Apply updated options
+                            if let Some(headers) = updated_options.headers {
+                                options.base.headers = Some(headers);
+                            }
+                            if let Some(transport) = updated_options.transport {
+                                options.base.transport = Some(transport);
+                            }
+                            if let Some(timeout) = updated_options.timeout_ms {
+                                options.base.timeout_ms = Some(timeout);
+                            }
+                            if let Some(retries) = updated_options.max_retries {
+                                options.base.max_retries = Some(retries);
+                            }
+                            if let Some(delay) = updated_options.max_retry_delay_ms {
+                                options.base.max_retry_delay_ms = Some(delay);
+                            }
+                            if let Some(retention) = updated_options.cache_retention {
+                                options.base.cache_retention = Some(retention);
+                            }
+                            if let Some(metadata) = updated_options.metadata {
+                                options.base.metadata = Some(metadata);
+                            }
+
+                            // Wire up on_payload callback (before_provider_payload hook)
+                            let h_payload = h.clone();
+                            let model_payload = model.clone();
+                            options.base.on_payload = Some(Arc::new(move |payload| {
+                                let h = h_payload.clone();
+                                let model = model_payload.clone();
+                                Box::pin(async move {
+                                    Some(h.emit_before_provider_payload(&model, payload).await)
+                                })
+                            }));
+
+                            let h_response = h.clone();
+                            options.base.on_response = Some(Arc::new(move |response| {
+                                let h = h_response.clone();
+                                Box::pin(async move {
+                                    h.emit(HarnessEvent::AfterProviderResponse {
+                                        status: response.status,
+                                        headers: response.headers,
+                                    }, None)
+                                    .await;
+                                })
+                            }));
+
+                            let mut stream = match flown_ai::stream_simple(&model, &context, Some(&options)) {
+                                Ok(s) => s,
+                                Err(error) => {
+                                    yield AssistantMessageEvent::Error {
+                                        reason: StopReason::Error,
+                                        error: AssistantMessage {
+                                            role: "assistant".to_string(),
+                                            content: vec![],
+                                            api: model.api.clone(),
+                                            provider: model.provider.clone(),
+                                            model: model.id.clone(),
+                                            response_model: None,
+                                            response_id: None,
+                                            usage: Usage::default(),
+                                            stop_reason: StopReason::Error,
+                                            error_message: Some(error.to_string()),
+                                            diagnostics: None,
+                                            timestamp: chrono::Utc::now(),
+                                        },
+                                    };
+                                    return;
+                                }
+                            };
+
+                            while let Some(event) = stream.next().await {
+                                yield event;
+                            }
+                        },
+                    ))
                 },
             )
         };
@@ -1884,9 +1915,12 @@ impl AgentHarness {
                     self.flush_pending_writes().await?;
 
                     // Emit save point
-                    self.emit(HarnessEvent::SavePoint {
-                        had_pending_mutations,
-                    }, None)
+                    self.emit(
+                        HarnessEvent::SavePoint {
+                            had_pending_mutations,
+                        },
+                        None,
+                    )
                     .await;
                     tracing::debug!(target: "flown::harness", "execute_turn save point emitted");
                 }
@@ -1895,11 +1929,8 @@ impl AgentHarness {
                     self.flush_pending_writes().await?;
                     tracing::debug!(target: "flown::harness", "execute_turn pending writes flushed after AgentEnd");
                     let next_turn_count = self.next_turn_queue.read().len();
-                    self.emit(
-                        HarnessEvent::Settled { next_turn_count },
-                        None,
-                    )
-                    .await;
+                    self.emit(HarnessEvent::Settled { next_turn_count }, None)
+                        .await;
                     tracing::debug!(target: "flown::harness", "execute_turn settled emitted");
                 }
                 _ => {}

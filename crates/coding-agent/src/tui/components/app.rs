@@ -104,8 +104,9 @@ fn handle_app_key(
             state.input.update(|input| input.clear());
             state.slash_popup.set(None);
         } else if has_overlap {
-            // CommandSide holds the bound RuntimeControl; expose overlap close
-            // through it so App stays independent of extension-specific logic.
+            // CommandSide holds the bound runtime command proxy; expose overlap
+            // close through it so App stays independent of extension-specific
+            // logic.
             let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
             tracing::info!(target: "flown::overlap", has_side = command_side.is_some(), "Ctrl+C in overlap, dispatching close");
             if let Some(cs) = command_side.as_ref() {
@@ -226,8 +227,8 @@ fn handle_app_key(
                 }
             } else if slash_commands_enabled && text.starts_with('/') {
                 // Extension commands get first crack at dispatch. CommandSide
-                // routes control commands to the bound RuntimeControl and
-                // effect commands to their handler.
+                // runs async handlers with an ExtensionContext backed by the
+                // runtime command proxy.
                 if let Some(cs) = command_side.as_ref()
                     && cs.dispatch(&text)
                 {

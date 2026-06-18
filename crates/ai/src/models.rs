@@ -46,8 +46,7 @@ pub fn calculate_cost(model: &Model, usage: &mut Usage) -> Cost {
         input: (model.cost.input / 1_000_000.0) * usage.input as f64,
         output: (model.cost.output / 1_000_000.0) * usage.output as f64,
         cache_read: (model.cost.cache_read / 1_000_000.0) * usage.cache_read as f64,
-        cache_write: (model.cost.cache_write * short_write
-            + model.cost.input * 2.0 * long_write)
+        cache_write: (model.cost.cache_write * short_write + model.cost.input * 2.0 * long_write)
             / 1_000_000.0,
         total: 0.0,
     };
@@ -495,4 +494,3 @@ mod tests {
         ));
     }
 }
-

@@ -11,7 +11,10 @@ static IMAGES_REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn image_model_registry_exposes_openrouter_models() {
     let model = get_image_model("openrouter", "openrouter/auto").expect("image model");
-    assert_eq!(model.api, ImagesApi::Known(KnownImagesApi::OpenrouterImages));
+    assert_eq!(
+        model.api,
+        ImagesApi::Known(KnownImagesApi::OpenrouterImages)
+    );
     assert_eq!(
         model.provider,
         ImagesProvider::Known(KnownImagesProvider::Openrouter)
@@ -29,10 +32,7 @@ fn built_in_images_provider_registers() {
     let _guard = IMAGES_REGISTRY_LOCK.lock().unwrap();
     clear_images_api_providers();
     register_built_in_images_api_providers();
-    assert!(get_images_api_provider(&ImagesApi::Known(
-        KnownImagesApi::OpenrouterImages
-    ))
-    .is_some());
+    assert!(get_images_api_provider(&ImagesApi::Known(KnownImagesApi::OpenrouterImages)).is_some());
 }
 
 #[test]

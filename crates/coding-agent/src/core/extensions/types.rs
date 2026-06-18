@@ -13,24 +13,22 @@
 //!   Command dispatch runs here (via `on_key` → `handle_app_key`).
 //!
 //! The split:
-//! - `Extension::register` runs on **tokio** and produces pure `Send` data: a
-//!   command table, one-shot tools, and `ToolStore`s.
+//! - `Extension::register` runs on **tokio** and produces command metadata,
+//!   async command handlers, one-shot tools, hooks, and `ToolStore`s.
 //! - The command table is moved to the **iodilos** side, wrapped in a
-//!   [`CommandSide`] that owns the `Rc<UiState>` sink and *interprets* each
-//!   handler's returned [`CommandEffect`] into `UiState` operations.
+//!   [`CommandSide`] that binds a host-owned runtime command proxy.
+//! - Command handlers receive an [`ExtensionContext`] facade. They drive UI and
+//!   conversation behavior through capabilities (`ctx.ui`, `ctx.conversation`)
+//!   instead of owning internal `Rc<UiState>` or raw harness state.
 //! - [`ToolHandle`] / [`ToolStore`] stay on **tokio** where
 //!   `harness.set_tools` is reachable.
-//!
-//! Handlers never receive `&CommandContext` — they take `args` and return a
-//! `CommandEffect`. This keeps `CommandHandler` `Send + Sync` (made on tokio,
-//! moved to iodilos) without forcing `CommandContext` to be `Sync`, which is
-//! impossible while it carries `Rc<UiState>`. An effect is plain `Send` data;
-//! iodilos interprets it. This is also more testable (effects are values) and
-//! accommodates future control commands through generic runtime capabilities.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use flown_agent::AgentTool;
+use tokio::sync::oneshot;
 
 // ── Extension trait ─────────────────────────────────────────────────────
 
@@ -80,25 +78,6 @@ pub struct SubcommandDef {
     pub description: String,
 }
 
-// ── CommandEffect + handler ─────────────────────────────────────────────
-
-/// What a command handler wants the runtime to do, returned as plain `Send`
-/// data so the handler itself can be `Send + Sync` (made on tokio, invoked on
-/// iodilos). The iodilos-side dispatcher interprets each variant.
-///
-/// Variants are added when a real extension needs them — never preemptively.
-/// M2a needs only the notify pair. Control commands use [`ControlRuntime`]
-/// when they need live TUI capabilities.
-#[derive(Debug, Clone)]
-pub enum CommandEffect {
-    /// Push an informational line into the transcript. Does not trigger a turn.
-    Notify(String),
-    /// Push an error line into the transcript.
-    NotifyError(String),
-    /// Clear the transcript.
-    ClearTranscript,
-}
-
 /// Whether an extension-owned overlap participates in global slash commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SlashCommandScope {
@@ -131,14 +110,23 @@ impl OverlapOptions {
     }
 }
 
+/// Parsed invocation handed to an extension command handler.
+#[derive(Debug, Clone)]
+pub struct CommandInvocation {
+    pub name: String,
+    pub args: String,
+}
+
+pub type CommandResult = anyhow::Result<()>;
+pub type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + 'static>>;
+
 /// Handler invoked when the user runs a registered extension command.
 ///
-/// `args` is everything after the command name (trimmed, re-joined). The
-/// handler returns a [`CommandEffect`] rather than touching the runtime
-/// directly, which keeps it `Send + Sync` regardless of the iodilos thread's
-/// `Rc`-based state.
-pub type CommandHandler = Arc<dyn Fn(&str) -> CommandEffect + Send + Sync>;
-pub type ControlHandler = Arc<dyn Fn(&str, &dyn ControlRuntime) + Send + Sync>;
+/// The handler is async and drives host behavior through [`ExtensionContext`].
+/// It returns `Result<()>`; user-visible output is explicit (`ctx.ui.notify`,
+/// `ctx.ui.notify_error`, etc.) and errors are surfaced by the command runner.
+pub type CommandHandler =
+    Arc<dyn Fn(CommandInvocation, ExtensionContext) -> CommandFuture + Send + Sync>;
 
 /// A fully-registered command, captured by [`ExtensionApi`] during `register`
 /// and moved into the iodilos-side [`super::CommandSide`].
@@ -146,41 +134,152 @@ pub struct RegisteredCommand {
     pub name: String,
     pub meta: CommandMeta,
     pub handler: CommandHandler,
-    pub control_handler: Option<ControlHandler>,
-    /// When `true`, the command needs the iodilos-side [`ControlRuntime`] to
-    /// drive the conversation stack. [`super::CommandSide`] supplies the live
-    /// runtime to `control_handler`; effect-only commands (`/mcp`) leave this
-    /// `false` and use `handler`.
-    pub needs_control: bool,
 }
 
-// ── Control-runtime (iodilos-side capability) ───────────────────────────
+// ── ExtensionContext + runtime command proxy ────────────────────────────
 
-/// Iodilos-side capability handed to *control* commands (those registered with
-/// [`ExtensionApi::register_control_command`]). Lets a command drive the
-/// conversation stack — open/close an extension layer, submit a turn, notify —
-/// without returning a plain [`CommandEffect`] when sequential logic over live
-/// runtime state is required.
+/// Commands that can be sent through the runtime command proxy.
+#[derive(Debug)]
+pub enum RuntimeCommand {
+    OpenOverlap {
+        options: OverlapOptions,
+        reply: oneshot::Sender<CommandResult>,
+    },
+    CloseActiveOverlap {
+        reply: oneshot::Sender<CommandResult>,
+    },
+    SendToActive {
+        text: String,
+        reply: oneshot::Sender<CommandResult>,
+    },
+    NotifyActive {
+        text: String,
+    },
+    NotifyErrorActive {
+        text: String,
+    },
+    ClearActive,
+}
+
+/// Host-owned command proxy used by [`ExtensionContext`] capabilities.
 ///
-/// This mirrors pi-mono's `ExtensionCommandContext` (handler receives a
-/// stateful `ctx`, not a pure effect). Implementations live on the iodilos
-/// thread and hold `Rc`-based state, so this trait is **not** `Send` and is
-/// never constructed during `register` (which runs on tokio). `CommandSide`
-/// receives the impl at mount and passes it to registered control handlers.
-pub trait ControlRuntime {
-    /// Open an extension-owned agent overlap. The runtime owns the generic
-    /// mechanics; the extension owns the options and policy.
-    fn open_overlap(&self, options: OverlapOptions);
-    /// Close the active dismissible overlap. No-op on Main.
-    fn close_active_overlap(&self);
-    /// Submit `text` as a user turn on the active layer's harness.
-    fn send_to_active(&self, text: String);
-    /// Push an informational line into the active layer's transcript.
-    fn notify_active(&self, text: String);
-    /// Push an error line into the active layer's transcript.
-    fn notify_error_active(&self, text: String);
-    /// Clear the active layer's transcript.
-    fn clear_active(&self);
+/// The proxy is `Send + Sync` and request-response aware: command handlers can
+/// await important runtime actions without owning raw `UiState`,
+/// `ConversationStack`, or harness internals.
+#[derive(Clone)]
+pub struct RuntimeCommandProxy {
+    tx: flume::Sender<RuntimeCommand>,
+}
+
+impl RuntimeCommandProxy {
+    pub fn new(tx: flume::Sender<RuntimeCommand>) -> Self {
+        Self { tx }
+    }
+
+    fn send(&self, cmd: RuntimeCommand) {
+        let _ = self.tx.send(cmd);
+    }
+
+    async fn request<F>(&self, make: F) -> CommandResult
+    where
+        F: FnOnce(oneshot::Sender<CommandResult>) -> RuntimeCommand,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(make(reply_tx))
+            .map_err(|_| anyhow::anyhow!("runtime command channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("runtime command reply dropped"))?
+    }
+
+    pub async fn open_overlap(&self, options: OverlapOptions) -> CommandResult {
+        self.request(|reply| RuntimeCommand::OpenOverlap { options, reply })
+            .await
+    }
+
+    pub async fn close_active_overlap(&self) -> CommandResult {
+        self.request(|reply| RuntimeCommand::CloseActiveOverlap { reply })
+            .await
+    }
+
+    pub async fn send_to_active(&self, text: String) -> CommandResult {
+        self.request(|reply| RuntimeCommand::SendToActive { text, reply })
+            .await
+    }
+
+    pub fn notify_active(&self, text: String) {
+        self.send(RuntimeCommand::NotifyActive { text });
+    }
+
+    pub fn notify_error_active(&self, text: String) {
+        self.send(RuntimeCommand::NotifyErrorActive { text });
+    }
+
+    pub fn clear_active(&self) {
+        self.send(RuntimeCommand::ClearActive);
+    }
+}
+
+/// Unified context object handed to extension command handlers.
+#[derive(Clone)]
+pub struct ExtensionContext {
+    pub ui: UiCapability,
+    pub conversation: ConversationCapability,
+}
+
+impl ExtensionContext {
+    pub fn new(runtime: Arc<RuntimeCommandProxy>) -> Self {
+        Self {
+            ui: UiCapability {
+                runtime: Arc::clone(&runtime),
+            },
+            conversation: ConversationCapability { runtime },
+        }
+    }
+}
+
+/// UI capability namespace for extension commands.
+#[derive(Clone)]
+pub struct UiCapability {
+    runtime: Arc<RuntimeCommandProxy>,
+}
+
+impl UiCapability {
+    /// Fire-and-forget informational notification on the active conversation.
+    pub fn notify(&self, text: impl Into<String>) {
+        self.runtime.notify_active(text.into());
+    }
+
+    /// Fire-and-forget error notification on the active conversation.
+    pub fn notify_error(&self, text: impl Into<String>) {
+        self.runtime.notify_error_active(text.into());
+    }
+
+    /// Clear the active conversation transcript.
+    pub fn clear(&self) {
+        self.runtime.clear_active();
+    }
+}
+
+/// Conversation capability namespace for extension commands.
+#[derive(Clone)]
+pub struct ConversationCapability {
+    runtime: Arc<RuntimeCommandProxy>,
+}
+
+impl ConversationCapability {
+    pub async fn open_overlap(&self, options: OverlapOptions) -> CommandResult {
+        self.runtime.open_overlap(options).await
+    }
+
+    pub async fn close_active_overlap(&self) -> CommandResult {
+        self.runtime.close_active_overlap().await
+    }
+
+    pub async fn send_to_active(&self, text: impl Into<String>) -> CommandResult {
+        self.runtime.send_to_active(text.into()).await
+    }
 }
 
 // ── ToolHandle (runtime add/remove) ─────────────────────────────────────
@@ -202,15 +301,28 @@ pub(crate) struct ToolStore {
     /// The full set of tools this extension manages (by name). The runner
     /// merges every extension's store before calling `harness.set_tools`.
     tools: std::sync::RwLock<std::collections::HashMap<String, AgentTool>>,
-    /// Set when any edit occurred since the last reconcile; the runner polls it.
+    /// Set when any edit occurred since the last reconcile; the runner checks
+    /// it when the `dirty_signal` fires.
     dirty: std::sync::atomic::AtomicBool,
+    /// Wakeup signal shared with the runner's reconcile loop. One signal is
+    /// shared across **all** stores (the runner rebuilds the whole tool set on
+    /// any edit, so per-store granularity buys nothing). Fired on every edit
+    /// so the runner wakes immediately instead of polling on a timer.
+    ///
+    /// Field-level dead-code allow: only written by `mark_dirty`, which is part
+    /// of the reserved runtime-edit API (see [`ToolHandle::add`]).
+    #[allow(dead_code)]
+    dirty_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ToolStore {
-    pub(crate) fn new() -> Self {
+    /// `dirty_signal` is shared across every store the runner owns, so a single
+    /// `notified().await` in the reconcile loop covers all of them.
+    pub(crate) fn new(dirty_signal: Arc<tokio::sync::Notify>) -> Self {
         Self {
             tools: std::sync::RwLock::new(std::collections::HashMap::new()),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            dirty_signal,
         }
     }
 }
@@ -221,18 +333,25 @@ impl ToolHandle {
     }
 
     /// Add or replace a tool by name. Staged until the next reconcile.
+    ///
+    /// Part of the reserved runtime-edit API: no built-in extension calls this
+    /// yet (MCP ships a one-shot snapshot at registration), but an MCP server
+    /// watcher or future extension will. It fires the shared dirty signal so
+    /// the runner's reconcile task wakes immediately.
+    #[allow(dead_code)]
     pub fn add(&self, tool: AgentTool) {
         self.store
             .tools
             .write()
             .expect("poisoned tool store")
             .insert(tool.name.clone(), tool);
-        self.store
-            .dirty
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.mark_dirty();
     }
 
     /// Remove a tool by name. Staged until the next reconcile.
+    ///
+    /// Reserved runtime-edit API — see [`Self::add`].
+    #[allow(dead_code)]
     pub fn remove(&self, name: &str) {
         if self
             .store
@@ -242,22 +361,39 @@ impl ToolHandle {
             .remove(name)
             .is_some()
         {
-            self.store
-                .dirty
-                .store(true, std::sync::atomic::Ordering::Release);
+            self.mark_dirty();
         }
     }
 
     /// Replace the entire tool set this handle owns. Staged until reconcile.
+    ///
+    /// Reserved runtime-edit API — see [`Self::add`].
+    #[allow(dead_code)]
     pub fn replace_all(&self, tools: Vec<AgentTool>) {
         let mut map = std::collections::HashMap::new();
         for t in tools {
             map.insert(t.name.clone(), t);
         }
         *self.store.tools.write().expect("poisoned tool store") = map;
+        self.mark_dirty();
+    }
+
+    /// Flag the store dirty and wake the reconcile loop. Called after every
+    /// successful edit. `notify_one` is a no-op when no task is waiting, but a
+    /// stored permit guarantees the next `notified().await` resolves — so an
+    /// edit that lands between reconcile passes is never lost (reconcile also
+    /// re-checks `dirty` on wake).
+    ///
+    /// Dead-code analysis flags this (and the `dirty_signal` field) because the
+    /// only callers are the reserved `add`/`remove`/`replace_all`, which have
+    /// no consumer yet — MCP ships a snapshot, not a watcher. The whole chain
+    /// goes live the moment an extension calls `api.tool_handle()`.
+    #[allow(dead_code)]
+    fn mark_dirty(&self) {
         self.store
             .dirty
             .store(true, std::sync::atomic::Ordering::Release);
+        self.store.dirty_signal.notify_one();
     }
 
     /// A snapshot of the current tools (for the runner's reconcile pass).
@@ -281,9 +417,9 @@ impl ToolHandle {
 
 // ── Hook handler (reserved, M2a unused) ──────────────────────────────────
 
-/// Reserved for `on(event, handler)`. The runner aggregates these with the
-/// chained semantics specified in ADR-0003 D1. No built-in extension uses a
-/// hook in M2a, so the signature is intentionally coarse and may tighten.
+/// Reserved for `on(event, handler)`. No built-in extension uses a hook yet, so
+/// the signature is intentionally coarse and the chained-aggregation semantics
+/// are undecided — both may tighten once the first hook consumer lands.
 pub type HookHandler = Arc<dyn Fn(serde_json::Value) -> serde_json::Value + Send + Sync>;
 
 /// A hook collected during `register`.
@@ -304,6 +440,12 @@ pub struct ExtensionApi {
     pub(crate) one_shot_tools: Vec<AgentTool>,
     pub(crate) hooks: Vec<RegisteredHook>,
     pub(crate) tool_stores: Vec<Arc<ToolStore>>,
+    /// Wakeup signal shared with every [`ToolStore`] this API mints and with
+    /// the runner's reconcile loop. One signal for all stores: the runner
+    /// rebuilds the whole tool set on any edit, so per-store granularity buys
+    /// nothing, and a single `notified().await` avoids the `!Unpin` / pin
+    /// gymnastics `select_all` over per-store signals would require.
+    pub(crate) shared_dirty_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ExtensionApi {
@@ -313,43 +455,18 @@ impl ExtensionApi {
             one_shot_tools: Vec::new(),
             hooks: Vec::new(),
             tool_stores: Vec::new(),
+            shared_dirty_signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Register an effect-only slash command (`/mcp`). `name` includes the
-    /// leading `/` (e.g. `"/mcp"`). The handler returns a [`CommandEffect`].
+    /// Register an async slash command (`/mcp`). `name` includes the leading
+    /// `/` (e.g. `"/mcp"`). The handler receives an [`ExtensionContext`] and
+    /// returns `Result<()>`.
     pub fn register_command(&mut self, name: &str, meta: CommandMeta, handler: CommandHandler) {
         self.commands.push(RegisteredCommand {
             name: name.to_string(),
             meta,
             handler,
-            control_handler: None,
-            needs_control: false,
-        });
-    }
-
-    /// Register a control slash command that needs the iodilos-side
-    /// [`ControlRuntime`] to drive the conversation stack. Only the metadata
-    /// (`name`/`meta`) is captured here; the actual handler is an
-    /// iodilos-side closure bound at mount (see [`super::CommandSide`]),
-    /// because it holds `Rc`-based state and cannot be `Send`. The placeholder
-    /// `handler` is a no-op used only so the `Send + Sync` shape is uniform.
-    pub fn register_control_command(
-        &mut self,
-        name: &str,
-        meta: CommandMeta,
-        control_handler: ControlHandler,
-    ) {
-        self.commands.push(RegisteredCommand {
-            name: name.to_string(),
-            meta,
-            handler: Arc::new(|_| {
-                CommandEffect::NotifyError(
-                    "control command unavailable in this runtime".to_string(),
-                )
-            }),
-            control_handler: Some(control_handler),
-            needs_control: true,
         });
     }
 
@@ -364,7 +481,7 @@ impl ExtensionApi {
     /// reconcile. An extension typically calls this once in `register` and
     /// clones the returned handle into a spawned task.
     pub fn tool_handle(&mut self) -> ToolHandle {
-        let store = Arc::new(ToolStore::new());
+        let store = Arc::new(ToolStore::new(Arc::clone(&self.shared_dirty_signal)));
         self.tool_stores.push(store.clone());
         ToolHandle::from_store(store)
     }
@@ -385,12 +502,14 @@ impl ExtensionApi {
         Vec<AgentTool>,
         Vec<RegisteredHook>,
         Vec<Arc<ToolStore>>,
+        Arc<tokio::sync::Notify>,
     ) {
         (
             self.commands,
             self.one_shot_tools,
             self.hooks,
             self.tool_stores,
+            self.shared_dirty_signal,
         )
     }
 }

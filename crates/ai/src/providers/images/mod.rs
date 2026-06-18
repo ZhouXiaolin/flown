@@ -1,6 +1,6 @@
 mod openrouter;
 
-use crate::images_api_registry::{register_images_api_provider, ImagesApiProvider};
+use crate::images_api_registry::{ImagesApiProvider, register_images_api_provider};
 use crate::images_types::*;
 use std::sync::Arc;
 

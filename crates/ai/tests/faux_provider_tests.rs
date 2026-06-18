@@ -35,7 +35,10 @@ async fn faux_provider_streams_queued_responses_and_complete_simple_resolves() {
         events.push(event);
     }
 
-    assert!(matches!(events.last(), Some(AssistantMessageEvent::Done { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(AssistantMessageEvent::Done { .. })
+    ));
     assert_eq!(registration.call_count(), 1);
 
     registration.append_responses(vec![FauxResponseStep::Message(faux_assistant_message(
@@ -44,13 +47,10 @@ async fn faux_provider_streams_queued_responses_and_complete_simple_resolves() {
     ))]);
     let completed = complete_simple(&model, &context, None).await.unwrap();
     assert_eq!(
-        completed
-            .content
-            .iter()
-            .find_map(|block| match block {
-                AssistantContent::Text(text) => Some(text.text.clone()),
-                _ => None,
-            }),
+        completed.content.iter().find_map(|block| match block {
+            AssistantContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        }),
         Some("world".to_string())
     );
 }

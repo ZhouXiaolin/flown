@@ -2,11 +2,8 @@
 //!
 //! The command side (`/mcp list|status|help`) is read-only: `list` echoes
 //! config, `status` reports live connection state from the `McpManager` when
-//! available (falling back to config otherwise), and both return
-//! [`CommandEffect::Notify`]. The tool side snapshots the current MCP tools at
-//! registration; runtime add/remove (servers connecting/disconnecting later)
-//! is not wired yet — when needed, a watcher task will mint its own
-//! [`ToolHandle`](super::types::ToolHandle).
+//! available (falling back to config otherwise), and writes output through the
+//! async command's `ExtensionContext`.
 //!
 //! MCP tool construction (`mcp_manager_tools`, moved here from `core/tools`)
 //! is an implementation detail of this extension — it wraps each MCP server
@@ -20,7 +17,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::core::mcp::McpManager;
 
-use super::types::{CommandEffect, CommandMeta, Extension, ExtensionApi, SubcommandDef};
+use super::types::{CommandMeta, Extension, ExtensionApi, SubcommandDef};
 
 /// The MCP extension: `/mcp` command + MCP tools (runtime add/remove).
 pub struct McpExtension {
@@ -71,13 +68,16 @@ impl McpExtension {
             {
                 let config = config.clone();
                 let mcp = self.mcp.clone();
-                // The handler closure is `Send + Sync`: it captures only the
-                // `Config` (Clone, owned) and the optional live McpManager
-                // (`Arc<Mutex<…>>`), and returns a plain `CommandEffect`. It
-                // never touches `UiState`; the iodilos side interprets the
-                // returned effect.
-                Arc::new(move |args: &str| -> CommandEffect {
-                    handle_mcp_subcommand(args, &config, mcp.as_ref())
+                Arc::new(move |invocation, ctx| {
+                    let config = config.clone();
+                    let mcp = mcp.clone();
+                    Box::pin(async move {
+                        match mcp_subcommand_text(&invocation.args, &config, mcp.as_ref()) {
+                            Ok(text) => ctx.ui.notify(text),
+                            Err(text) => ctx.ui.notify_error(text),
+                        }
+                        Ok(())
+                    })
                 })
             },
         );
@@ -158,20 +158,19 @@ fn mcp_manager_tools(mcp: Arc<tokio::sync::Mutex<McpManager>>) -> Vec<AgentTool>
         .collect()
 }
 
-/// Dispatch `/mcp <subcommand>`, returning a [`CommandEffect`]. When a live
-/// `McpManager` is available, `/mcp status` reports actual connection state
-/// (connected/error/disconnected + tool count); without one it falls back to
-/// config-only (disabled/enabled).
-fn handle_mcp_subcommand(
+/// Build `/mcp <subcommand>` output. When a live `McpManager` is available,
+/// `/mcp status` reports actual connection state (connected/error/disconnected
+/// + tool count); without one it falls back to config-only (disabled/enabled).
+fn mcp_subcommand_text(
     args: &str,
     config: &Config,
     mcp: Option<&Arc<tokio::sync::Mutex<McpManager>>>,
-) -> CommandEffect {
+) -> Result<String, String> {
     match args.trim() {
-        "" | "help" => CommandEffect::Notify(mcp_help_text()),
-        "list" => CommandEffect::Notify(mcp_list_text(config)),
-        "status" => CommandEffect::Notify(mcp_status_text(config, mcp)),
-        other => CommandEffect::NotifyError(format!(
+        "" | "help" => Ok(mcp_help_text()),
+        "list" => Ok(mcp_list_text(config)),
+        "status" => Ok(mcp_status_text(config, mcp)),
+        other => Err(format!(
             "Unknown /mcp subcommand: {other}. Type /mcp help for usage."
         )),
     }
@@ -225,32 +224,32 @@ fn mcp_status_text(config: &Config, mcp: Option<&Arc<tokio::sync::Mutex<McpManag
     // Live view: only when the manager exists AND we can lock it without
     // blocking. The handler runs on the iodilos thread and must not .await,
     // so a contended lock degrades to the config fallback rather than stalling.
-    if let Some(mcp) = mcp {
-        if let Ok(manager) = mcp.try_lock() {
-            let infos = manager.server_info();
-            let mut lines = vec!["MCP Servers (live):".to_string()];
-            use crate::core::types::McpServerStatus;
-            for info in &infos {
-                let icon = match info.status {
-                    McpServerStatus::Connected => "✓",
-                    McpServerStatus::Error => "✗",
-                    McpServerStatus::Disconnected => "○",
-                };
-                let suffix = match (&info.status, info.tool_count, info.error.as_deref()) {
-                    (McpServerStatus::Connected, n, _) => format!("({n} tools)"),
-                    (McpServerStatus::Error, _, Some(e)) => format!("error: {e}"),
-                    (McpServerStatus::Error, _, None) => "error".to_string(),
-                    (McpServerStatus::Disconnected, _, _) => "disconnected".to_string(),
-                };
-                let full_cmd = if info.args.is_empty() {
-                    info.command.clone()
-                } else {
-                    format!("{} {}", info.command, info.args.join(" "))
-                };
-                lines.push(format!("  {icon} {}  - {full_cmd} [{suffix}]", info.name));
-            }
-            return lines.join("\n");
+    if let Some(mcp) = mcp
+        && let Ok(manager) = mcp.try_lock()
+    {
+        let infos = manager.server_info();
+        let mut lines = vec!["MCP Servers (live):".to_string()];
+        use crate::core::types::McpServerStatus;
+        for info in &infos {
+            let icon = match info.status {
+                McpServerStatus::Connected => "✓",
+                McpServerStatus::Error => "✗",
+                McpServerStatus::Disconnected => "○",
+            };
+            let suffix = match (&info.status, info.tool_count, info.error.as_deref()) {
+                (McpServerStatus::Connected, n, _) => format!("({n} tools)"),
+                (McpServerStatus::Error, _, Some(e)) => format!("error: {e}"),
+                (McpServerStatus::Error, _, None) => "error".to_string(),
+                (McpServerStatus::Disconnected, _, _) => "disconnected".to_string(),
+            };
+            let full_cmd = if info.args.is_empty() {
+                info.command.clone()
+            } else {
+                format!("{} {}", info.command, info.args.join(" "))
+            };
+            lines.push(format!("  {icon} {}  - {full_cmd} [{suffix}]", info.name));
         }
+        return lines.join("\n");
     }
 
     // Config fallback.
@@ -289,10 +288,7 @@ mod tests {
     #[test]
     fn mcp_help_subcommand() {
         let cfg = empty_config();
-        let effect = handle_mcp_subcommand("help", &cfg, None);
-        let CommandEffect::Notify(text) = effect else {
-            panic!("expected Notify");
-        };
+        let text = mcp_subcommand_text("help", &cfg, None).expect("expected text");
         assert!(text.contains("/mcp list"));
         assert!(text.contains("/mcp status"));
     }
@@ -300,35 +296,27 @@ mod tests {
     #[test]
     fn mcp_list_no_servers() {
         let cfg = empty_config();
-        let effect = handle_mcp_subcommand("list", &cfg, None);
-        let CommandEffect::Notify(text) = effect else {
-            panic!("expected Notify");
-        };
+        let text = mcp_subcommand_text("list", &cfg, None).expect("expected text");
         assert_eq!(text, "No MCP servers configured.");
     }
 
     #[test]
     fn mcp_unknown_subcommand_is_error() {
         let cfg = empty_config();
-        let effect = handle_mcp_subcommand("frobnicate", &cfg, None);
-        assert!(matches!(effect, CommandEffect::NotifyError(_)));
+        assert!(mcp_subcommand_text("frobnicate", &cfg, None).is_err());
     }
 
     #[test]
     fn mcp_bare_invocation_shows_help() {
         let cfg = empty_config();
-        let effect = handle_mcp_subcommand("", &cfg, None);
-        assert!(matches!(effect, CommandEffect::Notify(_)));
+        assert!(mcp_subcommand_text("", &cfg, None).is_ok());
     }
 
     /// With no live manager, `/mcp status` falls back to the config view.
     #[test]
     fn mcp_status_no_live_manager_falls_back_to_config() {
         let cfg = empty_config();
-        let effect = handle_mcp_subcommand("status", &cfg, None);
-        let CommandEffect::Notify(text) = effect else {
-            panic!("expected Notify");
-        };
+        let text = mcp_subcommand_text("status", &cfg, None).expect("expected text");
         assert!(text.contains("configured"), "fallback text: {text}");
     }
 }

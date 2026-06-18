@@ -177,10 +177,10 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
                                     Some(AssistantContent::Text(TextContent {
-                                            content_type: "text".to_string(),
-                                            text,
-                                            text_signature,
-                                        }))
+                                        content_type: "text".to_string(),
+                                        text,
+                                        text_signature,
+                                    }))
                                 }
                                 "thinking" => {
                                     let thinking = block
@@ -194,11 +194,11 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .map(|s| s.to_string());
                                     let redacted = block.get("redacted").and_then(|v| v.as_bool());
                                     Some(AssistantContent::Thinking(ThinkingContent {
-                                            content_type: "thinking".to_string(),
-                                            thinking,
-                                            thinking_signature,
-                                            redacted,
-                                        }))
+                                        content_type: "thinking".to_string(),
+                                        thinking,
+                                        thinking_signature,
+                                        redacted,
+                                    }))
                                 }
                                 "toolCall" => {
                                     let id = block
@@ -216,12 +216,12 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .cloned()
                                         .unwrap_or(serde_json::Value::Null);
                                     Some(AssistantContent::ToolCall(ToolCall {
-                                            content_type: "toolCall".to_string(),
-                                            id,
-                                            name,
-                                            arguments,
-                                            thought_signature: None,
-                                        }))
+                                        content_type: "toolCall".to_string(),
+                                        id,
+                                        name,
+                                        arguments,
+                                        thought_signature: None,
+                                    }))
                                 }
                                 _ => None,
                             }
@@ -301,9 +301,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
     }
 }
 
-fn tool_result_content_to_json(
-    content: &[ToolResultContent],
-) -> Vec<serde_json::Value> {
+fn tool_result_content_to_json(content: &[ToolResultContent]) -> Vec<serde_json::Value> {
     content
         .iter()
         .map(|block| match block {
@@ -321,37 +319,35 @@ fn tool_result_content_to_json(
         .collect()
 }
 
-fn tool_result_content_from_json(
-    block: &serde_json::Value,
-) -> Option<ToolResultContent> {
+fn tool_result_content_from_json(block: &serde_json::Value) -> Option<ToolResultContent> {
     match block.get("type").and_then(|v| v.as_str())? {
         "text" => Some(ToolResultContent::Text(TextContent {
-                content_type: "text".to_string(),
-                text: block
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                text_signature: block
-                    .get("textSignature")
-                    .or_else(|| block.get("text_signature"))
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string),
-            })),
+            content_type: "text".to_string(),
+            text: block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            text_signature: block
+                .get("textSignature")
+                .or_else(|| block.get("text_signature"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+        })),
         "image" => Some(ToolResultContent::Image(ImageContent {
-                content_type: "image".to_string(),
-                data: block
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                mime_type: block
-                    .get("mimeType")
-                    .or_else(|| block.get("mime_type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            })),
+            content_type: "image".to_string(),
+            data: block
+                .get("data")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            mime_type: block
+                .get("mimeType")
+                .or_else(|| block.get("mime_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })),
         _ => None,
     }
 }

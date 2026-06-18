@@ -1,6 +1,6 @@
 use flown_agent::{Agent, AgentEvent, AgentMessage, AgentOptions, AgentTool, AgentToolResult};
 use flown_ai::register_built_in_api_providers;
-use flown_ai::{MessageContent, ToolResultContent, UserMessage};
+use flown_ai::{AssistantMessageEvent, MessageContent, TextContent, ToolResultContent};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -94,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
             "You are a helpful coding agent. Use the bash tool to run commands.".to_string();
     });
 
-    println!("Agent ready. Model: {}", agent.state().snapshot().model.name);
+    println!(
+        "Agent ready. Model: {}",
+        agent.state().snapshot().model.name
+    );
     println!();
 
     // Subscribe to lifecycle events (callback model). Listeners are awaited in
@@ -141,9 +144,9 @@ async fn main() -> anyhow::Result<()> {
         })
     }));
 
-    let prompt = std::env::args().nth(1).unwrap_or_else(|| {
-        "List the files in the current directory using bash.".to_string()
-    });
+    let prompt = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "List the files in the current directory using bash.".to_string());
     agent
         .prompt(flown_agent::PromptInput::Text(prompt))
         .await

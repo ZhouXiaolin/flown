@@ -7,19 +7,19 @@
 //!   [`ToolStore`]s, reconciles dirty handles by calling
 //!   `harness.set_tools().await`, and hosts extension background tasks.
 //! - [`CommandSide`] moves to the **iodilos** side — owns the command table and
-//!   the `Rc<UiState>` sink, dispatches slash commands, and interprets the
-//!   returned [`CommandEffect`] into `UiState` operations.
+//!   a host runtime command proxy. It dispatches slash commands by constructing
+//!   an [`ExtensionContext`] and awaiting the registered async handler.
 //!
-//! See `docs/m2a-extension-api-draft.md` and the threading-model note in
-//! [`super::types`].
+//! See `docs/adr/0001-async-extension-context-and-command-proxy.md` and the
+//! threading-model note in [`super::types`].
 
-use std::rc::Rc;
 use std::sync::Arc;
 
 use flown_agent::{AgentHarness, AgentTool};
 
 use super::types::{
-    CommandEffect, ControlRuntime, Extension, ExtensionApi, RegisteredCommand, ToolHandle,
+    CommandInvocation, Extension, ExtensionApi, ExtensionContext, RegisteredCommand,
+    RuntimeCommandProxy, ToolHandle,
 };
 
 /// Run every extension's `register` on the tokio side, then split the result
@@ -37,13 +37,14 @@ pub fn build(
     for ext in &extensions {
         ext.register(&mut api);
     }
-    let (commands, one_shot_tools, _hooks, tool_stores) = api.into_parts();
+    let (commands, one_shot_tools, _hooks, tool_stores, dirty_signal) = api.into_parts();
 
     let tool_side = ToolSide {
         harness,
         built_in_tools,
         one_shot_tools,
         tool_stores,
+        dirty_signal,
     };
     let command_side = CommandTable { commands };
     (tool_side, command_side)
@@ -54,8 +55,9 @@ pub fn build(
 /// tokio-side runtime: owns the harness and reconciles tool edits.
 ///
 /// The McpExtension's background task (cloned [`ToolHandle`] in hand) calls
-/// `handle.add()`/`remove()` from tokio; the runtime periodically calls
-/// [`Self::reconcile_tools`] to flush those edits into the harness.
+/// `handle.add()`/`remove()` from tokio; the runtime's reconcile task
+/// ([`Self::run_reconcile`]) wakes on the shared dirty signal and flushes those
+/// edits into the harness.
 ///
 /// Cheap to clone (every field is behind an `Arc` or a `Vec`). The runtime
 /// keeps one clone for the reconcile loop and lets the iodilos side read the
@@ -66,6 +68,10 @@ pub struct ToolSide {
     built_in_tools: Vec<AgentTool>,
     one_shot_tools: Vec<AgentTool>,
     tool_stores: Vec<Arc<super::types::ToolStore>>,
+    /// Shared wakeup signal: every [`ToolStore`] fires it on edit, and
+    /// [`Self::run_reconcile`] awaits it. One signal for all stores — the
+    /// runner rebuilds the whole tool set on any edit.
+    dirty_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ToolSide {
@@ -82,6 +88,26 @@ impl ToolSide {
         }
         let all = self.all_tools();
         let _ = self.harness.set_tools(all, None).await;
+    }
+
+    /// Drive reconcile in response to tool edits, instead of on a timer.
+    ///
+    /// Waits for the shared dirty signal, then reconciles. Repeats for the
+    /// lifetime of the runtime. Because `Notify::notify_one` stores one permit
+    /// when there is no waiter, an edit that lands between iterations is not
+    /// lost: the next `notified().await` resolves immediately and
+    /// `reconcile_tools` re-checks the dirty flag.
+    ///
+    /// One signal covers every store (each store fires the same `Notify`), so
+    /// this is a single `notified().await` — no `select_all` or pinning needed.
+    pub async fn run_reconcile(self) {
+        loop {
+            // Reconcile any edits already staged before we start waiting, so an
+            // edit that happened during bootstrap is not deferred to the first
+            // signal.
+            self.reconcile_tools().await;
+            self.dirty_signal.notified().await;
+        }
     }
 
     /// The full current tool set: built-in + one-shot tools + every live store
@@ -112,36 +138,22 @@ pub struct CommandTable {
 }
 
 impl CommandTable {
-    /// Bind this table to the iodilos-side transcript sink, producing the
+    /// Bind this table to the host runtime command proxy, producing the
     /// dispatch-capable [`CommandSide`]. Called once from the iodilos mount
-    /// closure, after `Rc<UiState>` exists.
-    pub fn bind(self, sink: Rc<CommandSink>) -> CommandSide {
+    /// closure, after the runtime proxy exists.
+    pub fn bind(self, runtime: Arc<RuntimeCommandProxy>) -> CommandSide {
         CommandSide {
             commands: self.commands,
-            sink,
-            control: None,
+            ctx: ExtensionContext::new(runtime),
         }
     }
 }
 
-/// iodilos-side runtime: dispatches extension slash commands and interprets
-/// their [`CommandEffect`]s into `UiState` operations. NOT `Send` — it owns the
-/// `Rc` transcript sink.
+/// Iodilos-side command dispatcher. NOT `Send` — its context owns a runtime
+/// command proxy that may hold `Rc`-based UI state behind the facade.
 pub struct CommandSide {
     commands: Vec<RegisteredCommand>,
-    sink: Rc<CommandSink>,
-    /// The conversation-stack capability, bound at mount. Present when a
-    /// `RuntimeControl` exists (i.e. the TUI is mounted with a live stack).
-    control: Option<Rc<dyn ControlRuntime>>,
-}
-
-/// Sink the iodilos side uses to apply [`CommandEffect`]s. Holds the live
-/// `Rc<UiState>` via closures captured at mount. Kept opaque so the extension
-/// contract doesn't depend on TUI internals.
-pub struct CommandSink {
-    pub notify: Box<dyn Fn(String)>,
-    pub notify_error: Box<dyn Fn(String)>,
-    pub clear: Box<dyn Fn()>,
+    ctx: ExtensionContext,
 }
 
 impl CommandSide {
@@ -151,25 +163,13 @@ impl CommandSide {
         &self.commands
     }
 
-    /// Bind the conversation-stack capability. Control commands carry their
-    /// own registered handler; the runtime is the generic capability passed to
-    /// that handler.
-    pub fn bind_control_runtime(&mut self, runtime: Rc<dyn ControlRuntime>) {
-        self.control = Some(runtime);
-    }
-
-    /// Whether a control capability is bound.
-    pub fn has_control(&self) -> bool {
-        self.control.is_some()
-    }
-
     /// Close the active extension overlap, if any. Reaches the bound
-    /// [`ControlRuntime`]. No-op when no control is bound or the active layer is
-    /// Main.
+    /// runtime proxy. No-op when the active layer is Main.
     pub fn close_active_overlap(&self) {
-        if let Some(rt) = self.control.as_ref() {
-            rt.close_active_overlap();
-        }
+        let ctx = self.ctx.clone();
+        iodilos::prelude::spawn_local(async move {
+            let _ = ctx.conversation.close_active_overlap().await;
+        });
     }
 
     /// Resolve `text` against registered commands. `text` is the full input
@@ -186,35 +186,25 @@ impl CommandSide {
         Some((cmd, args))
     }
 
-    /// Dispatch a command. For effect commands (`/mcp`) it calls the handler
-    /// and applies the returned [`CommandEffect`]. For control commands
-    /// it calls the bound control handler with the [`ControlRuntime`].
-    /// Returns `true` if a registered command handled it.
+    /// Dispatch a command by awaiting the registered async handler. Returns
+    /// `true` if a registered command handled it.
     pub fn dispatch(&self, text: &str) -> bool {
         let Some((cmd, args)) = self.resolve(text) else {
             return false;
         };
-        if cmd.needs_control
-            && let (Some(rt), Some(handler)) = (self.control.as_ref(), cmd.control_handler.as_ref())
-        {
-            handler(&args, rt.as_ref());
-            return true;
-        }
-        // needs_control but no runtime bound (session-only mode): fall through
-        // to the effect handler so the placeholder can surface an error rather
-        // than silently no-op'ing.
-        let effect = (cmd.handler)(&args);
-        self.apply(effect);
+        let invocation = CommandInvocation {
+            name: cmd.name.clone(),
+            args,
+        };
+        let ctx = self.ctx.clone();
+        let handler = cmd.handler.clone();
+        iodilos::prelude::spawn_local(async move {
+            if let Err(error) = handler(invocation, ctx.clone()).await {
+                ctx.ui
+                    .notify_error(format!("Extension command failed: {error}"));
+            }
+        });
         true
-    }
-
-    /// Interpret a [`CommandEffect`] into `UiState` operations.
-    fn apply(&self, effect: CommandEffect) {
-        match effect {
-            CommandEffect::Notify(s) => (self.sink.notify)(s),
-            CommandEffect::NotifyError(s) => (self.sink.notify_error)(s),
-            CommandEffect::ClearTranscript => (self.sink.clear)(),
-        }
     }
 }
 
@@ -222,63 +212,71 @@ impl CommandSide {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
-    fn mcp_command_side_with_events() -> (CommandSide, Rc<RefCell<Vec<(&'static str, String)>>>) {
+    fn command_side_with_rx() -> (
+        CommandSide,
+        flume::Receiver<super::super::types::RuntimeCommand>,
+    ) {
         let mut api = ExtensionApi::new();
         super::super::mcp::McpExtension::new(Config::default(), None).register(&mut api);
-        let (commands, _, _, _) = api.into_parts();
-        let events: Rc<RefCell<Vec<(&'static str, String)>>> = Rc::default();
-        let sink = Rc::new(CommandSink {
-            notify: {
-                let e = events.clone();
-                Box::new(move |text| e.borrow_mut().push(("notify", text)))
-            },
-            notify_error: {
-                let e = events.clone();
-                Box::new(move |text| e.borrow_mut().push(("error", text)))
-            },
-            clear: {
-                let e = events.clone();
-                Box::new(move || e.borrow_mut().push(("clear", String::new())))
-            },
-        });
-        let side = CommandTable { commands }.bind(sink);
-        (side, events)
+        let (commands, _, _, _, _) = api.into_parts();
+        let (tx, rx) = flume::unbounded();
+        let side = CommandTable { commands }.bind(Arc::new(RuntimeCommandProxy::new(tx)));
+        (side, rx)
     }
 
-    /// `/mcp list` with no servers routes through dispatch → handler → sink
-    /// and lands as a single `notify`. This is the end-to-end wiring test for
-    /// the extension command path (ADR-0003 verification gate).
-    #[test]
-    fn dispatch_mcp_list_produces_notify() {
-        let (side, events) = mcp_command_side_with_events();
-        assert!(side.dispatch("/mcp list"));
-        let recorded = events.borrow();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].0, "notify");
-        assert_eq!(recorded[0].1, "No MCP servers configured.");
+    /// `/mcp list` resolves to the registered command and its async handler
+    /// sends a runtime notification command through ExtensionContext.
+    #[tokio::test]
+    async fn mcp_list_handler_notifies() {
+        let (side, rx) = command_side_with_rx();
+        let (cmd, args) = side.resolve("/mcp list").expect("/mcp should resolve");
+        (cmd.handler)(
+            CommandInvocation {
+                name: cmd.name.clone(),
+                args,
+            },
+            side.ctx.clone(),
+        )
+        .await
+        .expect("handler should succeed");
+        let cmd = rx.try_recv().expect("handler should emit one command");
+        let super::super::types::RuntimeCommand::NotifyActive { text } = cmd else {
+            panic!("expected notify command");
+        };
+        assert_eq!(text, "No MCP servers configured.");
     }
 
     /// A line that doesn't match any registered command returns `false` and
     /// records nothing — the static dispatcher must still get a chance.
     #[test]
-    fn dispatch_unknown_command_returns_false() {
-        let (side, events) = mcp_command_side_with_events();
-        assert!(!side.dispatch("/help"));
-        assert!(events.borrow().is_empty());
+    fn resolve_unknown_command_returns_none() {
+        let (side, rx) = command_side_with_rx();
+        assert!(side.resolve("/help").is_none());
+        assert!(rx.is_empty());
     }
 
     /// `/mcp` with no args (or `help`) shows help text; an unknown subcommand
     /// lands in the error channel.
-    #[test]
-    fn dispatch_mcp_unknown_subcommand_is_error() {
-        let (side, events) = mcp_command_side_with_events();
-        assert!(side.dispatch("/mcp frobnicate"));
-        let recorded = events.borrow();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].0, "error");
-        assert!(recorded[0].1.contains("frobnicate"));
+    #[tokio::test]
+    async fn mcp_unknown_subcommand_is_error() {
+        let (side, rx) = command_side_with_rx();
+        let (cmd, args) = side
+            .resolve("/mcp frobnicate")
+            .expect("/mcp should resolve");
+        (cmd.handler)(
+            CommandInvocation {
+                name: cmd.name.clone(),
+                args,
+            },
+            side.ctx.clone(),
+        )
+        .await
+        .expect("handler should succeed");
+        let cmd = rx.try_recv().expect("handler should emit one command");
+        let super::super::types::RuntimeCommand::NotifyErrorActive { text } = cmd else {
+            panic!("expected error command");
+        };
+        assert!(text.contains("frobnicate"));
     }
 }

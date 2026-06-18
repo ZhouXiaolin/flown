@@ -102,10 +102,22 @@ pub async fn execute_shell_with_capture(
         let path = env
             .create_temp_file(Some("bash-"), Some(".log"))
             .await
-            .map_err(|e| ExecutionError::with_source(ExecutionErrorCode::Unknown, "failed to create temp file", e))?;
+            .map_err(|e| {
+                ExecutionError::with_source(
+                    ExecutionErrorCode::Unknown,
+                    "failed to create temp file",
+                    e,
+                )
+            })?;
         env.append_file(&path, tail_output.as_bytes())
             .await
-            .map_err(|e| ExecutionError::with_source(ExecutionErrorCode::Unknown, "failed to write full output log", e))?;
+            .map_err(|e| {
+                ExecutionError::with_source(
+                    ExecutionErrorCode::Unknown,
+                    "failed to write full output log",
+                    e,
+                )
+            })?;
         full_output_path = Some(path);
     }
 

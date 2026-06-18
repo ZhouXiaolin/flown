@@ -1,8 +1,8 @@
-use crate::harness::types::*;
-use crate::harness::{CompactionError, CompactionErrorCode};
 use crate::harness::session::{
     ContentBlock, CustomMessageContent, SessionMessage, SessionTreeEntry,
 };
+use crate::harness::types::*;
+use crate::harness::{CompactionError, CompactionErrorCode};
 use crate::types::AgentMessage;
 use flown_ai::{
     AbortSignal, AssistantContent, Context, Message, MessageContent, Model, SimpleStreamOptions,

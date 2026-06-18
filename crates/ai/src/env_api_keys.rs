@@ -23,9 +23,7 @@ pub fn find_env_keys(provider: &Provider) -> Option<Vec<&'static str>> {
     };
     match known {
         // ANTHROPIC_OAUTH_TOKEN takes precedence over ANTHROPIC_API_KEY.
-        KnownProvider::Anthropic => {
-            Some(vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"])
-        }
+        KnownProvider::Anthropic => Some(vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]),
         KnownProvider::OpenAi => Some(vec!["OPENAI_API_KEY"]),
         _ => None,
     }

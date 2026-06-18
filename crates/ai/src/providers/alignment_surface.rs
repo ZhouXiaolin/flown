@@ -173,10 +173,8 @@ pub struct OAuthSelectPrompt {
 /// Type-only public surface mirroring pi-ai's OAuth callbacks contract.
 #[derive(Clone, Default)]
 pub struct OAuthLoginCallbacks {
-    pub on_auth:
-        Option<std::sync::Arc<dyn Fn(OAuthAuthInfo) + Send + Sync>>,
-    pub on_device_code:
-        Option<std::sync::Arc<dyn Fn(OAuthDeviceCodeInfo) + Send + Sync>>,
+    pub on_auth: Option<std::sync::Arc<dyn Fn(OAuthAuthInfo) + Send + Sync>>,
+    pub on_device_code: Option<std::sync::Arc<dyn Fn(OAuthDeviceCodeInfo) + Send + Sync>>,
     pub on_prompt: Option<
         std::sync::Arc<
             dyn Fn(OAuthPrompt) -> futures::future::BoxFuture<'static, String> + Send + Sync,
@@ -200,7 +198,10 @@ impl std::fmt::Debug for OAuthLoginCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthLoginCallbacks")
             .field("on_auth", &self.on_auth.as_ref().map(|_| "<fn>"))
-            .field("on_device_code", &self.on_device_code.as_ref().map(|_| "<fn>"))
+            .field(
+                "on_device_code",
+                &self.on_device_code.as_ref().map(|_| "<fn>"),
+            )
             .field("on_prompt", &self.on_prompt.as_ref().map(|_| "<fn>"))
             .field("on_progress", &self.on_progress.as_ref().map(|_| "<fn>"))
             .field(

@@ -143,19 +143,13 @@ pub type ImagesOnPayloadFn = Arc<
     dyn Fn(
             serde_json::Value,
             ImagesModel,
-        )
-            -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
         + Send
         + Sync,
 >;
 
 pub type ImagesOnResponseFn = Arc<
-    dyn Fn(
-            ProviderResponse,
-            ImagesModel,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(ProviderResponse, ImagesModel) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 pub struct ImagesOptions {
@@ -219,8 +213,7 @@ impl Default for ImagesOptions {
 
 pub type ProviderImagesOptions = ImagesOptions;
 
-pub type ImagesFuture =
-    Pin<Box<dyn Future<Output = crate::error::Result<AssistantImages>> + Send>>;
+pub type ImagesFuture = Pin<Box<dyn Future<Output = crate::error::Result<AssistantImages>> + Send>>;
 
 pub type ImagesFunction =
     Arc<dyn Fn(ImagesModel, ImagesContext, Option<ImagesOptions>) -> ImagesFuture + Send + Sync>;

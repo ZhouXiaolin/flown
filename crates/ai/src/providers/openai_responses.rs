@@ -55,7 +55,10 @@ fn response_url(model: &Model) -> Result<String, String> {
         resolve_cloudflare_base_url(model)
             .map(|base_url| format!("{}/responses", base_url.trim_end_matches('/')))
     } else {
-        Ok(format!("{}/responses", model.base_url.trim_end_matches('/')))
+        Ok(format!(
+            "{}/responses",
+            model.base_url.trim_end_matches('/')
+        ))
     }
 }
 
@@ -137,7 +140,9 @@ fn convert_responses_input(model: &Model, context: &Context) -> Vec<serde_json::
                     match block {
                         AssistantContent::Thinking(thinking) => {
                             if let Some(signature) = thinking.thinking_signature {
-                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&signature) {
+                                if let Ok(value) =
+                                    serde_json::from_str::<serde_json::Value>(&signature)
+                                {
                                     input.push(value);
                                 }
                             }
@@ -173,7 +178,9 @@ fn convert_responses_input(model: &Model, context: &Context) -> Vec<serde_json::
                             let (call_id, item_id) = tool_call
                                 .id
                                 .split_once('|')
-                                .map(|(call_id, item_id)| (call_id.to_string(), Some(item_id.to_string())))
+                                .map(|(call_id, item_id)| {
+                                    (call_id.to_string(), Some(item_id.to_string()))
+                                })
                                 .unwrap_or_else(|| (tool_call.id.clone(), None));
                             let mut item = serde_json::json!({
                                 "type": "function_call",
@@ -217,7 +224,8 @@ fn convert_responses_input(model: &Model, context: &Context) -> Vec<serde_json::
 }
 
 fn convert_responses_tools(tools: &[Tool]) -> Vec<serde_json::Value> {
-    tools.iter()
+    tools
+        .iter()
         .map(|tool| {
             serde_json::json!({
                 "type": "function",
@@ -263,15 +271,17 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         return Some(seconds.saturating_mul(1000));
     }
 
-    chrono::DateTime::parse_from_rfc2822(value).ok().and_then(|date| {
-        let now = chrono::Utc::now();
-        let target = date.with_timezone(&chrono::Utc);
-        if target <= now {
-            Some(0)
-        } else {
-            Some((target - now).num_milliseconds().max(0) as u64)
-        }
-    })
+    chrono::DateTime::parse_from_rfc2822(value)
+        .ok()
+        .and_then(|date| {
+            let now = chrono::Utc::now();
+            let target = date.with_timezone(&chrono::Utc);
+            if target <= now {
+                Some(0)
+            } else {
+                Some((target - now).num_milliseconds().max(0) as u64)
+            }
+        })
 }
 
 const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 60_000;
@@ -332,7 +342,11 @@ fn build_body(
         }
     }
 
-    if context.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+    if context
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+    {
         body["tools"] = serde_json::json!(convert_responses_tools(
             context.tools.as_ref().expect("checked is_some_and")
         ));
@@ -417,7 +431,10 @@ fn stream_openai_responses(
         }
     }
 
-    if let Some(session_id) = options.as_ref().and_then(|opts| opts.base.session_id.as_ref()) {
+    if let Some(session_id) = options
+        .as_ref()
+        .and_then(|opts| opts.base.session_id.as_ref())
+    {
         if let Ok(value) = reqwest::header::HeaderValue::from_str(session_id) {
             headers.insert("session_id", value.clone());
             headers.insert("x-client-request-id", value);
@@ -976,7 +993,9 @@ impl ApiProvider for OpenAiResponsesApiProvider {
             ..Default::default()
         });
         let body = build_body(&model, &context, options.as_ref());
-        AssistantMessageEventStream::from_raw(stream_openai_responses(client, model, context, options, body))
+        AssistantMessageEventStream::from_raw(stream_openai_responses(
+            client, model, context, options, body,
+        ))
     }
 
     fn stream_simple(
@@ -988,21 +1007,27 @@ impl ApiProvider for OpenAiResponsesApiProvider {
         let client = Client::new();
         let model = model.clone();
         let context = context.clone();
-        let options = options.cloned().map(|options| OpenAiResponsesStreamOptions {
-            base: options.base,
-            reasoning_effort: options.reasoning.map(|level| match clamp_thinking_level(&model, level) {
-                ThinkingLevel::Off => "minimal".to_string(),
-                ThinkingLevel::Minimal => "minimal".to_string(),
-                ThinkingLevel::Low => "low".to_string(),
-                ThinkingLevel::Medium => "medium".to_string(),
-                ThinkingLevel::High => "high".to_string(),
-                ThinkingLevel::XHigh => "xhigh".to_string(),
-            }),
-            reasoning_summary: None,
-            service_tier: None,
-        });
+        let options = options
+            .cloned()
+            .map(|options| OpenAiResponsesStreamOptions {
+                base: options.base,
+                reasoning_effort: options.reasoning.map(|level| {
+                    match clamp_thinking_level(&model, level) {
+                        ThinkingLevel::Off => "minimal".to_string(),
+                        ThinkingLevel::Minimal => "minimal".to_string(),
+                        ThinkingLevel::Low => "low".to_string(),
+                        ThinkingLevel::Medium => "medium".to_string(),
+                        ThinkingLevel::High => "high".to_string(),
+                        ThinkingLevel::XHigh => "xhigh".to_string(),
+                    }
+                }),
+                reasoning_summary: None,
+                service_tier: None,
+            });
         let body = build_body(&model, &context, options.as_ref());
-        AssistantMessageEventStream::from_raw(stream_openai_responses(client, model, context, options, body))
+        AssistantMessageEventStream::from_raw(stream_openai_responses(
+            client, model, context, options, body,
+        ))
     }
 }
 
@@ -1102,7 +1127,10 @@ mod tests {
         assert_eq!(body["input"][0]["role"], serde_json::json!("developer"));
         assert_eq!(body["input"][0]["content"], serde_json::json!("be concise"));
         assert_eq!(body["input"][1]["role"], serde_json::json!("user"));
-        assert_eq!(body["input"][1]["content"][0]["type"], serde_json::json!("input_text"));
+        assert_eq!(
+            body["input"][1]["content"][0]["type"],
+            serde_json::json!("input_text")
+        );
         assert_eq!(body["tools"][0]["type"], serde_json::json!("function"));
         assert_eq!(body["tools"][0]["name"], serde_json::json!("lookup"));
         assert_eq!(body["reasoning"]["effort"], serde_json::json!("medium"));

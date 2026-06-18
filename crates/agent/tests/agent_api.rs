@@ -37,11 +37,18 @@ async fn subscribe_receives_events_in_order() {
     // No tools, no real provider registered for the default model → the run
     // fails, which must surface as an error assistant message event sequence,
     // not a panic. agent_end must still fire.
-    let _ = agent.prompt(PromptInput::Messages(vec![user_text("hi")])).await;
+    let _ = agent
+        .prompt(PromptInput::Messages(vec![user_text("hi")]))
+        .await;
     agent.wait_for_idle().await;
 
     let observed = order.lock().unwrap().clone();
-    assert!(observed.first().map(|s| s == "agent_start").unwrap_or(false));
+    assert!(
+        observed
+            .first()
+            .map(|s| s == "agent_start")
+            .unwrap_or(false)
+    );
     assert!(observed.last().map(|s| s == "agent_end").unwrap_or(false));
 }
 
@@ -184,7 +191,9 @@ async fn unsubscribe_removes_only_the_target_listener() {
     let transient = agent.subscribe(Arc::new(|_event, _signal| Box::pin(async move {})));
     drop(transient);
 
-    let _ = agent.prompt(PromptInput::Messages(vec![user_text("hi")])).await;
+    let _ = agent
+        .prompt(PromptInput::Messages(vec![user_text("hi")]))
+        .await;
     agent.wait_for_idle().await;
 
     let observed = events.lock().unwrap().clone();

@@ -276,8 +276,8 @@ pub async fn build_agent(
         .map(|i| (&model_str[..i], &model_str[i + 1..]))
         .unwrap_or(("", model_str));
 
-    let model = flown_ai::get_model(provider_hint, model_id)
-        .or_else(|| flown_ai::get_model("", model_id));
+    let model =
+        flown_ai::get_model(provider_hint, model_id).or_else(|| flown_ai::get_model("", model_id));
 
     let model = match model {
         Some(m) => m,
@@ -356,23 +356,22 @@ pub async fn build_agent(
         })
         .await?;
 
-    let harness =
-        flown_agent::AgentHarness::new(flown_agent::AgentHarnessOptions {
-            env,
-            session,
-            tools,
-            system_prompt: flown_agent::SystemPromptConfig::Static(system_prompt),
-            model,
-            thinking_level: Some(flown_ai::ThinkingLevel::Off),
-            get_api_key_and_headers: Some(Arc::new(move |_model: &flown_ai::Model| {
-                api_key.clone().map(|k| (k, None))
-            })),
-            resources: None,
-            stream_options: None,
-            active_tool_names: None,
-            steering_mode: None,
-            follow_up_mode: None,
-        });
+    let harness = flown_agent::AgentHarness::new(flown_agent::AgentHarnessOptions {
+        env,
+        session,
+        tools,
+        system_prompt: flown_agent::SystemPromptConfig::Static(system_prompt),
+        model,
+        thinking_level: Some(flown_ai::ThinkingLevel::Off),
+        get_api_key_and_headers: Some(Arc::new(move |_model: &flown_ai::Model| {
+            api_key.clone().map(|k| (k, None))
+        })),
+        resources: None,
+        stream_options: None,
+        active_tool_names: None,
+        steering_mode: None,
+        follow_up_mode: None,
+    });
 
     Ok((harness, mcp_manager))
 }

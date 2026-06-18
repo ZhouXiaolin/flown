@@ -10,20 +10,22 @@
 //! naturally — a harness is subscribed to exactly its layer's channel — so
 //! exit is a plain teardown (unsubscribe → drop sender → pop).
 //!
-//! [`RuntimeControl`] is the iodilos-side capability handed to extension
-//! control command handlers. It is `Rc`-held and never crosses threads; it
-//! drives push/pop/send on the stack.
+//! [`RuntimeControl`] is the iodilos-side runtime command interpreter. It is
+//! `Rc`-held and never crosses threads; extension-facing command proxies send
+//! requests back to this owner thread.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
-use flown_agent::{AgentHarness, AgentTool, ExecutionEnv, GetApiKeyAndHeadersFn, AgentHarnessEvent};
+use flown_agent::{
+    AgentHarness, AgentHarnessEvent, AgentTool, ExecutionEnv, GetApiKeyAndHeadersFn,
+};
 use flown_ai::Model;
 use iodilos::prelude::*;
 
 use super::state::UiState;
 use crate::config::Config;
-use crate::core::extensions::{ControlRuntime, OverlapOptions, SlashCommandScope};
+use crate::core::extensions::{OverlapOptions, SlashCommandScope};
 
 /// Which kind of conversation a layer holds. Determines exit/discard semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,12 +91,8 @@ impl ConversationLayer {
         match &self.cmd_tx {
             Some(tx) => match tx.try_send(LayerCommand::Prompt(text)) {
                 Ok(()) => SubmitOutcome::Queued,
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    SubmitOutcome::DriverGone
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    SubmitOutcome::ChannelFull
-                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => SubmitOutcome::DriverGone,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => SubmitOutcome::ChannelFull,
             },
             None => SubmitOutcome::NoAgent,
         }
@@ -201,8 +199,7 @@ pub(crate) fn bind_layer_driver(
     // Command channel + optional initial prompt on a priority rx.
     let (cmd_tx, mut cmd_rx) =
         tokio::sync::mpsc::channel::<LayerCommand>(LAYER_CMD_CHANNEL_CAPACITY);
-    let (initial_tx, initial_rx) =
-        tokio::sync::mpsc::channel::<LayerCommand>(1);
+    let (initial_tx, initial_rx) = tokio::sync::mpsc::channel::<LayerCommand>(1);
     if let Some(p) = initial_prompt {
         let _ = initial_tx.try_send(LayerCommand::Prompt(p));
     }
@@ -565,9 +562,7 @@ impl AgentOverlapFactory {
             env: self.env.clone(),
             session,
             tools: self.built_in_tools.clone(),
-            system_prompt: flown_agent::SystemPromptConfig::Static(
-                self.system_prompt.clone(),
-            ),
+            system_prompt: flown_agent::SystemPromptConfig::Static(self.system_prompt.clone()),
             model: self.model.clone(),
             thinking_level: Some(flown_ai::ThinkingLevel::Off),
             get_api_key_and_headers: Some(self.api_key_fn.clone()),
@@ -581,8 +576,7 @@ impl AgentOverlapFactory {
     }
 }
 
-/// The iodilos-side overlap capability. Implements [`ControlRuntime`]; held by
-/// `CommandSide` and called by extension control handlers.
+/// The iodilos-side runtime command interpreter.
 ///
 /// All operations act on [`ConversationStack::active`] — after `open_overlap`,
 /// "active" is the new overlap; after close, it's back to main. This
@@ -600,8 +594,8 @@ impl RuntimeControl {
     }
 }
 
-impl ControlRuntime for RuntimeControl {
-    fn open_overlap(&self, options: OverlapOptions) {
+impl RuntimeControl {
+    pub fn open_overlap(&self, options: OverlapOptions) {
         tracing::info!(extension = %options.extension_id, "open overlap");
         let stack = self.stack.clone();
         let initial_prompt = options.initial_prompt.clone();
@@ -683,9 +677,7 @@ impl ControlRuntime for RuntimeControl {
             // overlap harness is wired to the UI, so the one-harness-one-transcript
             // invariant is structural here.
             let binding = match build {
-                OverlapBuildResult::Ok(h) => {
-                    Some(bind_layer_driver(h, initial_prompt.clone()))
-                }
+                OverlapBuildResult::Ok(h) => Some(bind_layer_driver(h, initial_prompt.clone())),
                 OverlapBuildResult::Err(msg) => {
                     stack_for_bridge.release_overlap_token(overlap_token);
                     stack_for_bridge
@@ -704,9 +696,8 @@ impl ControlRuntime for RuntimeControl {
                     overlap_state.busy.set(true);
                     overlap_state.status.update(|s| s.busy = true);
                 } else {
-                    overlap_state.push_error(
-                        "No LLM agent available. Check your config.".to_string(),
-                    );
+                    overlap_state
+                        .push_error("No LLM agent available. Check your config.".to_string());
                 }
             }
 
@@ -770,7 +761,7 @@ impl ControlRuntime for RuntimeControl {
         });
     }
 
-    fn close_active_overlap(&self) {
+    pub fn close_active_overlap(&self) {
         tracing::info!(target: "flown::overlap", "close_active_overlap called");
         let stack = self.stack.clone();
         if stack.active_is_overlap() && !stack.active_overlap_is_dismissible() {
@@ -817,7 +808,9 @@ impl ControlRuntime for RuntimeControl {
                         );
                         if let Some(h) = &layer.harness {
                             let h = Arc::clone(h);
-                            tokio::spawn(async move { let _ = h.abort().await; });
+                            tokio::spawn(async move {
+                                let _ = h.abort().await;
+                            });
                         }
                     }
                 }
@@ -827,7 +820,7 @@ impl ControlRuntime for RuntimeControl {
         }
     }
 
-    fn send_to_active(&self, text: String) {
+    pub fn send_to_active(&self, text: String) {
         let layer = self.stack.active();
         if layer.state.busy.get() {
             return;
@@ -862,15 +855,15 @@ impl ControlRuntime for RuntimeControl {
         }
     }
 
-    fn notify_active(&self, text: String) {
+    pub fn notify_active(&self, text: String) {
         self.stack.active().state.push_system(text);
     }
 
-    fn notify_error_active(&self, text: String) {
+    pub fn notify_error_active(&self, text: String) {
         self.stack.active().state.push_error(text);
     }
 
-    fn clear_active(&self) {
+    pub fn clear_active(&self) {
         self.stack.active().state.clear();
     }
 }

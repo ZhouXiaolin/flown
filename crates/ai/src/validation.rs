@@ -56,7 +56,11 @@ fn check_required(parameters: &Value, args: &Value) -> Result<()> {
     };
     let obj = match args {
         Value::Object(map) => map,
-        _ => return Err(AiError::Validation("Arguments must be a JSON object".to_string())),
+        _ => {
+            return Err(AiError::Validation(
+                "Arguments must be a JSON object".to_string(),
+            ));
+        }
     };
     for field in required {
         if let Value::String(name) = field {
@@ -98,10 +102,7 @@ fn coerce(value: &mut Value, schema: &serde_json::Map<String, Value>) {
         }
     }
 
-    if let Some(Value::Array(branches)) = schema
-        .get("anyOf")
-        .or_else(|| schema.get("oneOf"))
-    {
+    if let Some(Value::Array(branches)) = schema.get("anyOf").or_else(|| schema.get("oneOf")) {
         if let Some(coerced) = try_union_branches(value, branches) {
             *value = coerced;
             return;
@@ -178,7 +179,11 @@ fn coerce_primitive(value: &Value, ty: &str) -> Option<Value> {
                     }
                 })
             }
-            Value::Bool(b) => Some(Value::Number(serde_json::Number::from(if *b { 1 } else { 0 }))),
+            Value::Bool(b) => Some(Value::Number(serde_json::Number::from(if *b {
+                1
+            } else {
+                0
+            }))),
             _ => None,
         },
         "integer" => match value {
@@ -193,7 +198,11 @@ fn coerce_primitive(value: &Value, ty: &str) -> Option<Value> {
                     .ok()
                     .map(|n| Value::Number(serde_json::Number::from(n)))
             }
-            Value::Bool(b) => Some(Value::Number(serde_json::Number::from(if *b { 1 } else { 0 }))),
+            Value::Bool(b) => Some(Value::Number(serde_json::Number::from(if *b {
+                1
+            } else {
+                0
+            }))),
             _ => None,
         },
         "boolean" => match value {

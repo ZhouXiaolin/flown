@@ -19,32 +19,37 @@ use regex::{Regex, RegexBuilder};
 /// `OVERFLOW_PATTERNS` (`utils/overflow.ts:35-59`).
 static OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
-        r"prompt is too long", // Anthropic token overflow
-        r"request_too_large", // Anthropic request byte-size overflow (HTTP 413)
+        r"prompt is too long",                    // Anthropic token overflow
+        r"request_too_large",                     // Anthropic request byte-size overflow (HTTP 413)
         r"input is too long for requested model", // Amazon Bedrock
-        r"exceeds the context window", // OpenAI (Completions & Responses API)
+        r"exceeds the context window",            // OpenAI (Completions & Responses API)
         r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI-compatible proxies (LiteLLM)
         r"input token count.*exceeds the maximum", // Google (Gemini)
-        r"maximum prompt length is \d+", // xAI (Grok)
-        r"reduce the length of the messages", // Groq
-        r"maximum context length is \d+ tokens", // OpenRouter (most backends)
+        r"maximum prompt length is \d+",           // xAI (Grok)
+        r"reduce the length of the messages",      // Groq
+        r"maximum context length is \d+ tokens",   // OpenRouter (most backends)
         r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", // OpenRouter/Poolside
         r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)", // Together AI
-        r"exceeds the limit of \d+", // GitHub Copilot
+        r"exceeds the limit of \d+",           // GitHub Copilot
         r"exceeds the available context size", // llama.cpp server
-        r"greater than the context length", // LM Studio
-        r"context window exceeds limit", // MiniMax
-        r"exceeded model token limit", // Kimi For Coding
+        r"greater than the context length",    // LM Studio
+        r"context window exceeds limit",       // MiniMax
+        r"exceeded model token limit",         // Kimi For Coding
         r"too large for model with \d+ maximum context length", // Mistral
         r"model_context_window_exceeded", // z.ai non-standard finish_reason surfaced as error text
         r"prompt too long; exceeded (?:max )?context length", // Ollama explicit overflow error
         r"context[_ ]length[_ ]exceeded", // Generic fallback
-        r"too many tokens", // Generic fallback
-        r"token limit exceeded", // Generic fallback
+        r"too many tokens",               // Generic fallback
+        r"token limit exceeded",          // Generic fallback
         r"^4(?:00|13)\s*(?:status code)?\s*\(no body\)", // Cerebras: 400/413 with no body
     ]
     .iter()
-    .map(|pat| RegexBuilder::new(pat).case_insensitive(true).build().expect("overflow pattern is valid regex"))
+    .map(|pat| {
+        RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .expect("overflow pattern is valid regex")
+    })
     .collect()
 });
 
@@ -58,11 +63,16 @@ static OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 static NON_OVERFLOW_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
         r"^(Throttling error|Service unavailable):", // AWS Bedrock non-overflow errors (human-readable prefixes from formatBedrockError)
-        r"rate limit", // Generic rate limiting
-        r"too many requests", // Generic HTTP 429 style
+        r"rate limit",                               // Generic rate limiting
+        r"too many requests",                        // Generic HTTP 429 style
     ]
     .iter()
-    .map(|pat| RegexBuilder::new(pat).case_insensitive(true).build().expect("non-overflow pattern is valid regex"))
+    .map(|pat| {
+        RegexBuilder::new(pat)
+            .case_insensitive(true)
+            .build()
+            .expect("non-overflow pattern is valid regex")
+    })
     .collect()
 });
 
@@ -75,16 +85,11 @@ fn matches_any(haystack: &str, patterns: &[Regex]) -> bool {
 /// Pass `context_window` (the model's context window in tokens) to also
 /// detect silent overflow: providers that accept oversized requests but
 /// report usage that already fills or exceeds the context window.
-pub fn is_context_overflow(
-    message: &AssistantMessage,
-    context_window: Option<u32>,
-) -> bool {
+pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u32>) -> bool {
     // Case 1: explicit error message.
     if message.stop_reason == StopReason::Error {
         if let Some(text) = message.error_message.as_deref() {
-            if !matches_any(text, &NON_OVERFLOW_PATTERNS)
-                && matches_any(text, &OVERFLOW_PATTERNS)
-            {
+            if !matches_any(text, &NON_OVERFLOW_PATTERNS) && matches_any(text, &OVERFLOW_PATTERNS) {
                 return true;
             }
         }
@@ -143,10 +148,7 @@ mod tests {
         }
     }
 
-    fn message_with_usage(
-        stop_reason: StopReason,
-        usage: Usage,
-    ) -> AssistantMessage {
+    fn message_with_usage(stop_reason: StopReason, usage: Usage) -> AssistantMessage {
         AssistantMessage {
             role: "assistant".to_string(),
             content: vec![],

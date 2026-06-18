@@ -1,26 +1,26 @@
 use async_trait::async_trait;
 use flown_agent::{
-    AgentHarness, AgentHarnessOptions, AgentMessage, AgentTool, BranchPreparation,
-    BranchSummaryDetails, CollectEntriesResult, CompactionSettings, ContextUsageEstimate,
-    ExecOptions, ExecResult, ExecutionEnv, FileError, FileErrorCode, FileInfo, AgentHarnessEvent,
-    AgentHarnessStreamOptions, InMemorySessionRepo, MemorySessionCreateOptions, NavigateTreeOptions,
-    QueueMode, SessionBeforeCompactResult, SessionBeforeTreeResult, SessionMessage,
-    SessionTreeEntry, SessionTreeSummaryResult, SessionRepo, SystemPromptConfig,
-    calculate_context_tokens, collect_entries_for_branch_summary_result, estimate_tokens,
-    find_turn_start_index, generate_branch_summary, get_file_system_result_or_throw,
-    get_last_assistant_usage, prepare_branch_entries, uuidv7,
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentHarnessStreamOptions, AgentMessage,
+    AgentTool, BranchPreparation, BranchSummaryDetails, CollectEntriesResult, CompactionSettings,
+    ContextUsageEstimate, ExecOptions, ExecResult, ExecutionEnv, FileError, FileErrorCode,
+    FileInfo, InMemorySessionRepo, MemorySessionCreateOptions, NavigateTreeOptions, QueueMode,
+    SessionBeforeCompactResult, SessionBeforeTreeResult, SessionMessage, SessionRepo,
+    SessionTreeEntry, SessionTreeSummaryResult, SystemPromptConfig, calculate_context_tokens,
+    collect_entries_for_branch_summary_result, estimate_tokens, find_turn_start_index,
+    generate_branch_summary, get_file_system_result_or_throw, get_last_assistant_usage,
+    prepare_branch_entries, uuidv7,
 };
 use flown_ai::{
-    RawEventStream, Api, ApiProvider, AssistantContent, AssistantMessage,
-    AssistantMessageEvent, AssistantMessageEventStream, Context, MessageContent, Model,
-    ModelCost, Provider, ProviderResponse, SimpleStreamOptions, StopReason, StreamOptions,
-    ThinkingLevel, UserMessage, Usage, clear_api_providers, register_api_provider,
+    Api, ApiProvider, AssistantContent, AssistantMessage, AssistantMessageEvent,
+    AssistantMessageEventStream, Context, MessageContent, Model, ModelCost, Provider,
+    ProviderResponse, RawEventStream, SimpleStreamOptions, StopReason, StreamOptions,
+    ThinkingLevel, Usage, UserMessage, clear_api_providers, register_api_provider,
 };
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
@@ -104,11 +104,7 @@ impl flown_agent::FileSystem for TestExecutionEnv {
     }
 
     async fn create_temp_dir(&self, prefix: Option<&str>) -> Result<String, FileError> {
-        Ok(format!(
-            "{}/{}-dir",
-            self.cwd,
-            prefix.unwrap_or("temp")
-        ))
+        Ok(format!("{}/{}-dir", self.cwd, prefix.unwrap_or("temp")))
     }
 
     async fn create_temp_file(
@@ -219,8 +215,12 @@ impl ApiProvider for TestApiProvider {
         let on_response = options
             .as_ref()
             .and_then(|options| options.base.on_response.clone());
-        let headers = options.as_ref().and_then(|options| options.base.headers.clone());
-        let reasoning = options.as_ref().and_then(|options| options.reasoning.clone());
+        let headers = options
+            .as_ref()
+            .and_then(|options| options.base.headers.clone());
+        let reasoning = options
+            .as_ref()
+            .and_then(|options| options.reasoning.clone());
 
         AssistantMessageEventStream::from_stream(Box::pin(async_stream::stream! {
             let call_index = {
@@ -649,14 +649,23 @@ async fn prompt_emits_stream_and_queue_lifecycle_hooks_via_public_api() {
             _ => None,
         })
         .collect();
-    assert_eq!(user_messages, vec!["queued next turn".to_string(), "original prompt".to_string()]);
+    assert_eq!(
+        user_messages,
+        vec![
+            "queued next turn".to_string(),
+            "original prompt".to_string()
+        ]
+    );
 }
 
 #[tokio::test]
 async fn compact_uses_session_before_compact_hook_and_emits_hooked_save_entry() {
     println!("test: start compact_uses_session_before_compact_hook_and_emits_hooked_save_entry");
     let harness = test_harness().await;
-    harness.session().append_message(user_text("older user")).await;
+    harness
+        .session()
+        .append_message(user_text("older user"))
+        .await;
     let first_kept_entry_id = harness
         .session()
         .append_message(assistant_text("older assistant", 64))
@@ -782,7 +791,10 @@ async fn navigate_tree_uses_session_before_tree_hook_and_emits_session_tree() {
         Box::pin(async move {
             if let AgentHarnessEvent::SessionBeforeTree { preparation, .. } = &event {
                 assert_eq!(preparation.target_id, first_user_id);
-                assert_eq!(preparation.old_leaf_id.as_deref(), Some(second_user_id.as_str()));
+                assert_eq!(
+                    preparation.old_leaf_id.as_deref(),
+                    Some(second_user_id.as_str())
+                );
                 assert!(preparation.user_wants_summary);
                 assert_eq!(
                     preparation.custom_instructions.as_deref(),
@@ -963,7 +975,10 @@ async fn stream_options_updates_apply_to_follow_up_turns() {
     let harness = Arc::new(test_harness().await);
     harness
         .set_stream_options(AgentHarnessStreamOptions {
-            headers: Some(HashMap::from([("x-phase".to_string(), "first".to_string())])),
+            headers: Some(HashMap::from([(
+                "x-phase".to_string(),
+                "first".to_string(),
+            )])),
             ..AgentHarnessStreamOptions::default()
         })
         .await;
@@ -982,7 +997,10 @@ async fn stream_options_updates_apply_to_follow_up_turns() {
     harness.follow_up("second prompt", None).await.unwrap();
     harness
         .set_stream_options(AgentHarnessStreamOptions {
-            headers: Some(HashMap::from([("x-phase".to_string(), "second".to_string())])),
+            headers: Some(HashMap::from([(
+                "x-phase".to_string(),
+                "second".to_string(),
+            )])),
             ..AgentHarnessStreamOptions::default()
         })
         .await;

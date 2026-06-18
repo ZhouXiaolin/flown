@@ -1,15 +1,15 @@
 use crate::agent_loop::{AgentEventSink, run_agent_loop, run_agent_loop_continue};
 use crate::types::*;
 use flown_ai::{
-    AbortSignal, Message, MessageContent, OnPayloadFn, OnResponseFn, TextContent,
-    ThinkingBudgets, ThinkingLevel, Transport, UserContentBlock, UserMessage,
+    AbortSignal, Message, MessageContent, OnPayloadFn, OnResponseFn, TextContent, ThinkingBudgets,
+    ThinkingLevel, Transport, UserContentBlock, UserMessage,
 };
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Agent options for construction.
 pub struct AgentOptions {
@@ -20,8 +20,7 @@ pub struct AgentOptions {
             dyn Fn(
                     Vec<AgentMessage>,
                     Option<AbortSignal>,
-                )
-                    -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+                ) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -149,8 +148,7 @@ pub struct Agent {
             dyn Fn(
                     Vec<AgentMessage>,
                     Option<AbortSignal>,
-                )
-                    -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
+                ) -> Pin<Box<dyn Future<Output = Vec<AgentMessage>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -271,7 +269,9 @@ impl Agent {
             thinking_budgets: options.thinking_budgets,
             transport: options.transport,
             max_retry_delay_ms: options.max_retry_delay_ms,
-            tool_execution: options.tool_execution.unwrap_or(ToolExecutionMode::Parallel),
+            tool_execution: options
+                .tool_execution
+                .unwrap_or(ToolExecutionMode::Parallel),
         }
     }
 
@@ -530,7 +530,10 @@ impl Agent {
                         state.write().messages.push(message.clone());
                     }
                     AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
-                        state.write().pending_tool_calls.insert(tool_call_id.clone());
+                        state
+                            .write()
+                            .pending_tool_calls
+                            .insert(tool_call_id.clone());
                     }
                     AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
                         state.write().pending_tool_calls.remove(tool_call_id);

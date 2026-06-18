@@ -9,8 +9,8 @@
 //! reserved for provider-internal error aggregation and never appears in a
 //! public signature.
 
-use crate::types::Api;
 use crate::images_types::ImagesApi;
+use crate::types::Api;
 
 /// Unified error returned by every fallible public API in this crate.
 #[derive(Debug, thiserror::Error)]

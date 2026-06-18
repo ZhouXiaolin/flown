@@ -6,8 +6,9 @@
 //! `register` pass; the runtime splits the result along the thread boundary
 //! (see [`runner`] and the threading-model doc there).
 //!
-//! See `docs/adr/0003-extension-layer-m2-refinement.md` for the design and
-//! `docs/m2a-extension-api-draft.md` for the per-extension writing convention.
+//! See `docs/adr/0001-async-extension-context-and-command-proxy.md` for the
+//! architecture and `docs/superpowers/specs/2026-06-17-btw-extension-design.md`
+//! for the per-extension writing convention.
 //!
 //! M2a ships exactly one extension: [`mcp::McpExtension`] (the `/mcp` command
 //! plus MCP tools with runtime add/remove). Application-ontology behavior
@@ -26,8 +27,8 @@ use flown_agent::{AgentHarness, AgentTool};
 
 use crate::config::Config;
 
-pub use runner::{CommandSide, CommandSink, CommandTable, ToolSide, build};
-pub use types::{ControlRuntime, Extension, OverlapOptions, SlashCommandScope};
+pub use runner::{CommandSide, CommandTable, ToolSide, build};
+pub use types::{Extension, OverlapOptions, RuntimeCommand, RuntimeCommandProxy, SlashCommandScope};
 
 /// Run every extension's `register` on the tokio side and split the result.
 ///

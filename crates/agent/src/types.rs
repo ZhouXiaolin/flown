@@ -12,11 +12,7 @@ use std::sync::Arc;
 
 /// Stream function used by the agent loop
 pub type StreamFn = Arc<
-    dyn Fn(
-            Model,
-            Context,
-            Option<SimpleStreamOptions>,
-        ) -> flown_ai::AssistantMessageEventStream
+    dyn Fn(Model, Context, Option<SimpleStreamOptions>) -> flown_ai::AssistantMessageEventStream
         + Send
         + Sync,
 >;
@@ -351,7 +347,9 @@ pub enum AgentEvent {
 /// `NoResponse` are retained only until Task 6 rewrites `Agent` and drops them.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AgentError {
-    #[error("Agent is already processing a prompt. Use steer() or follow_up() to queue messages, or wait for completion.")]
+    #[error(
+        "Agent is already processing a prompt. Use steer() or follow_up() to queue messages, or wait for completion."
+    )]
     AlreadyProcessing,
     #[error("No messages to continue from")]
     NoMessages,
@@ -368,7 +366,10 @@ pub enum PromptInput {
     /// Plain text user prompt.
     Text(String),
     /// Text prompt with attached images.
-    TextWithImages { text: String, images: Vec<ImageContent> },
+    TextWithImages {
+        text: String,
+        images: Vec<ImageContent>,
+    },
     /// Pre-built message batch (e.g. drained from steer/follow-up queues).
     Messages(Vec<AgentMessage>),
 }

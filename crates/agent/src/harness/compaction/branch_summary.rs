@@ -1,9 +1,11 @@
-use super::compaction::{estimate_message_tokens, estimate_tokens, extract_file_ops, serialize_conversation};
-use crate::harness::types::*;
-use crate::harness::{BranchSummaryError, BranchSummaryErrorCode};
+use super::compaction::{
+    estimate_message_tokens, estimate_tokens, extract_file_ops, serialize_conversation,
+};
 use crate::harness::session::{
     ContentBlock, CustomMessageContent, SessionMessage, SessionTreeEntry,
 };
+use crate::harness::types::*;
+use crate::harness::{BranchSummaryError, BranchSummaryErrorCode};
 use crate::types::AgentMessage;
 use flown_ai::{
     AbortSignal, AssistantContent, Context, Message, MessageContent, Model, SimpleStreamOptions,
@@ -200,11 +202,9 @@ pub fn prepare_branch_entries(
     entries: &[SessionTreeEntry],
     token_budget: u64,
 ) -> BranchPreparation {
-    let (messages, read_files, modified_files) = prepare_branch_entries_tuple(entries, token_budget);
-    let total_tokens = messages
-        .iter()
-        .map(estimate_tokens)
-        .sum();
+    let (messages, read_files, modified_files) =
+        prepare_branch_entries_tuple(entries, token_budget);
+    let total_tokens = messages.iter().map(estimate_tokens).sum();
     BranchPreparation {
         messages,
         read_files,

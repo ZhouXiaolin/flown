@@ -1,17 +1,17 @@
 use flown_ai::{
     AnthropicOptions, Api, AssistantContent, AssistantMessage, AssistantMessageEvent,
-    AzureOpenAIResponsesOptions, BedrockOptions, Context, Cost, GoogleOptions,
-    GoogleThinkingLevel, GoogleVertexOptions, ImageContent, KnownApi, KnownProvider, Message,
-    MessageContent, MistralOptions, Model, ModelCost, OpenAICodexResponsesOptions,
-    OpenAICodexWebSocketDebugStats, OpenAICompletionsOptions, OpenAIResponsesOptions,
-    OAuthAuthInfo, OAuthCredentials, OAuthDeviceCodeInfo, OAuthPrompt, OAuthProviderId,
-    OAuthProviderInfo, OAuthSelectOption, OAuthSelectPrompt, Provider, StopReason, TextContent,
-    ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContentBlock, UserMessage,
-    clamp_thinking_level, clear_api_providers, complete, get_api_provider, get_model, get_models,
-    get_providers, get_supported_thinking_levels, models_are_equal,
-    register_built_in_api_providers, register_built_in_images_api_providers, stream, stream_anthropic_public,
-    stream_openai_completions_public, stream_openai_responses_public,
-    stream_simple_anthropic, stream_simple_openai_completions, stream_simple_openai_responses,
+    AzureOpenAIResponsesOptions, BedrockOptions, Context, Cost, GoogleOptions, GoogleThinkingLevel,
+    GoogleVertexOptions, ImageContent, KnownApi, KnownProvider, Message, MessageContent,
+    MistralOptions, Model, ModelCost, OAuthAuthInfo, OAuthCredentials, OAuthDeviceCodeInfo,
+    OAuthPrompt, OAuthProviderId, OAuthProviderInfo, OAuthSelectOption, OAuthSelectPrompt,
+    OpenAICodexResponsesOptions, OpenAICodexWebSocketDebugStats, OpenAICompletionsOptions,
+    OpenAIResponsesOptions, Provider, StopReason, TextContent, ThinkingContent, ThinkingLevel,
+    ToolCall, Usage, UserContentBlock, UserMessage, clamp_thinking_level, clear_api_providers,
+    complete, get_api_provider, get_model, get_models, get_providers,
+    get_supported_thinking_levels, models_are_equal, register_built_in_api_providers,
+    register_built_in_images_api_providers, stream, stream_anthropic_public,
+    stream_openai_completions_public, stream_openai_responses_public, stream_simple_anthropic,
+    stream_simple_openai_completions, stream_simple_openai_responses,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -213,7 +213,10 @@ fn oauth_public_types_are_exported() {
 #[test]
 fn google_thinking_level_is_exported() {
     let level = GoogleThinkingLevel::High;
-    assert_eq!(serde_json::to_value(level).unwrap(), serde_json::json!("HIGH"));
+    assert_eq!(
+        serde_json::to_value(level).unwrap(),
+        serde_json::json!("HIGH")
+    );
 }
 
 #[test]
@@ -256,7 +259,10 @@ fn clear_api_providers_keeps_registry_empty_until_explicit_reregister() {
     let _guard = REGISTRY_LOCK.lock().unwrap();
     clear_api_providers();
     let provider = get_api_provider(&Api::Known(KnownApi::OpenAiCompletions));
-    assert!(provider.is_none(), "clearApiProviders() should leave registry empty");
+    assert!(
+        provider.is_none(),
+        "clearApiProviders() should leave registry empty"
+    );
 }
 
 #[test]

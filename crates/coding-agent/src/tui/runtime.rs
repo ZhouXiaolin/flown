@@ -90,17 +90,12 @@ pub async fn run_tui(
         tokio::spawn(async move {
             let _ = h.set_tools(initial, None).await;
         });
-        // Reconcile loop: periodically flush runtime tool edits (MCP server
-        // connect/disconnect) into the harness. Polls on tokio; cheap no-op
-        // when no ToolHandle was dirtied.
-        let ts = tool_side.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
-            loop {
-                interval.tick().await;
-                ts.reconcile_tools().await;
-            }
-        });
+        // Reconcile loop: flush runtime tool edits (MCP server
+        // connect/disconnect) into the harness. Event-driven via each
+        // `ToolStore`'s `Notify` — wakes immediately on an edit and stays idle
+        // otherwise, instead of waking on a fixed timer. Cheap no-op when no
+        // `ToolHandle` was dirtied.
+        tokio::spawn(tool_side.clone().run_reconcile());
     }
 
     // Bind the main harness to its transcript ATOMICALLY: one call creates the
@@ -113,10 +108,7 @@ pub async fn run_tui(
     // here, replacing the old `tokio::spawn(harness.prompt())`.
     let initial_busy = initial_prompt.is_some() && harness.is_some();
     let main_binding = harness.as_ref().map(|h| {
-        crate::tui::conversation::bind_layer_driver(
-            Arc::clone(h),
-            initial_prompt.clone(),
-        )
+        crate::tui::conversation::bind_layer_driver(Arc::clone(h), initial_prompt.clone())
     });
     // Deconstruct the binding into independent handles. The event receiver is
     // single-consumer (one pump), so it is NOT held on the layer — it lives
@@ -124,22 +116,23 @@ pub async fn run_tui(
     // sender (dropping it ends the pump), the command sender (close sends
     // Shutdown), the unsubscribe token, and a harness clone (defensive abort).
     use crate::tui::conversation::LayerBinding;
-    let (
-        main_harness,
-        main_cmd_tx,
-        main_event_tx,
-        main_event_rx,
-        main_unsubscribe,
-    ) = match main_binding {
-        Some(LayerBinding { harness, cmd_tx, event_tx, event_rx, unsubscribe }) => (
-            Some(harness),
-            Some(cmd_tx),
-            Some(event_tx),
-            Some(event_rx),
-            Some(unsubscribe),
-        ),
-        None => (None, None, None, None, None),
-    };
+    let (main_harness, main_cmd_tx, main_event_tx, main_event_rx, main_unsubscribe) =
+        match main_binding {
+            Some(LayerBinding {
+                harness,
+                cmd_tx,
+                event_tx,
+                event_rx,
+                unsubscribe,
+            }) => (
+                Some(harness),
+                Some(cmd_tx),
+                Some(event_tx),
+                Some(event_rx),
+                Some(unsubscribe),
+            ),
+            None => (None, None, None, None, None),
+        };
 
     // Initial status snapshot.
     let status = StatusInfo {
@@ -222,7 +215,9 @@ pub async fn run_tui(
             overlap: None,
             state: Rc::clone(&state),
             harness: mount_harness.clone(),
-            event_tx: mount_event_tx.clone().expect("main event_tx present when harness exists; binding created before mount"),
+            event_tx: mount_event_tx
+                .clone()
+                .expect("main event_tx present when harness exists; binding created before mount"),
             unsubscribe: mount_unsubscribe.take(),
             cmd_tx: mount_cmd_tx.clone(),
         };
@@ -231,47 +226,25 @@ pub async fn run_tui(
             mount_overlap_factory.clone(),
         );
 
-        // RuntimeControl is the iodilos-side capability for extension control
-        // commands. Built here (not during register, which runs on tokio)
-        // because it holds the Rc<ConversationStack>.
+        // RuntimeControl is the iodilos-side command interpreter behind the
+        // extension-facing RuntimeCommandProxy. Built here (not during
+        // register, which runs on tokio) because it holds the Rc<ConversationStack>.
         let runtime_control =
             crate::tui::conversation::RuntimeControl::new(Rc::clone(&stack), mount_config.clone());
+        let (runtime_command_tx, runtime_command_rx) = flume::unbounded();
+        let runtime_proxy = Arc::new(crate::core::extensions::RuntimeCommandProxy::new(
+            runtime_command_tx,
+        ));
+        spawn_runtime_command_pump(Rc::clone(&runtime_control), runtime_command_rx);
 
         // Bind the extension command table to the live stack, producing the
-        // dispatch-capable CommandSide. The sink routes each CommandEffect to
-        // the ACTIVE layer's UiState (so /mcp notify shows in whatever view is
-        // visible). Then bind control handlers with the RuntimeControl — done
-        // before wrapping in Rc because bind_control needs &mut.
+        // dispatch-capable CommandSide. Commands receive an ExtensionContext
+        // backed by RuntimeCommandProxy, so UI/conversation actions target the
+        // active layer without exposing UiState to extensions.
         let command_side: Option<Rc<crate::core::extensions::CommandSide>> =
-            mount_command_table.take().map(|table| {
-                let sink = Rc::new(crate::core::extensions::CommandSink {
-                    notify: {
-                        let stack = Rc::clone(&stack);
-                        Box::new(move |text: String| {
-                            stack.active().state.push_system(text);
-                        })
-                    },
-                    notify_error: {
-                        let stack = Rc::clone(&stack);
-                        Box::new(move |text: String| {
-                            stack.active().state.push_error(text);
-                        })
-                    },
-                    clear: {
-                        let stack = Rc::clone(&stack);
-                        Box::new(move || {
-                            stack.active().state.clear();
-                        })
-                    },
-                });
-                let mut side = table.bind(sink);
-                // Bind the generic control capability. Control commands bring
-                // their own handler from the extension registration.
-                let rc =
-                    Rc::clone(&runtime_control) as Rc<dyn crate::core::extensions::ControlRuntime>;
-                side.bind_control_runtime(rc);
-                Rc::new(side)
-            });
+            mount_command_table
+                .take()
+                .map(|table| Rc::new(table.bind(Arc::clone(&runtime_proxy))));
         provide_context(command_side);
 
         // Provide the conversation stack (not a bare UiState) + handles. App
@@ -319,6 +292,40 @@ pub async fn run_tui(
 
     renderer.run().await?;
     Ok(())
+}
+
+fn spawn_runtime_command_pump(
+    runtime_control: Rc<crate::tui::conversation::RuntimeControl>,
+    rx: flume::Receiver<crate::core::extensions::RuntimeCommand>,
+) {
+    spawn_local(async move {
+        while let Ok(command) = rx.recv_async().await {
+            use crate::core::extensions::RuntimeCommand;
+            match command {
+                RuntimeCommand::OpenOverlap { options, reply } => {
+                    runtime_control.open_overlap(options);
+                    let _ = reply.send(Ok(()));
+                }
+                RuntimeCommand::CloseActiveOverlap { reply } => {
+                    runtime_control.close_active_overlap();
+                    let _ = reply.send(Ok(()));
+                }
+                RuntimeCommand::SendToActive { text, reply } => {
+                    runtime_control.send_to_active(text);
+                    let _ = reply.send(Ok(()));
+                }
+                RuntimeCommand::NotifyActive { text } => {
+                    runtime_control.notify_active(text);
+                }
+                RuntimeCommand::NotifyErrorActive { text } => {
+                    runtime_control.notify_error_active(text);
+                }
+                RuntimeCommand::ClearActive => {
+                    runtime_control.clear_active();
+                }
+            }
+        }
+    });
 }
 
 /// Translate one `AgentHarnessEvent` into `UiState` mutations. A near-verbatim port

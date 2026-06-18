@@ -47,7 +47,10 @@ pub(crate) fn register_images_api_provider_with_source(
     if let Some(ref mut map) = *registry {
         map.insert(
             provider.api(),
-            RegisteredImagesProvider { provider, source_id },
+            RegisteredImagesProvider {
+                provider,
+                source_id,
+            },
         );
     }
 }
