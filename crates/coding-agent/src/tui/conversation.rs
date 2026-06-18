@@ -604,10 +604,6 @@ impl RuntimeControl {
         })
     }
 
-    /// Borrow the overlay stack (App reads it to render the active overlay).
-    pub fn overlay_stack(&self) -> &Rc<crate::tui::overlay_stack::OverlayStack> {
-        &self.overlay_stack
-    }
 }
 
 impl RuntimeControl {
