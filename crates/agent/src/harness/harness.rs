@@ -371,10 +371,10 @@ impl AgentHarness {
     // ── Public API ──────────────────────────────────────────────────
 
     fn set_phase(&self, phase: AgentHarnessPhase) {
-        println!("harness: set_phase -> {:?}", phase);
+        tracing::debug!(target: "flown::harness", phase = ?phase, "set_phase");
         *self.phase.write() = phase.clone();
         if phase == AgentHarnessPhase::Idle {
-            println!("harness: set_phase sending idle signal");
+            tracing::debug!(target: "flown::harness", "set_phase sending idle signal");
             let _ = self.idle_tx.send(());
         }
     }
@@ -480,13 +480,13 @@ impl AgentHarness {
 
     /// Wait for the current run to complete
     pub async fn wait_for_idle(&self) {
-        println!("harness: wait_for_idle start");
+        tracing::debug!(target: "flown::harness", "wait_for_idle start");
         while !self.is_idle() {
-            println!("harness: wait_for_idle awaiting idle signal");
+            tracing::debug!(target: "flown::harness", "wait_for_idle awaiting idle signal");
             let _ = self.idle_rx.recv_async().await;
-            println!("harness: wait_for_idle received idle signal");
+            tracing::debug!(target: "flown::harness", "wait_for_idle received idle signal");
         }
-        println!("harness: wait_for_idle end");
+        tracing::debug!(target: "flown::harness", "wait_for_idle end");
     }
 
     /// Set model
@@ -699,7 +699,7 @@ impl AgentHarness {
             return Err(HarnessError::Busy(phase));
         }
 
-        println!("harness: prompt start text={:?}", text);
+        tracing::debug!(target: "flown::harness", text_len = text.len(), "prompt start");
         self.set_phase(AgentHarnessPhase::Turn);
         tracing::info!(target: "flown::harness", "harness prompt phase set to turn");
 
@@ -721,8 +721,8 @@ impl AgentHarness {
             }
         }
         self.set_phase(AgentHarnessPhase::Idle);
-        tracing::info!(target: "flown::harness", "harness prompt phase set to idle");
-        println!("harness: prompt end");
+        tracing::debug!(target: "flown::harness", "harness prompt phase set to idle");
+        tracing::debug!(target: "flown::harness", "prompt end");
 
         result
     }
@@ -1258,17 +1258,18 @@ impl AgentHarness {
             .iter()
             .map(|entry| Arc::clone(&entry.handler))
             .collect();
-        println!(
-            "harness: emit start event={:?} subscribers={}",
-            event,
-            handlers.len()
+        tracing::debug!(
+            target: "flown::harness",
+            event = ?event,
+            subscribers = handlers.len(),
+            "emit start"
         );
         for (index, handler) in handlers.into_iter().enumerate() {
-            println!("harness: emit calling subscriber index={}", index);
+            tracing::debug!(target: "flown::harness", index, "emit calling subscriber");
             handler(event.clone(), signal.clone()).await;
-            println!("harness: emit subscriber completed index={}", index);
+            tracing::debug!(target: "flown::harness", index, "emit subscriber completed");
         }
-        println!("harness: emit end event={:?}", event);
+        tracing::debug!(target: "flown::harness", event = ?event, "emit end");
     }
 
     async fn emit_any(&self, event: HarnessEvent, signal: Option<AbortSignal>) {
@@ -1447,7 +1448,7 @@ impl AgentHarness {
         text: &str,
         images: Option<Vec<ImageContent>>,
     ) -> Result<AssistantMessage, HarnessError> {
-        println!("harness: execute_turn start text={:?}", text);
+        tracing::debug!(target: "flown::harness", text_len = text.len(), "execute_turn start");
         let mut turn_state = self.create_turn_state().await;
         let abort_signal = AbortSignal::new();
         *self.run_abort.write() = Some(abort_signal.clone());
@@ -1831,7 +1832,7 @@ impl AgentHarness {
         let mut last_message = None;
 
         while let Some(event) = stream.next().await {
-            println!("harness: execute_turn event={:?}", event);
+            tracing::debug!(target: "flown::harness", event = ?event, "execute_turn event");
             // Convert AgentEvent to HarnessEvent and forward to subscribers
             let harness_event = HarnessEvent::from(&event);
 
@@ -1864,9 +1865,10 @@ impl AgentHarness {
                         .await;
                 }
                 AgentEvent::TurnEnd { tool_results, .. } => {
-                    println!(
-                        "harness: execute_turn handling TurnEnd tool_results={}",
-                        tool_results.len()
+                    tracing::debug!(
+                        target: "flown::harness",
+                        tool_results_count = tool_results.len(),
+                        "execute_turn handling TurnEnd"
                     );
                     // Append tool results to session
                     for result in tool_results {
@@ -1886,28 +1888,29 @@ impl AgentHarness {
                         had_pending_mutations,
                     }, None)
                     .await;
-                    println!("harness: execute_turn save point emitted");
+                    tracing::debug!(target: "flown::harness", "execute_turn save point emitted");
                 }
                 AgentEvent::AgentEnd { .. } => {
-                    println!("harness: execute_turn handling AgentEnd");
+                    tracing::debug!(target: "flown::harness", "execute_turn handling AgentEnd");
                     self.flush_pending_writes().await?;
-                    println!("harness: execute_turn pending writes flushed after AgentEnd");
+                    tracing::debug!(target: "flown::harness", "execute_turn pending writes flushed after AgentEnd");
                     let next_turn_count = self.next_turn_queue.read().len();
                     self.emit(
                         HarnessEvent::Settled { next_turn_count },
                         None,
                     )
                     .await;
-                    println!("harness: execute_turn settled emitted");
+                    tracing::debug!(target: "flown::harness", "execute_turn settled emitted");
                 }
                 _ => {}
             }
         }
 
         self.run_abort.write().take();
-        println!(
-            "harness: execute_turn stream ended has_last_message={}",
-            last_message.is_some()
+        tracing::debug!(
+            target: "flown::harness",
+            has_last_message = last_message.is_some(),
+            "execute_turn stream ended"
         );
         last_message.ok_or_else(|| HarnessError::InvalidState("no assistant response".to_string()))
     }
