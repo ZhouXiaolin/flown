@@ -323,6 +323,14 @@ fn spawn_runtime_command_pump(
                 RuntimeCommand::ClearActive => {
                     runtime_control.clear_active();
                 }
+                // Wired in the dedicated task; the placeholder arm keeps this
+                // exhaustive match compiling while the handlers land.
+                RuntimeCommand::OpenModelOverlay { reply } => {
+                    let _ = reply;
+                }
+                RuntimeCommand::ForkConversation { prompt, reply } => {
+                    let _ = (prompt, reply);
+                }
             }
         }
     });

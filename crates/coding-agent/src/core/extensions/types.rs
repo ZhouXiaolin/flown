@@ -159,6 +159,17 @@ pub enum RuntimeCommand {
         text: String,
     },
     ClearActive,
+    /// Open the `/model` overlay (model + thinking-intensity picker). Pushed
+    /// onto the OverlayStack by the iodilos-side RuntimeControl.
+    OpenModelOverlay {
+        reply: oneshot::Sender<CommandResult>,
+    },
+    /// Fork the main session into a transient overlay (btw). The prompt, when
+    /// present, is submitted to the forked harness immediately.
+    ForkConversation {
+        prompt: Option<String>,
+        reply: oneshot::Sender<CommandResult>,
+    },
 }
 
 /// Host-owned command proxy used by [`ExtensionContext`] capabilities.
@@ -205,6 +216,19 @@ impl RuntimeCommandProxy {
 
     pub async fn send_to_active(&self, text: String) -> CommandResult {
         self.request(|reply| RuntimeCommand::SendToActive { text, reply })
+            .await
+    }
+
+    /// Ask the iodilos-side runtime to open the `/model` overlay.
+    pub async fn open_model_overlay(&self) -> CommandResult {
+        self.request(|reply| RuntimeCommand::OpenModelOverlay { reply })
+            .await
+    }
+
+    /// Ask the iodilos-side runtime to fork the main session into a transient
+    /// overlay (btw). `prompt`, when present, is submitted to the fork.
+    pub async fn fork_conversation(&self, prompt: Option<String>) -> CommandResult {
+        self.request(|reply| RuntimeCommand::ForkConversation { prompt, reply })
             .await
     }
 
@@ -279,6 +303,16 @@ impl ConversationCapability {
 
     pub async fn send_to_active(&self, text: impl Into<String>) -> CommandResult {
         self.runtime.send_to_active(text.into()).await
+    }
+
+    /// Open the `/model` overlay (model + thinking-intensity picker).
+    pub async fn open_model_overlay(&self) -> CommandResult {
+        self.runtime.open_model_overlay().await
+    }
+
+    /// Fork the main session into a transient overlay (btw).
+    pub async fn fork_conversation(&self, prompt: Option<String>) -> CommandResult {
+        self.runtime.fork_conversation(prompt).await
     }
 }
 
