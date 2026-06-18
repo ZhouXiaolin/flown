@@ -228,14 +228,21 @@ pub async fn run_tui(
 
         // RuntimeControl is the iodilos-side command interpreter behind the
         // extension-facing RuntimeCommandProxy. Built here (not during
-        // register, which runs on tokio) because it holds the Rc<ConversationStack>.
-        let runtime_control =
-            crate::tui::conversation::RuntimeControl::new(Rc::clone(&stack), mount_config.clone());
+        // register, which runs on tokio) because it holds the Rc<ConversationStack>
+        // and the OverlayStack (both !Send). The overlay stack is provided as
+        // context so App can render the active overlay on top of the main UI.
+        let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+        let runtime_control = crate::tui::conversation::RuntimeControl::new(
+            Rc::clone(&stack),
+            Rc::clone(&overlay_stack),
+            mount_config.clone(),
+        );
         let (runtime_command_tx, runtime_command_rx) = flume::unbounded();
         let runtime_proxy = Arc::new(crate::core::extensions::RuntimeCommandProxy::new(
             runtime_command_tx,
         ));
         spawn_runtime_command_pump(Rc::clone(&runtime_control), runtime_command_rx);
+        provide_context(Rc::clone(&overlay_stack));
 
         // Bind the extension command table to the live stack, producing the
         // dispatch-capable CommandSide. Commands receive an ExtensionContext
@@ -323,13 +330,11 @@ fn spawn_runtime_command_pump(
                 RuntimeCommand::ClearActive => {
                     runtime_control.clear_active();
                 }
-                // Wired in the dedicated task; the placeholder arm keeps this
-                // exhaustive match compiling while the handlers land.
-                RuntimeCommand::OpenModelOverlay { reply } => {
-                    let _ = reply;
-                }
                 RuntimeCommand::ForkConversation { prompt, reply } => {
-                    let _ = (prompt, reply);
+                    runtime_control.fork_conversation(prompt, reply);
+                }
+                RuntimeCommand::OpenModelOverlay { reply } => {
+                    runtime_control.handle_open_model_overlay(reply);
                 }
             }
         }

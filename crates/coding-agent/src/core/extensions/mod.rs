@@ -18,6 +18,7 @@
 
 pub mod btw;
 pub mod mcp;
+pub mod model;
 pub mod runner;
 pub mod types;
 
@@ -49,6 +50,7 @@ pub fn build_runner(
     let extensions: Vec<Box<dyn Extension>> = vec![
         Box::new(mcp::McpExtension::new(_config.clone(), mcp)),
         Box::new(btw::BtwExtension::new()),
+        Box::new(model::ModelExtension::new()),
     ];
     build(harness, built_in_tools, extensions)
 }

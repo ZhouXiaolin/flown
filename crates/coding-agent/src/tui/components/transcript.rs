@@ -13,7 +13,7 @@ use std::rc::Rc;
 use iodilos::prelude::*;
 
 use crate::tui::components::message_block::render_entry;
-use crate::tui::state::{ConversationEntry, EntryKind};
+use crate::tui::state::{ConversationEntry, EntryKind, UiState};
 
 const RESERVED_ROWS: u16 = 7;
 /// Columns consumed by the `ScrollableViewport` chrome: left/right border (1+1)
@@ -57,6 +57,44 @@ pub fn Transcript() -> impl IntoView {
             ScrollDirection::Down => state.scroll_down(3),
             ScrollDirection::Left | ScrollDirection::Right => {}
         }
+    });
+    let mut props = ScrollableViewportProps::new(content, on_scroll);
+    props.border_color = Color::Rgb(40, 40, 48);
+    ScrollableViewport::new(props)
+}
+
+/// A standalone transcript viewport bound to an explicit `Rc<UiState>`, used by
+/// the btw fork overlay (which renders a *forked* session that is not part of
+/// the main ConversationStack, so it cannot use the context-bound `Transcript()`).
+///
+/// Mirrors `Transcript()` exactly but reads the passed-in state instead of
+/// `use_context::<ConversationStack>()`. Scroll still mutates that same state.
+pub fn transcript_for_state(state: Rc<UiState>) -> Node {
+    let terminal_size = use_terminal_size();
+
+    let content = Node::new_richtext();
+    let content_for_effect = content.clone();
+    let state_for_effect = Rc::clone(&state);
+    create_effect(move || {
+        let (terminal_width, terminal_height) = terminal_size.get();
+        let viewport_lines = transcript_viewport_lines(terminal_height);
+        let render_width = transcript_render_width(terminal_width);
+        let scroll_offset = state_for_effect.scroll_offset.get();
+        state_for_effect.entries.with(|entries| {
+            content_for_effect.set_lines(visible_transcript_lines(
+                entries,
+                viewport_lines,
+                scroll_offset,
+                render_width,
+            ));
+        });
+    });
+
+    let scroll_state = Rc::clone(&state);
+    let on_scroll = Callback::new(move |direction| match direction {
+        ScrollDirection::Up => scroll_state.scroll_up(3),
+        ScrollDirection::Down => scroll_state.scroll_down(3),
+        ScrollDirection::Left | ScrollDirection::Right => {}
     });
     let mut props = ScrollableViewportProps::new(content, on_scroll);
     props.border_color = Color::Rgb(40, 40, 48);
@@ -128,6 +166,16 @@ pub(crate) fn visible_transcript_lines(
     let offset = requested_offset.min(max_offset);
     let end = lines.len().saturating_sub(offset);
     let start = end.saturating_sub(viewport_lines);
+    tracing::debug!(
+        target: "flown::transcript",
+        entries = entries.len(),
+        rendered_total = lines.len(),
+        viewport_lines,
+        scroll_offset,
+        start,
+        end,
+        "transcript window"
+    );
     lines[start..end].to_vec()
 }
 

@@ -584,13 +584,29 @@ impl AgentOverlapFactory {
 /// is simply not used post-switch; everything goes through the stack).
 pub struct RuntimeControl {
     stack: Rc<ConversationStack>,
+    /// The single-overlay stack model: `/model` pushes an inset overlay; btw
+    /// forks push a full-bleed overlay. Depth is 1 in v1.
+    overlay_stack: Rc<crate::tui::overlay_stack::OverlayStack>,
     #[allow(dead_code)]
     config: Config,
 }
 
 impl RuntimeControl {
-    pub fn new(stack: Rc<ConversationStack>, config: Config) -> Rc<Self> {
-        Rc::new(Self { stack, config })
+    pub fn new(
+        stack: Rc<ConversationStack>,
+        overlay_stack: Rc<crate::tui::overlay_stack::OverlayStack>,
+        config: Config,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            stack,
+            overlay_stack,
+            config,
+        })
+    }
+
+    /// Borrow the overlay stack (App reads it to render the active overlay).
+    pub fn overlay_stack(&self) -> &Rc<crate::tui::overlay_stack::OverlayStack> {
+        &self.overlay_stack
     }
 }
 
@@ -759,6 +775,206 @@ impl RuntimeControl {
             };
             stack_for_bridge.push(layer);
         });
+    }
+
+    /// Fork the main session into a transient full-bleed overlay (btw). This is
+    /// the `open_overlap` build sequence lifted onto the new OverlayStack model:
+    /// the same tokio→iodilos bridge (factory.build → bind_layer_driver →
+    /// spawn_local pump), but instead of pushing a `ConversationLayer`, it
+    /// pushes an `OverlayBox(FullBleed)` whose content is a standalone
+    /// transcript bound to the forked `UiState`. Teardown (`on_close`) mirrors
+    /// `close_active_overlap`: unsubscribe → Shutdown the driver → drop.
+    ///
+    /// `reply` is answered once the overlay is up (or with an error if the
+    /// build fails or another overlay is already active).
+    pub fn fork_conversation(
+        &self,
+        initial_prompt: Option<String>,
+        reply: tokio::sync::oneshot::Sender<crate::core::extensions::types::CommandResult>,
+    ) {
+        let stack = self.stack.clone();
+        let overlay_stack = Rc::clone(&self.overlay_stack);
+        if overlay_stack.is_active() {
+            stack
+                .active()
+                .state
+                .push_system("An overlay is already active. Close it before opening another.");
+            let _ = reply.send(Ok(()));
+            return;
+        }
+
+        let factory = match stack.overlap_factory() {
+            Some(f) => f,
+            None => {
+                stack
+                    .active()
+                    .state
+                    .push_error("No LLM agent available. Cannot fork conversation.".to_string());
+                let _ = reply.send(Ok(()));
+                return;
+            }
+        };
+
+        // Build channel (single-use): carries the forked harness back from tokio.
+        let (build_tx, build_rx) = flume::unbounded::<OverlapBuildResult>();
+
+        // 1. Tokio task: fork session + build harness, ship it back.
+        let factory_for_task = factory.clone();
+        tokio::spawn(async move {
+            let result = match factory_for_task.build().await {
+                Ok(harness) => OverlapBuildResult::Ok(harness),
+                Err(e) => OverlapBuildResult::Err(e.to_string()),
+            };
+            let _ = build_tx.send(result);
+        });
+
+        // 2. Iodilos bridge: await the harness, bind it, and push the overlay.
+        let prompt_for_bridge = initial_prompt.clone();
+        spawn_local(async move {
+            let build = match build_rx.recv_async().await {
+                Ok(b) => b,
+                Err(_) => {
+                    stack
+                        .main_layer()
+                        .state
+                        .push_error("fork build channel closed unexpectedly.".to_string());
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+            };
+
+            let binding = match build {
+                OverlapBuildResult::Ok(h) => bind_layer_driver(h, prompt_for_bridge.clone()),
+                OverlapBuildResult::Err(msg) => {
+                    stack
+                        .main_layer()
+                        .state
+                        .push_error(format!("Could not fork conversation: {msg}"));
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+            };
+
+            // Fresh UiState for the fork; seed status from the main layer so the
+            // status line keeps showing model/provider/cwd/git.
+            let fork_state = Rc::new(UiState::new(TextAreaState::default()));
+            let main_status = stack.main_layer().state.status.get();
+            fork_state.status.set(main_status);
+            if let Some(prompt) = &prompt_for_bridge {
+                fork_state.push_user(prompt);
+                fork_state.busy.set(true);
+                fork_state.status.update(|s| s.busy = true);
+            }
+
+            // 3. Event pump feeding the forked UiState (identical to overlap).
+            let LayerBinding {
+                harness,
+                cmd_tx,
+                event_tx,
+                event_rx,
+                unsubscribe,
+            } = binding;
+            let pump_state = Rc::clone(&fork_state);
+            spawn_local(async move {
+                let mut accumulated_text = String::new();
+                let mut in_thinking = false;
+                while let Ok(event) = event_rx.recv_async().await {
+                    crate::tui::runtime::translate_event(
+                        event,
+                        &pump_state,
+                        &mut accumulated_text,
+                        &mut in_thinking,
+                    );
+                }
+            });
+
+            // 4. Teardown closure: unsubscribe → Shutdown the driver → the
+            // binding's parts (event_tx, harness Arc, cmd_tx) drop with the
+            // captured cell. Same load-bearing order as close_active_overlap.
+            let teardown = Rc::new({
+                let unsubscribe = Rc::new(unsubscribe);
+                let cmd_tx = Rc::new(cmd_tx);
+                let _event_tx = Rc::new(event_tx);
+                let _harness = Rc::new(harness);
+                let unsubscribe = Rc::clone(&unsubscribe);
+                let cmd_tx = Rc::clone(&cmd_tx);
+                move || {
+                    (unsubscribe)();
+                    let _ = cmd_tx.try_send(LayerCommand::Shutdown);
+                    // The captured event_tx/harness Arcs drop when this closure's
+                    // cell is dropped (it is held by the OverlayStack).
+                }
+            });
+
+            // 5. Push the overlay. Content is the standalone transcript bound
+            // to the forked state; the full-bleed geometry covers the main UI.
+            let content_state = Rc::clone(&fork_state);
+            let overlay = crate::tui::overlay_stack::ActiveOverlay {
+                geometry: iodilos::OverlayGeometry::FullBleed,
+                dismissible: true,
+                content: Rc::new(move || {
+                    crate::tui::components::transcript::transcript_for_state(Rc::clone(
+                        &content_state,
+                    ))
+                }),
+                on_close: Some(Rc::clone(&teardown) as Rc<dyn Fn()>),
+            };
+            overlay_stack.push(overlay);
+            let _ = reply.send(Ok(()));
+        });
+    }
+
+    /// Open the `/model` overlay. The overlay's content (model + thinking
+    /// picker) is built by ModelOverlay (Task 11); this method only reserves
+    /// the overlay slot and pushes an inset OverlayBox whose content node is
+    /// supplied by a caller-provided factory.
+    pub fn open_model_overlay(&self, content_factory: std::rc::Rc<dyn Fn() -> Node>) {
+        if self.overlay_stack.is_active() {
+            self.stack
+                .active()
+                .state
+                .push_system("An overlay is already active. Close it before opening another.");
+            return;
+        }
+        let overlay = crate::tui::overlay_stack::ActiveOverlay {
+            geometry: iodilos::OverlayGeometry::Inset { ratio: 0.125 },
+            dismissible: true,
+            content: content_factory,
+            on_close: None,
+        };
+        self.overlay_stack.push(overlay);
+    }
+
+    /// Handle the `OpenModelOverlay` runtime command: build the ModelOverlay
+    /// node (reading the live harness from context) and push it as an inset
+    /// overlay. Runs on the iodilos owner thread, so `use_context` resolves.
+    pub fn handle_open_model_overlay(
+        &self,
+        reply: tokio::sync::oneshot::Sender<crate::core::extensions::types::CommandResult>,
+    ) {
+        let harness = use_context::<Option<Arc<AgentHarness>>>();
+        let overlay_stack = Rc::clone(&self.overlay_stack);
+        let content_factory: std::rc::Rc<dyn Fn() -> Node> = match &harness {
+            Some(h) => {
+                let h = Arc::clone(h);
+                let stack = Rc::clone(&overlay_stack);
+                std::rc::Rc::new(move || {
+                    crate::tui::components::model_overlay::model_overlay(
+                        Arc::clone(&h),
+                        Rc::clone(&stack),
+                    )
+                })
+            }
+            None => {
+                self.stack.active().state.push_error(
+                    "No LLM agent available. Cannot open the model picker.".to_string(),
+                );
+                let _ = reply.send(Ok(()));
+                return;
+            }
+        };
+        self.open_model_overlay(content_factory);
+        let _ = reply.send(Ok(()));
     }
 
     pub fn close_active_overlap(&self) {
