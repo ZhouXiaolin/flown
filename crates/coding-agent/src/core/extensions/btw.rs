@@ -6,7 +6,7 @@
 //! Argument parsing (`/btw` vs `/btw <message>`) is a pure, unit-tested
 //! function so it stays testable without a TUI.
 
-use super::types::{CommandMeta, Extension, ExtensionApi, OverlapOptions, SlashCommandScope};
+use super::types::{CommandMeta, Extension, ExtensionApi};
 
 /// The `/btw` extension. Stateless beyond registration; all btw policy is in
 /// [`open_btw_overlap`].
@@ -62,19 +62,16 @@ pub fn parse_btw_args(args: &str) -> Option<String> {
 /// Runtime handler for `/btw`.
 ///
 /// All btw-specific policy lives here. The TUI runtime only sees a generic
-/// overlap request: open an agent-backed overlay, disable slash commands inside
-/// it, display a badge, and keep it single-instance.
+/// fork request: open an agent-backed overlay (full-bleed OverlayBox) that
+/// forks the current history, then submit the optional prompt to the fork.
+/// `fork_conversation` is single-instance (the OverlayStack rejects a second
+/// overlay while one is active).
 pub async fn open_btw_overlap(
     args: &str,
     ctx: super::types::ExtensionContext,
 ) -> anyhow::Result<()> {
-    let mut options = OverlapOptions::new("btw");
-    options.badge = Some("BTW".to_string());
-    options.single_instance_key = Some("btw".to_string());
-    options.dismissible = true;
-    options.slash_commands = SlashCommandScope::Disabled;
-    options.initial_prompt = parse_btw_args(args);
-    ctx.conversation.open_overlap(options).await
+    let prompt = parse_btw_args(args);
+    ctx.conversation.fork_conversation(prompt).await
 }
 
 #[cfg(test)]
