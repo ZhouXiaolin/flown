@@ -32,14 +32,16 @@ pub fn App() -> Node {
     let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
     let agent = use_context::<Option<Arc<AgentHarness>>>();
     let config = use_context::<crate::config::Config>();
+    let overlay_stack = use_context::<Rc<crate::tui::overlay_stack::OverlayStack>>();
 
     // The global key router. Runs under this component's owner (registered at
     // mount); captures the handles by move.
     let key_stack = Rc::clone(&stack);
+    let key_overlay = Rc::clone(&overlay_stack);
     let key_agent = agent;
     let key_config = config;
     on_key(move |key: KeyEvent| -> bool {
-        handle_app_key(key, &key_stack, key_agent.as_ref(), &key_config)
+        handle_app_key(key, &key_stack, &key_overlay, key_agent.as_ref(), &key_config)
     });
 
     view! {
@@ -52,8 +54,45 @@ pub fn App() -> Node {
             Transcript()
             StatusLine()
             InputEditor()
+            OverlayLayer(overlay: overlay_stack)
         }
     }
+}
+
+/// Renders the active overlay (if any) on top of the main UI. Reads the
+/// OverlayStack's active signal so it re-runs when an overlay is pushed/popped.
+/// Built as a `#[component]` child of the root View so it participates in the
+/// layout tree as the last (topmost) sibling.
+#[component]
+fn OverlayLayer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> Node {
+    // Track the active overlay reactively. `active_signal` is an RwSignal; reading
+    // it inside an effect registers the dependency. We render the OverlayBox only
+    // while an overlay is present.
+    let active = overlay.active_signal();
+    let host = Node::new_view();
+    let host_for_effect = host.clone();
+    create_effect(move || {
+        let current = active.get();
+        match current {
+            Some(o) => {
+                let geometry = o.geometry;
+                let content = (o.content)();
+                let props = iodilos::OverlayBoxProps {
+                    geometry,
+                    background: Color::Reset,
+                    border: Borders::ALL,
+                    border_style: iodilos::BorderStyle::Round,
+                    border_color: Color::Rgb(80, 80, 96),
+                    content,
+                };
+                host_for_effect.set_children(vec![iodilos::OverlayBox::new(props)]);
+            }
+            None => {
+                host_for_effect.set_children(vec![]);
+            }
+        }
+    });
+    host
 }
 
 /// The global key router. Returns `true` if the key was consumed. Operates on
@@ -62,6 +101,7 @@ pub fn App() -> Node {
 fn handle_app_key(
     key: KeyEvent,
     stack: &Rc<crate::tui::conversation::ConversationStack>,
+    overlay_stack: &Rc<crate::tui::overlay_stack::OverlayStack>,
     _agent: Option<&Arc<AgentHarness>>,
     config: &crate::config::Config,
 ) -> bool {
@@ -94,9 +134,15 @@ fn handle_app_key(
         iodilos::quit();
         return true;
     }
-    // Ctrl-C: with empty input, close a dismissible/pending overlap. Otherwise
-    // clear non-empty input, or quit the app (main layer, empty input).
+    // Ctrl-C: an open overlay (model picker / btw fork) is closed first. With
+    // empty input, close a dismissible/pending overlap. Otherwise clear
+    // non-empty input, or quit the app (main layer, empty input).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        if overlay_stack.is_active() {
+            tracing::info!(target: "flown::overlay", "Ctrl+C with active overlay, popping it");
+            overlay_stack.pop();
+            return true;
+        }
         let has_input = state.input.with(|input| !input.is_empty());
         let has_overlap = stack.overlap_is_active_or_pending();
         tracing::info!(target: "flown::overlap", has_input, has_overlap, "Ctrl+C received");
