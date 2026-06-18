@@ -472,6 +472,18 @@ pub(crate) fn translate_event(
             state.status.update(|s| s.busy = false);
         }
 
+        AgentHarnessEvent::ModelUpdate { model, .. } => {
+            state.status.update(|s| {
+                s.model = format!("{}/{}", model.provider, model.id);
+                s.provider = model.provider.to_string();
+            });
+        }
+        AgentHarnessEvent::ThinkingLevelUpdate { level, .. } => {
+            state.status.update(|s| {
+                s.thinking_level = format!("{:?}", level).to_lowercase();
+            });
+        }
+
         _ => {}
     }
 }
@@ -707,5 +719,59 @@ mod tests {
         assert!(!state.status.get().busy);
         assert!(accumulated_text.is_empty());
         assert!(!in_thinking);
+    }
+
+    #[test]
+    fn model_update_syncs_status_model_and_provider() {
+        // After a ModelUpdate event, the status snapshot's `model` carries the
+        // model id and `provider` is set from the model's provider. Today this
+        // is discarded by the `_ => {}` fallthrough in translate_event.
+        let state = UiState::new(TextAreaState::default());
+        let mut acc = String::new();
+        let mut thinking = false;
+        let model: flown_ai::Model = serde_json::from_str(
+            r#"{"id":"glm-5.1","name":"GLM 5.1","api":"openai-completions","provider":"openrouter","baseUrl":"","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1,"maxTokens":1}"#,
+        )
+        .expect("minimal Model JSON parses");
+        translate_event(
+            AgentHarnessEvent::ModelUpdate {
+                model: model.clone(),
+                previous_model: None,
+                source: flown_agent::ModelUpdateSource::Set,
+            },
+            &state,
+            &mut acc,
+            &mut thinking,
+        );
+        let snap = state.status.get();
+        assert!(
+            snap.model.contains("glm-5.1"),
+            "status.model should contain the model id, got {}",
+            snap.model
+        );
+        // Provider::Display for Known(OpenRouter) is lowercase "openrouter".
+        assert_eq!(snap.provider, "openrouter");
+    }
+
+    #[test]
+    fn thinking_level_update_syncs_status_thinking_level() {
+        let state = UiState::new(TextAreaState::default());
+        let mut acc = String::new();
+        let mut thinking = false;
+        translate_event(
+            AgentHarnessEvent::ThinkingLevelUpdate {
+                level: flown_ai::ThinkingLevel::High,
+                previous_level: flown_ai::ThinkingLevel::Off,
+            },
+            &state,
+            &mut acc,
+            &mut thinking,
+        );
+        let snap = state.status.get();
+        assert!(
+            snap.thinking_level.contains("high"),
+            "status.thinking_level should reflect the new level, got {}",
+            snap.thinking_level
+        );
     }
 }
