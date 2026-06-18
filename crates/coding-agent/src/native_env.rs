@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use flown_agent::harness::env::types::*;
+use flown_agent::{
+    ExecOptions, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode, FileError,
+    FileErrorCode, FileInfo, FileKind, FileSystem, Shell,
+};
 use tokio::fs;
 use tokio::process::Command;
 
@@ -246,7 +249,9 @@ impl FileSystem for NativeExecutionEnv {
         let temp_dir = std::env::temp_dir();
         let file_name = format!("{}_{}{}", prefix, uuid::Uuid::new_v4(), suffix);
         let path = temp_dir.join(file_name);
-        fs::write(&path, "").await.map_err(|e| map_io_error(e, &path))?;
+        fs::write(&path, "")
+            .await
+            .map_err(|e| map_io_error(e, &path))?;
         Ok(path.to_string_lossy().to_string())
     }
 
@@ -262,7 +267,11 @@ impl FileSystem for NativeExecutionEnv {
 
 #[async_trait::async_trait]
 impl Shell for NativeExecutionEnv {
-    async fn exec(&self, command: &str, options: ExecOptions) -> Result<ExecResult, ExecutionError> {
+    async fn exec(
+        &self,
+        command: &str,
+        options: ExecOptions,
+    ) -> Result<ExecResult, ExecutionError> {
         let cwd = options
             .cwd
             .as_ref()
@@ -281,32 +290,41 @@ impl Shell for NativeExecutionEnv {
             }
         }
 
-        let child = cmd
-            .spawn()
-            .map_err(|_e| ExecutionError {
-                code: ExecutionErrorCode::SpawnError,
-            })?;
+        let child = cmd.spawn().map_err(|e| {
+            ExecutionError::with_source(
+                ExecutionErrorCode::SpawnError,
+                format!("failed to spawn shell command: {command}"),
+                e,
+            )
+        })?;
 
         let output = if let Some(timeout) = options.timeout {
             let timeout = std::time::Duration::from_millis(timeout);
             match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                Ok(result) => {
-                    result.map_err(|_e| ExecutionError {
-                        code: ExecutionErrorCode::SpawnError,
-                    })?
-                }
+                Ok(result) => result.map_err(|e| {
+                    ExecutionError::with_source(
+                        ExecutionErrorCode::SpawnError,
+                        format!("failed to wait for shell command: {command}"),
+                        e,
+                    )
+                })?,
                 Err(_) => {
-                    return Err(ExecutionError {
-                        code: ExecutionErrorCode::Timeout,
-                    });
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::Timeout,
+                        format!("shell command timed out: {command}"),
+                    ));
                 }
             }
         } else {
             child
                 .wait_with_output()
                 .await
-                .map_err(|_e| ExecutionError {
-                    code: ExecutionErrorCode::SpawnError,
+                .map_err(|e| {
+                    ExecutionError::with_source(
+                        ExecutionErrorCode::SpawnError,
+                        format!("failed to wait for shell command: {command}"),
+                        e,
+                    )
                 })?
         };
 

@@ -1,26 +1,28 @@
-pub mod compaction;
-pub mod env;
-pub mod harness;
-pub mod messages;
-pub mod prompt_templates;
-pub mod session;
-pub mod skills;
-pub mod system_prompt;
-pub mod types;
-pub mod utils;
+mod compaction;
+mod env;
+mod harness;
+mod messages;
+mod prompt_templates;
+mod session;
+mod skills;
+mod system_prompt;
+mod types;
+mod utils;
 
 pub use compaction::branch_summary::{
-    BranchSummaryResult, GenerateBranchSummaryOptions, collect_entries_for_branch_summary,
-    prepare_branch_entries,
+    BranchPreparation, BranchSummaryDetails, BranchSummaryResult, CollectEntriesResult,
+    GenerateBranchSummaryOptions, collect_entries_for_branch_summary,
+    collect_entries_for_branch_summary_result, generate_branch_summary, prepare_branch_entries,
 };
 pub use compaction::compaction::{
-    CompactionPreparation, CompactionResult, CompactionSettings, CutPoint,
-    DEFAULT_COMPACTION_SETTINGS, build_file_ops_tag, compact, compact_with_llm,
-    estimate_context_tokens, estimate_message_tokens, extract_file_ops, find_cut_point,
-    generate_summary, generate_turn_prefix_summary, prepare_compaction, serialize_conversation,
-    should_compact,
+    CompactionPreparation, CompactionResult, CompactionSettings, ContextUsageEstimate, CutPoint,
+    DEFAULT_COMPACTION_SETTINGS, build_file_ops_tag, calculate_context_tokens, compact,
+    compact_with_llm, estimate_context_tokens, estimate_message_tokens, estimate_tokens,
+    extract_file_ops, find_cut_point, find_turn_start_index, generate_summary,
+    generate_turn_prefix_summary, get_last_assistant_usage, prepare_compaction,
+    serialize_conversation, should_compact,
 };
-pub use env::types::{
+pub use env::{
     AbortSignal, ExecOptions, ExecResult, ExecutionEnv, ExecutionError, ExecutionErrorCode,
     FileError, FileErrorCode, FileInfo, FileKind, FileSystem, Shell, ShellOutputUpdateFn,
 };
@@ -40,13 +42,13 @@ pub use prompt_templates::{
     load_prompt_templates, load_prompt_templates_with_diagnostics, load_sourced_prompt_templates,
     parse_command_args,
 };
-pub use session::jsonl_storage::SessionError;
-pub use session::types::*;
+pub use session::*;
 pub use session::{
     InMemorySessionRepo, JsonlSessionCreateOptions, JsonlSessionForkOptions,
     JsonlSessionListOptions, JsonlSessionRepo, MemorySessionCreateOptions,
     MemorySessionForkOptions, Session, SessionRepo, SessionStorage, build_session_context,
-    create_session_id, create_timestamp, get_entries_to_fork, to_session,
+    create_session_id, create_timestamp, get_entries_to_fork, get_file_system_result_or_throw,
+    to_session, uuidv7,
 };
 pub use skills::{
     LoadSkillsResult, LoadSourcedSkillsResult, Skill, SkillDiagnostic, SkillDiagnosticCode,
@@ -55,7 +57,16 @@ pub use skills::{
     load_sourced_skills,
 };
 pub use system_prompt::format_skills_for_system_prompt as format_system_prompt_skills;
-pub use types::*;
+pub use types::{
+    AgentHarnessError, AgentHarnessErrorCode, AgentHarnessEvent, AgentHarnessPhase,
+    AgentHarnessResources, AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch,
+    BeforeAgentStartResult, BeforeProviderPayloadResult, BeforeProviderRequestResult,
+    BranchSummaryError, BranchSummaryErrorCode, CompactResult, CompactionError,
+    CompactionErrorCode, ContextResult, ModelUpdateSource, NavigateTreeOptions,
+    NavigateTreeResult, SessionBeforeCompactResult, SessionBeforeTreeResult,
+    SessionTreeSummaryResult, ToolCallResult, ToolResultPatch, TreeNavigationPreparation,
+    ToolUpdateSource,
+};
 pub use utils::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, LineTruncationResult,
     ShellCaptureOptions, ShellCaptureResult, TruncationLimit, TruncationOptions, TruncationResult,

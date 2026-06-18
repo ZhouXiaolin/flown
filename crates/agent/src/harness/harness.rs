@@ -1,12 +1,17 @@
 use super::compaction::compaction::CompactionResult;
-use super::env::types::ExecutionEnv;
+use super::env::ExecutionEnv;
 use super::prompt_templates::format_prompt_template_invocation;
 use super::session::Session;
 use super::skills::{format_skill_invocation, format_skills_for_system_prompt};
 use super::types::*;
 use crate::agent_loop::agent_loop;
 use crate::types::*;
-use flown_ai::types::*;
+use flown_ai::{
+    AbortSignal, AssistantContent, AssistantMessage, AssistantMessageEvent, Context, ImageContent,
+    Message, MessageContent, Model, SimpleStreamOptions, StopReason, TextContent, ThinkingLevel,
+    Tool, ToolResultContent, UserContentBlock, UserMessage, Usage,
+};
+use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -14,7 +19,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-type EventHandler = Arc<dyn Fn(&HarnessEvent) + Send + Sync>;
+type EventHandler =
+    Arc<dyn Fn(HarnessEvent, Option<AbortSignal>) -> BoxFuture<'static, ()> + Send + Sync>;
 type HookHandler = Arc<
     dyn Fn(HarnessEvent) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
         + Send
@@ -306,7 +312,6 @@ pub struct AgentHarnessOptions {
 struct TurnState {
     messages: Vec<AgentMessage>,
     resources: HarnessResources,
-    stream_options: HarnessStreamOptions,
     session_id: String,
     system_prompt: String,
     model: Model,
@@ -366,8 +371,10 @@ impl AgentHarness {
     // ── Public API ──────────────────────────────────────────────────
 
     fn set_phase(&self, phase: AgentHarnessPhase) {
+        println!("harness: set_phase -> {:?}", phase);
         *self.phase.write() = phase.clone();
         if phase == AgentHarnessPhase::Idle {
+            println!("harness: set_phase sending idle signal");
             let _ = self.idle_tx.send(());
         }
     }
@@ -391,14 +398,29 @@ impl AgentHarness {
         self.model.read().clone()
     }
 
+    /// Pi-mono-aligned alias for `model()`.
+    pub async fn get_model(&self) -> Model {
+        self.model().await
+    }
+
     /// Get current thinking level
     pub async fn thinking_level(&self) -> ThinkingLevel {
         self.thinking_level.read().clone()
     }
 
+    /// Pi-mono-aligned alias for `thinking_level()`.
+    pub async fn get_thinking_level(&self) -> ThinkingLevel {
+        self.thinking_level().await
+    }
+
     /// Get current steering mode
     pub async fn steering_mode(&self) -> QueueMode {
         self.steering_mode.read().clone()
+    }
+
+    /// Pi-mono-aligned alias for `steering_mode()`.
+    pub async fn get_steering_mode(&self) -> QueueMode {
+        self.steering_mode().await
     }
 
     /// Set steering mode
@@ -409,6 +431,11 @@ impl AgentHarness {
     /// Get current follow-up mode
     pub async fn follow_up_mode(&self) -> QueueMode {
         self.follow_up_mode.read().clone()
+    }
+
+    /// Pi-mono-aligned alias for `follow_up_mode()`.
+    pub async fn get_follow_up_mode(&self) -> QueueMode {
+        self.follow_up_mode().await
     }
 
     /// Count pending user messages queued via steer/follow-up.
@@ -426,9 +453,19 @@ impl AgentHarness {
         self.resources.read().clone()
     }
 
+    /// Pi-mono-aligned alias for `resources()`.
+    pub async fn get_resources(&self) -> HarnessResources {
+        self.resources().await
+    }
+
     /// Get current stream options
     pub async fn stream_options(&self) -> HarnessStreamOptions {
         self.stream_options.read().clone()
+    }
+
+    /// Pi-mono-aligned alias for `stream_options()`.
+    pub async fn get_stream_options(&self) -> HarnessStreamOptions {
+        self.stream_options().await
     }
 
     /// Get the resolved system prompt for the current harness state.
@@ -436,11 +473,20 @@ impl AgentHarness {
         self.create_turn_state().await.system_prompt
     }
 
+    /// Pi-mono-aligned alias for `system_prompt()`.
+    pub async fn get_system_prompt(&self) -> String {
+        self.system_prompt().await
+    }
+
     /// Wait for the current run to complete
     pub async fn wait_for_idle(&self) {
+        println!("harness: wait_for_idle start");
         while !self.is_idle() {
+            println!("harness: wait_for_idle awaiting idle signal");
             let _ = self.idle_rx.recv_async().await;
+            println!("harness: wait_for_idle received idle signal");
         }
+        println!("harness: wait_for_idle end");
     }
 
     /// Set model
@@ -466,11 +512,12 @@ impl AgentHarness {
                 });
         }
 
-        self.emit(&HarnessEvent::ModelUpdate {
+        self.emit(HarnessEvent::ModelUpdate {
             model,
             previous_model: Some(previous),
             source: ModelUpdateSource::Set,
-        });
+        }, None)
+        .await;
     }
 
     /// Set thinking level
@@ -495,16 +542,22 @@ impl AgentHarness {
                 });
         }
 
-        self.emit(&HarnessEvent::ThinkingLevelUpdate {
+        self.emit(HarnessEvent::ThinkingLevelUpdate {
             level,
             previous_level: previous,
-        });
+        }, None)
+        .await;
     }
 
     /// Get all registered tools.
     /// Aligned with pi-mono `AgentHarness.getTools()`.
     pub fn tools(&self) -> Vec<AgentTool> {
         self.tools.read().values().cloned().collect()
+    }
+
+    /// Pi-mono-aligned alias for `tools()`.
+    pub fn get_tools(&self) -> Vec<AgentTool> {
+        self.tools()
     }
 
     /// Get currently active tool names.
@@ -522,6 +575,11 @@ impl AgentHarness {
             .iter()
             .filter_map(|name| tools.get(name).cloned())
             .collect()
+    }
+
+    /// Pi-mono-aligned alias for `active_tools()`.
+    pub fn get_active_tools(&self) -> Vec<AgentTool> {
+        self.active_tools()
     }
 
     /// Set tools with optional active names
@@ -550,13 +608,14 @@ impl AgentHarness {
         self.persist_active_tools_change(next_active_names).await;
         let tool_names: Vec<String> = self.tools.read().keys().cloned().collect();
         let active_tool_names = self.active_tool_names.read().clone();
-        self.emit(&HarnessEvent::ToolsUpdate {
+        self.emit(HarnessEvent::ToolsUpdate {
             tool_names,
             previous_tool_names,
             active_tool_names,
             previous_active_tool_names,
             source: ToolUpdateSource::Set,
-        });
+        }, None)
+        .await;
         Ok(())
     }
 
@@ -571,13 +630,14 @@ impl AgentHarness {
         self.persist_active_tools_change(names).await;
         let tool_names: Vec<String> = self.tools.read().keys().cloned().collect();
         let active_tool_names = self.active_tool_names.read().clone();
-        self.emit(&HarnessEvent::ToolsUpdate {
+        self.emit(HarnessEvent::ToolsUpdate {
             tool_names,
             previous_tool_names,
             active_tool_names,
             previous_active_tool_names,
             source: ToolUpdateSource::Set,
-        });
+        }, None)
+        .await;
         Ok(())
     }
 
@@ -599,10 +659,11 @@ impl AgentHarness {
         let previous = current.clone();
         *current = resources.clone();
 
-        self.emit(&HarnessEvent::ResourcesUpdate {
+        self.emit(HarnessEvent::ResourcesUpdate {
             resources,
             previous_resources: previous,
-        });
+        }, None)
+        .await;
     }
 
     /// Set stream options
@@ -638,6 +699,7 @@ impl AgentHarness {
             return Err(HarnessError::Busy(phase));
         }
 
+        println!("harness: prompt start text={:?}", text);
         self.set_phase(AgentHarnessPhase::Turn);
         tracing::info!(target: "flown::harness", "harness prompt phase set to turn");
 
@@ -660,6 +722,7 @@ impl AgentHarness {
         }
         self.set_phase(AgentHarnessPhase::Idle);
         tracing::info!(target: "flown::harness", "harness prompt phase set to idle");
+        println!("harness: prompt end");
 
         result
     }
@@ -730,7 +793,7 @@ impl AgentHarness {
 
         let message = create_user_message(text, images);
         self.steer_queue.write().push(message);
-        self.emit_queue_update();
+        self.emit_queue_update().await;
         Ok(())
     }
 
@@ -748,7 +811,7 @@ impl AgentHarness {
 
         let message = create_user_message(text, images);
         self.follow_up_queue.write().push(message);
-        self.emit_queue_update();
+        self.emit_queue_update().await;
         Ok(())
     }
 
@@ -756,7 +819,7 @@ impl AgentHarness {
     pub async fn next_turn(&self, text: &str, images: Option<Vec<ImageContent>>) {
         let message = create_user_message(text, images);
         self.next_turn_queue.write().push(message);
-        self.emit_queue_update();
+        self.emit_queue_update().await;
     }
 
     /// Abort the current run
@@ -774,15 +837,16 @@ impl AgentHarness {
             abort.cancel();
         }
 
-        self.emit_queue_update();
+        self.emit_queue_update().await;
 
         // Wait for the run to actually complete
         self.wait_for_idle().await;
 
-        self.emit(&HarnessEvent::Abort {
+        self.emit(HarnessEvent::Abort {
             cleared_steer: cleared_steer.clone(),
             cleared_follow_up: cleared_follow_up.clone(),
-        });
+        }, None)
+        .await;
 
         Ok(AbortResult {
             cleared_steer,
@@ -829,7 +893,9 @@ impl AgentHarness {
         &self,
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, HarnessError> {
-        self.assert_idle()?;
+        if !self.is_idle() {
+            let _ = self.abort().await?;
+        }
         self.set_phase(AgentHarnessPhase::Compaction);
         let abort_signal = AbortSignal::new();
         *self.run_abort.write() = Some(abort_signal.clone());
@@ -892,25 +958,9 @@ impl AgentHarness {
                     )));
                 }
                 if let Some(compaction) = parsed.compaction {
-                    // Use hook-provided summary
-                    let entry_id = self
-                        .session
-                        .append_compaction(
-                            &compaction.summary,
-                            &compaction.first_kept_entry_id,
-                            compaction.tokens_before,
-                            compaction.details.as_ref(),
-                            Some(true),
-                        )
-                        .await;
-                    let compaction_entry = self.session.get_entry(&entry_id).await;
-
-                    self.emit(&HarnessEvent::SessionCompact {
-                        compaction_entry: compaction_entry.clone(),
-                        from_hook: true,
-                    });
-
-                    return Ok(compaction.into());
+                    let result: CompactionResult = compaction.into();
+                    self.finish_compaction(&result, Some(true)).await;
+                    return Ok(result);
                 }
             }
         }
@@ -929,25 +979,30 @@ impl AgentHarness {
         .await
         .map_err(HarnessError::Compaction)?;
 
-        // Append compaction entry
+        self.finish_compaction(&summary, None).await;
+
+        Ok(summary)
+    }
+
+    async fn finish_compaction(&self, result: &CompactionResult, from_hook: Option<bool>) {
         let entry_id = self
             .session
             .append_compaction(
-                &summary.summary,
-                &preparation.first_kept_entry_id,
-                preparation.tokens_before,
-                summary.details.as_ref(),
-                None,
+                &result.summary,
+                &result.first_kept_entry_id,
+                result.tokens_before,
+                result.details.as_ref(),
+                from_hook,
             )
             .await;
+        let _session_context = self.session.build_context().await;
         let compaction_entry = self.session.get_entry(&entry_id).await;
 
-        self.emit(&HarnessEvent::SessionCompact {
+        self.emit(HarnessEvent::SessionCompact {
             compaction_entry,
-            from_hook: false,
-        });
-
-        Ok(summary)
+            from_hook: from_hook == Some(true),
+        }, None)
+        .await;
     }
 
     /// Navigate to a different point in the session tree
@@ -1084,8 +1139,8 @@ impl AgentHarness {
         let entry = self.session.get_entry(target_id).await;
         let new_leaf_id = if let Some(entry) = &entry {
             match entry {
-                super::session::types::SessionTreeEntry::Message {
-                    message: super::session::types::SessionMessage(AgentMessage::User(_)),
+                super::session::SessionTreeEntry::Message {
+                    message: super::session::SessionMessage(AgentMessage::User(_)),
                     ..
                 } => entry.parent_id().unwrap_or(target_id).to_string(),
                 _ => target_id.to_string(),
@@ -1113,18 +1168,19 @@ impl AgentHarness {
             None
         };
 
-        self.emit(&HarnessEvent::SessionTree {
+        self.emit(HarnessEvent::SessionTree {
             new_leaf_id: Some(new_leaf_id.clone()),
             old_leaf_id: old_leaf_id.clone(),
             summary_entry: summary_entry.clone(),
             from_hook: from_hook_summary,
-        });
+        }, None)
+        .await;
 
         // Get editor text from the target entry if it's a user message
         let editor_text = if let Some(entry) = &entry {
             match entry {
-                super::session::types::SessionTreeEntry::Message {
-                    message: super::session::types::SessionMessage(AgentMessage::User(msg)),
+                super::session::SessionTreeEntry::Message {
+                    message: super::session::SessionMessage(AgentMessage::User(msg)),
                     ..
                 } => match &msg.content {
                     MessageContent::Text(t) => Some(t.clone()),
@@ -1148,7 +1204,7 @@ impl AgentHarness {
     /// Subscribe to all events, returns an unsubscribe function
     pub fn subscribe(
         &self,
-        handler: impl Fn(&HarnessEvent) + Send + Sync + 'static,
+        handler: impl Fn(HarnessEvent, Option<AbortSignal>) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Box<dyn Fn() + Send + Sync> {
         let mut subscribers = self.subscribers.write();
         let mut next_id = self.next_subscriber_id.lock();
@@ -1195,20 +1251,28 @@ impl AgentHarness {
         }
     }
 
-    fn emit(&self, event: &HarnessEvent) {
+    async fn emit(&self, event: HarnessEvent, signal: Option<AbortSignal>) {
         let handlers: Vec<EventHandler> = self
             .subscribers
             .read()
             .iter()
             .map(|entry| Arc::clone(&entry.handler))
             .collect();
-        for handler in handlers {
-            handler(event);
+        println!(
+            "harness: emit start event={:?} subscribers={}",
+            event,
+            handlers.len()
+        );
+        for (index, handler) in handlers.into_iter().enumerate() {
+            println!("harness: emit calling subscriber index={}", index);
+            handler(event.clone(), signal.clone()).await;
+            println!("harness: emit subscriber completed index={}", index);
         }
+        println!("harness: emit end event={:?}", event);
     }
 
-    fn emit_any(&self, event: &HarnessEvent) {
-        self.emit(event);
+    async fn emit_any(&self, event: HarnessEvent, signal: Option<AbortSignal>) {
+        self.emit(event, signal).await;
     }
 
     async fn emit_hook(&self, event_type: &str, event: &HarnessEvent) -> Option<serde_json::Value> {
@@ -1228,12 +1292,20 @@ impl AgentHarness {
         result
     }
 
-    fn emit_queue_update(&self) {
-        self.emit(&HarnessEvent::QueueUpdate {
-            steer: self.steer_queue.read().clone(),
-            follow_up: self.follow_up_queue.read().clone(),
-            next_turn: self.next_turn_queue.read().clone(),
-        });
+    async fn emit_queue_update(&self) {
+        let steer = self.steer_queue.read().clone();
+        let follow_up = self.follow_up_queue.read().clone();
+        let next_turn = self.next_turn_queue.read().clone();
+        let signal = self.run_abort.read().clone();
+        self.emit(
+            HarnessEvent::QueueUpdate {
+                steer,
+                follow_up,
+                next_turn,
+            },
+            signal,
+        )
+        .await;
     }
 
     // ── Internal ────────────────────────────────────────────────────
@@ -1252,7 +1324,6 @@ impl AgentHarness {
         let metadata = self.session.get_metadata().await;
         let model = self.model.read().clone();
         let thinking_level = self.thinking_level.read().clone();
-        let stream_options = self.stream_options.read().clone();
         let all_tools: Vec<AgentTool> = self.tools.read().values().cloned().collect();
         let active_names = self.active_tool_names.read().clone();
         let active_tools: Vec<AgentTool> = all_tools
@@ -1302,7 +1373,6 @@ impl AgentHarness {
         TurnState {
             messages: session_context.messages,
             resources,
-            stream_options,
             session_id: metadata.id.clone(),
             system_prompt: full_system_prompt,
             model,
@@ -1377,6 +1447,7 @@ impl AgentHarness {
         text: &str,
         images: Option<Vec<ImageContent>>,
     ) -> Result<AssistantMessage, HarnessError> {
+        println!("harness: execute_turn start text={:?}", text);
         let mut turn_state = self.create_turn_state().await;
         let abort_signal = AbortSignal::new();
         *self.run_abort.write() = Some(abort_signal.clone());
@@ -1414,7 +1485,7 @@ impl AgentHarness {
         let context = AgentContext {
             system_prompt: turn_state.system_prompt.clone(),
             messages: turn_state.messages.clone(),
-            tools: turn_state.active_tools.clone(),
+            tools: Some(turn_state.active_tools.clone()),
         };
 
         // Create loop config
@@ -1449,7 +1520,7 @@ impl AgentHarness {
                         context: Some(AgentContext {
                             system_prompt: new_state.system_prompt.clone(),
                             messages: new_state.messages.clone(),
-                            tools: new_state.active_tools.clone(),
+                            tools: Some(new_state.active_tools.clone()),
                         }),
                         model: Some(new_state.model.clone()),
                         thinking_level: Some(new_state.thinking_level.clone()),
@@ -1610,12 +1681,10 @@ impl AgentHarness {
         let stream_fn = {
             let h = harness.clone();
             let session_id = turn_state.session_id.clone();
-            let stream_options = turn_state.stream_options.clone();
             Arc::new(
                 move |model: Model, context: Context, options: Option<SimpleStreamOptions>| {
                     let h = h.clone();
                     let session_id = session_id.clone();
-                    let stream_options = stream_options.clone();
                     flown_ai::AssistantMessageEventStream::from_stream(Box::pin(async_stream::stream! {
                         let mut options = options.unwrap_or_default();
 
@@ -1627,7 +1696,7 @@ impl AgentHarness {
                         }
 
                         // Emit before_provider_request hook
-                        let mut snapshot_options = stream_options.clone();
+                        let mut snapshot_options = h.stream_options.read().clone();
                         snapshot_options.headers = merge_headers(
                             snapshot_options.headers,
                             auth.and_then(|(_api_key, headers)| headers),
@@ -1669,13 +1738,14 @@ impl AgentHarness {
                         }));
 
                         let h_response = h.clone();
-                            options.base.on_response = Some(Arc::new(move |response| {
+                        options.base.on_response = Some(Arc::new(move |response| {
                             let h = h_response.clone();
                             Box::pin(async move {
-                                h.emit(&HarnessEvent::AfterProviderResponse {
+                                h.emit(HarnessEvent::AfterProviderResponse {
                                     status: response.status,
                                     headers: response.headers,
-                                });
+                                }, None)
+                                .await;
                             })
                         }));
 
@@ -1761,11 +1831,12 @@ impl AgentHarness {
         let mut last_message = None;
 
         while let Some(event) = stream.next().await {
+            println!("harness: execute_turn event={:?}", event);
             // Convert AgentEvent to HarnessEvent and forward to subscribers
             let harness_event = HarnessEvent::from(&event);
 
             // Forward event to subscribers
-            self.emit_any(&harness_event);
+            self.emit_any(harness_event, None).await;
 
             // Handle specific events
             match &event {
@@ -1793,6 +1864,10 @@ impl AgentHarness {
                         .await;
                 }
                 AgentEvent::TurnEnd { tool_results, .. } => {
+                    println!(
+                        "harness: execute_turn handling TurnEnd tool_results={}",
+                        tool_results.len()
+                    );
                     // Append tool results to session
                     for result in tool_results {
                         self.session
@@ -1807,21 +1882,33 @@ impl AgentHarness {
                     self.flush_pending_writes().await?;
 
                     // Emit save point
-                    self.emit(&HarnessEvent::SavePoint {
+                    self.emit(HarnessEvent::SavePoint {
                         had_pending_mutations,
-                    });
+                    }, None)
+                    .await;
+                    println!("harness: execute_turn save point emitted");
                 }
                 AgentEvent::AgentEnd { .. } => {
+                    println!("harness: execute_turn handling AgentEnd");
                     self.flush_pending_writes().await?;
-                    self.emit(&HarnessEvent::Settled {
-                        next_turn_count: self.next_turn_queue.read().len(),
-                    });
+                    println!("harness: execute_turn pending writes flushed after AgentEnd");
+                    let next_turn_count = self.next_turn_queue.read().len();
+                    self.emit(
+                        HarnessEvent::Settled { next_turn_count },
+                        None,
+                    )
+                    .await;
+                    println!("harness: execute_turn settled emitted");
                 }
                 _ => {}
             }
         }
 
         self.run_abort.write().take();
+        println!(
+            "harness: execute_turn stream ended has_last_message={}",
+            last_message.is_some()
+        );
         last_message.ok_or_else(|| HarnessError::InvalidState("no assistant response".to_string()))
     }
 
@@ -1990,7 +2077,6 @@ impl HarnessRefs {
         let metadata = self.session.get_metadata().await;
         let model = self.model.read().clone();
         let thinking_level = self.thinking_level.read().clone();
-        let stream_options = self.stream_options.read().clone();
         let all_tools: Vec<AgentTool> = self.tools.read().values().cloned().collect();
         let active_names = self.active_tool_names.read().clone();
         let active_tools: Vec<AgentTool> = all_tools
@@ -2036,7 +2122,6 @@ impl HarnessRefs {
         TurnState {
             messages: session_context.messages,
             resources,
-            stream_options,
             session_id: metadata.id.clone(),
             system_prompt: full_system_prompt,
             model,
@@ -2113,7 +2198,7 @@ impl HarnessRefs {
         payload
     }
 
-    fn emit(&self, event: &HarnessEvent) {
+    async fn emit(&self, event: HarnessEvent, signal: Option<AbortSignal>) {
         let handlers: Vec<EventHandler> = self
             .subscribers
             .read()
@@ -2121,7 +2206,7 @@ impl HarnessRefs {
             .map(|entry| Arc::clone(&entry.handler))
             .collect();
         for handler in handlers {
-            handler(event);
+            handler(event.clone(), signal.clone()).await;
         }
     }
 }

@@ -1,92 +1,54 @@
 use crate::types::*;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
-/// Built-in models are initialized at first access, matching pi-ai's generated
-/// model table import flow while keeping this crate usable without `init()`.
+/// Built-in model table, loaded at first access. Mirrors pi-ai's generated
+/// model table (`MODELS` import in `models.ts`): read-only and populated from
+/// `models.generated.json`. pi-ai exposes no runtime model registration, so
+/// neither does this crate.
 static BUILTIN_MODEL_REGISTRY: Lazy<HashMap<String, HashMap<String, Model>>> = Lazy::new(|| {
     serde_json::from_str(include_str!("models.generated.json"))
         .expect("built-in model registry JSON is valid")
 });
 
-/// Dynamic model registry for callers that add or override models at runtime.
-static MODEL_REGISTRY: Lazy<RwLock<HashMap<String, HashMap<String, Model>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
-fn provider_id(provider: &Provider) -> String {
-    match provider {
-        Provider::Known(provider) => provider.to_string(),
-        Provider::Custom(provider) => provider.clone(),
-    }
-}
-
-fn insert_model(registry: &mut HashMap<String, HashMap<String, Model>>, model: Model) {
-    let provider_id = provider_id(&model.provider);
-    registry
-        .entry(provider_id)
-        .or_default()
-        .insert(model.id.clone(), model);
-}
-
-/// Register a model
-pub fn register_model(model: Model) {
-    let mut registry = MODEL_REGISTRY.write().unwrap();
-    insert_model(&mut registry, model);
-}
-
 /// Get a model by provider and model ID
 pub fn get_model(provider: &str, model_id: &str) -> Option<Model> {
-    let registry = MODEL_REGISTRY.read().unwrap();
-    registry
+    BUILTIN_MODEL_REGISTRY
         .get(provider)
         .and_then(|models| models.get(model_id).cloned())
-        .or_else(|| {
-            BUILTIN_MODEL_REGISTRY
-                .get(provider)
-                .and_then(|models| models.get(model_id).cloned())
-        })
 }
 
 /// Get all providers
 pub fn get_providers() -> Vec<String> {
     let mut providers: Vec<String> = BUILTIN_MODEL_REGISTRY.keys().cloned().collect();
-    let registry = MODEL_REGISTRY.read().unwrap();
-    for provider in registry.keys() {
-        if !providers.contains(provider) {
-            providers.push(provider.clone());
-        }
-    }
     providers.sort();
     providers
 }
 
 /// Get all models for a provider
 pub fn get_models(provider: &str) -> Vec<Model> {
-    let mut models = BUILTIN_MODEL_REGISTRY
+    let mut models: Vec<Model> = BUILTIN_MODEL_REGISTRY
         .get(provider)
-        .cloned()
+        .map(|models| models.values().cloned().collect())
         .unwrap_or_default();
-
-    let registry = MODEL_REGISTRY.read().unwrap();
-    if let Some(dynamic_models) = registry.get(provider) {
-        for (id, model) in dynamic_models {
-            models.insert(id.clone(), model.clone());
-        }
-    }
-
-    let mut models: Vec<Model> = models.into_values().collect();
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models
 }
 
-/// Calculate cost for usage
+/// Calculate cost for usage, matching pi-ai's `calculateCost`:
+/// Anthropic charges 2× base input for 1h cache writes, so the
+/// `cache_write_1h` subset is priced at `model.cost.input * 2` while the
+/// remaining (short-retention) writes use `model.cost.cache_write`.
 pub fn calculate_cost(model: &Model, usage: &mut Usage) -> Cost {
+    let long_write = usage.cache_write_1h.unwrap_or(0) as f64;
+    let short_write = (usage.cache_write as f64) - long_write;
     usage.cost = Cost {
         input: (model.cost.input / 1_000_000.0) * usage.input as f64,
         output: (model.cost.output / 1_000_000.0) * usage.output as f64,
         cache_read: (model.cost.cache_read / 1_000_000.0) * usage.cache_read as f64,
-        cache_write: (model.cost.cache_write / 1_000_000.0) * usage.cache_write as f64,
+        cache_write: (model.cost.cache_write * short_write
+            + model.cost.input * 2.0 * long_write)
+            / 1_000_000.0,
         total: 0.0,
     };
     usage.cost.total =
@@ -260,10 +222,15 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
 
 /// Normalize conversation history before provider-specific conversion.
 ///
-/// This mirrors pi-ai's `transformMessages`: image downgrades for text-only
-/// models, cross-model thinking/tool-call cleanup, optional tool-call id
-/// normalization, and synthetic tool results for orphaned tool calls.
-pub fn transform_messages(
+/// This mirrors pi-ai's `transformMessages` (`providers/transform-messages.ts`):
+/// image downgrades for text-only models, cross-model thinking/tool-call
+/// cleanup, optional tool-call id normalization, and synthetic tool results
+/// for orphaned tool calls.
+///
+/// Internal — pi-ai keeps `transformMessages` as a provider-internal helper
+/// and does not export it, so neither does this crate. Built-in providers call
+/// it directly.
+pub(crate) fn transform_messages(
     messages: &[Message],
     model: &Model,
     normalize_tool_call_id: Option<&dyn Fn(&str, &Model, &AssistantMessage) -> String>,
@@ -415,13 +382,117 @@ pub fn transform_messages(
     result
 }
 
-/// Register default DeepSeek models into the dynamic registry.
-///
-/// Built-in DeepSeek models are already available through `get_model()` via the
-/// static registry. This function is kept for callers that still perform an
-/// explicit initialization pass.
-pub fn register_deepseek_models() {
-    for model in get_models("deepseek") {
-        register_model(model);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        AssistantContent, ImageContent, TextContent, ThinkingContent, ToolCall, ToolResultContent,
+        UserContentBlock, UserMessage,
+    };
+
+    /// `transform_messages` is provider-internal (mirroring pi-ai's unexported
+    /// `providers/transform-messages.ts`), so its semantics are covered here at
+    /// crate visibility rather than in the external alignment test.
+    #[test]
+    fn transform_messages_matches_pi_ai_cross_provider_semantics() {
+        let target = get_model("deepseek", "deepseek-v4-flash").expect("model");
+        let source_assistant = AssistantMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                AssistantContent::Thinking(ThinkingContent {
+                    content_type: "thinking".to_string(),
+                    thinking: "private plan".to_string(),
+                    thinking_signature: Some("foreign-thinking".to_string()),
+                    redacted: None,
+                }),
+                AssistantContent::Thinking(ThinkingContent {
+                    content_type: "thinking".to_string(),
+                    thinking: "[redacted]".to_string(),
+                    thinking_signature: Some("opaque".to_string()),
+                    redacted: Some(true),
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    content_type: "toolCall".to_string(),
+                    id: "call|unsafe/id".to_string(),
+                    name: "lookup".to_string(),
+                    arguments: serde_json::json!({ "q": "rust" }),
+                    thought_signature: Some("foreign-tool".to_string()),
+                }),
+            ],
+            api: Api::Known(KnownApi::AnthropicMessages),
+            provider: Provider::Known(KnownProvider::Anthropic),
+            model: "claude".to_string(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            diagnostics: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let messages = vec![
+            Message::User(UserMessage {
+                role: "user".to_string(),
+                content: MessageContent::Blocks(vec![
+                    UserContentBlock::Image(ImageContent {
+                        content_type: "image".to_string(),
+                        data: "abc".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                    UserContentBlock::Image(ImageContent {
+                        content_type: "image".to_string(),
+                        data: "def".to_string(),
+                        mime_type: "image/png".to_string(),
+                    }),
+                ]),
+                timestamp: chrono::Utc::now(),
+            }),
+            Message::Assistant(source_assistant),
+        ];
+
+        let transformed = transform_messages(
+            &messages,
+            &target,
+            Some(&|id, _model, _source| id.replace(['|', '/'], "_")),
+        );
+
+        assert!(matches!(
+            &transformed[0],
+            Message::User(UserMessage {
+                content: MessageContent::Blocks(blocks),
+                ..
+            }) if blocks.len() == 1
+                && matches!(
+                    &blocks[0],
+                    UserContentBlock::Text(TextContent { text, .. })
+                        if text == "(image omitted: model does not support images)"
+                )
+        ));
+        assert!(matches!(
+            &transformed[1],
+            Message::Assistant(AssistantMessage { content, .. })
+                if matches!(
+                    content.as_slice(),
+                    [
+                        AssistantContent::Text(TextContent { text, .. }),
+                        AssistantContent::ToolCall(ToolCall { id, thought_signature, .. }),
+                    ] if text == "private plan"
+                        && id == "call_unsafe_id"
+                        && thought_signature.is_none()
+                )
+        ));
+        assert!(matches!(
+            &transformed[2],
+            Message::ToolResult(result)
+                if result.tool_call_id == "call_unsafe_id"
+                    && result.tool_name == "lookup"
+                    && result.is_error
+                    && matches!(
+                        result.content.as_slice(),
+                        [ToolResultContent::Text(TextContent { text, .. })]
+                            if text == "No result provided"
+                    )
+        ));
     }
 }
+

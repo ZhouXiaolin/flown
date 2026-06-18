@@ -6,8 +6,8 @@ mod write;
 
 use std::sync::Arc;
 
-use flown_agent::harness::env::types::ExecutionEnv;
-use flown_agent::types::AgentTool;
+use flown_agent::ExecutionEnv;
+use flown_agent::AgentTool;
 
 pub fn built_in_coding_tools(env: Arc<dyn ExecutionEnv>) -> Vec<AgentTool> {
     vec![
@@ -17,4 +17,3 @@ pub fn built_in_coding_tools(env: Arc<dyn ExecutionEnv>) -> Vec<AgentTool> {
         write::tool(env),
     ]
 }
-

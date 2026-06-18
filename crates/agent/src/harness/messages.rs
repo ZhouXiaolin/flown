@@ -1,5 +1,8 @@
 use crate::types::AgentMessage;
-use flown_ai::types::*;
+use flown_ai::{
+    ImageContent, Message, MessageContent, TextContent, ToolCall, ToolResultContent,
+    UserContentBlock, UserMessage,
+};
 
 /// Bash execution message
 #[derive(Debug, Clone, Serialize, Deserialize)]

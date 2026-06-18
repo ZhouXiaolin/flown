@@ -8,7 +8,7 @@ use crate::config::Config;
 // with `/help` without a circular import (slash_commands is the command-
 // metadata owner; editor re-uses its types). `static_command_entries` and
 // `SLASH_COMMANDS` are pulled in only by tests, so they're imported there.
-use crate::tui::slash_commands::{list_installed_skills, CommandEntry};
+use crate::tui::slash_commands::{CommandEntry, list_installed_skills};
 
 /// One selectable entry in the top-level (`/`) completion popup.
 ///
@@ -75,7 +75,16 @@ pub fn handle_key(
     key: KeyEvent,
     config: &Config,
     commands: &[CommandEntry],
+    slash_commands_enabled: bool,
 ) -> EditorAction {
+    if !slash_commands_enabled {
+        *slash_popup = None;
+        return match input.handle_key(key, TextAreaSubmitMode::SubmitOnEnter) {
+            TextAreaAction::Submit => EditorAction::Submit,
+            TextAreaAction::None => EditorAction::None,
+        };
+    }
+
     if slash_popup.is_some() {
         return handle_slash_popup_key(input, slash_popup, key, config, commands);
     }
@@ -112,7 +121,10 @@ pub fn completion_items(popup: Option<&SlashPopup>) -> Vec<CompletionItem> {
                 };
                 let cmd = &popup.commands[*cmd_idx];
                 let sub = &cmd.subcommands[*sub_idx];
-                CompletionItem::new(format!("{} {}", cmd.name, sub.name), sub.description.clone())
+                CompletionItem::new(
+                    format!("{} {}", cmd.name, sub.name),
+                    sub.description.clone(),
+                )
             }
             // Top-level popup: items are either commands or skills.
             PopupKind::Command => match item {
@@ -281,7 +293,7 @@ fn handle_slash_popup_key(
         }
         _ => {
             *slash_popup = None;
-            handle_key(input, slash_popup, key, config, commands)
+            handle_key(input, slash_popup, key, config, commands, true)
         }
     }
 }
@@ -355,7 +367,7 @@ fn is_newline_modifier(modifiers: KeyModifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::slash_commands::{static_command_entries, SubcommandEntry, SLASH_COMMANDS};
+    use crate::tui::slash_commands::{SLASH_COMMANDS, SubcommandEntry, static_command_entries};
 
     /// A `Config` whose `skills_dir` points to a nonexistent path, so the skill
     /// scan returns empty and tests that don't care about skills aren't
@@ -405,6 +417,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         handle_key(
             &mut input,
@@ -412,6 +425,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         assert_eq!(input.text(), "hi");
         assert_eq!(
@@ -421,6 +435,7 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 &cfg,
                 &commands,
+                true,
             ),
             EditorAction::Submit
         );
@@ -438,6 +453,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         assert!(popup.is_some());
         let len = popup.as_ref().unwrap().items.len();
@@ -448,8 +464,29 @@ mod tests {
             KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         assert_eq!(popup.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn slash_disabled_treats_slash_as_plain_input() {
+        let cfg = empty_config();
+        let commands = test_commands();
+        let mut input = TextAreaState::default();
+        let mut popup = None;
+
+        handle_key(
+            &mut input,
+            &mut popup,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &cfg,
+            &commands,
+            false,
+        );
+
+        assert_eq!(input.text(), "/");
+        assert!(popup.is_none());
     }
 
     #[test]
@@ -464,6 +501,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         handle_key(
             &mut input,
@@ -471,6 +509,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         assert!(input.text().ends_with(' '));
         assert!(input.text().starts_with('/'));
@@ -491,6 +530,7 @@ mod tests {
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
 
         assert_eq!(input.text(), "/mcp ");
@@ -514,6 +554,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
 
         assert_eq!(action, EditorAction::None);
@@ -536,6 +577,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
             &cfg,
             &commands,
+            true,
         );
         assert!(popup.is_some());
         handle_key(
@@ -544,6 +586,7 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
             &cfg,
             &commands,
+            true,
         );
         assert_eq!(input.lines.len(), 2);
         assert_eq!(input.cursor_row, 1);
@@ -564,7 +607,12 @@ mod tests {
         let popup = popup.expect("bare / should open the command popup");
         assert!(matches!(popup.kind, PopupKind::Command));
         // All entries are commands (no skills installed).
-        assert!(popup.items.iter().all(|i| matches!(i, PopupItem::Command(_))));
+        assert!(
+            popup
+                .items
+                .iter()
+                .all(|i| matches!(i, PopupItem::Command(_)))
+        );
         assert!(popup.items.len() > 1);
     }
 

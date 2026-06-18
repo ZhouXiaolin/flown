@@ -72,7 +72,9 @@ pub async fn build_system_prompt(options: BuildSystemPromptOptions) -> String {
         append_project_context(&mut prompt, &options.context_files);
 
         if !skills.is_empty() {
-            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(skills));
+            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(
+                skills,
+            ));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);
@@ -95,7 +97,9 @@ Project context may provide additional instructions below.",
         append_project_context(&mut prompt, &options.context_files);
 
         if !skills.is_empty() {
-            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(skills));
+            prompt.push_str(&crate::core::skills::format_skills_for_system_prompt(
+                skills,
+            ));
         }
 
         append_date_and_cwd(&mut prompt, &date, &prompt_cwd);
@@ -240,7 +244,10 @@ fn normalize_default_prompt_snippets(snippets: Vec<ToolPromptSnippet>) -> Vec<To
     let mut merged = default_tool_snippets();
 
     for snippet in snippets {
-        if let Some(existing) = merged.iter_mut().find(|existing| existing.name == snippet.name) {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.name == snippet.name)
+        {
             *existing = snippet;
         } else {
             merged.push(snippet);

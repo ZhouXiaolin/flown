@@ -18,16 +18,32 @@ use crate::tui::state::{BUSY_FRAMES, StatusInfo};
 #[component]
 pub fn StatusLine() -> Node {
     let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
-    let state = Rc::clone(&stack.active().state);
-    let status = state.status;
+    let active_index = stack.active_index_signal();
 
     let node = Node::new_richtext();
     let seed = node.clone();
     create_effect(move || {
-        // Read the snapshot inside the effect so it re-runs on any status
-        // change (busy, frame, model, context %, …). `with` borrows without
-        // cloning the whole struct.
-        let line = status.with(|s| build_line(s, 0));
+        // Track layer switches: re-read the active layer's status signal so an
+        // overlap push / Ctrl+C pop re-renders this bar from the new layer.
+        active_index.get();
+        let active = stack.active();
+        let status = Rc::clone(&active.state).status;
+        let badge = stack.active_overlap_badge();
+        let state_busy = active.state.busy.get();
+        let line = status.with(|s| {
+            if badge.is_some() || s.busy || state_busy {
+                tracing::info!(
+                    target: "flown::statusline",
+                    layer = ?active.kind,
+                    badge = badge.as_deref().unwrap_or(""),
+                    state_busy,
+                    status_busy = s.busy,
+                    frame = s.frame,
+                    "statusline render"
+                );
+            }
+            build_line(s, 0, badge.as_deref())
+        });
         seed.set_lines(vec![line]);
     });
     node
@@ -36,7 +52,7 @@ pub fn StatusLine() -> Node {
 /// Build the status line as a single `Line`. `width` is the available columns
 /// (0 = unknown; the fill rule is skipped when width is 0, since iodilos lays
 /// out via flexbox rather than a fixed terminal width here).
-fn build_line(status: &StatusInfo, width: usize) -> Line<'static> {
+fn build_line(status: &StatusInfo, width: usize, badge: Option<&str>) -> Line<'static> {
     let mut spans = Vec::new();
 
     // Separator style: " · " (dot separator like oh-my-pi)
@@ -148,6 +164,16 @@ fn build_line(status: &StatusInfo, width: usize) -> Line<'static> {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::ITALIC),
+        ));
+    }
+
+    if let Some(badge) = badge {
+        spans.push(Span::styled(
+            format!(" {} ", badge),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 

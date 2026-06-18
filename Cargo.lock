@@ -895,6 +895,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "once_cell",
+ "regex",
  "reqwest 0.13.4",
  "reqwest-eventsource",
  "schemars",

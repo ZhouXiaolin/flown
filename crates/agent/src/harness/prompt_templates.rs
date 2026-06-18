@@ -1,4 +1,4 @@
-use crate::harness::env::types::{FileError, FileErrorCode, FileInfo, FileKind, FileSystem};
+use crate::harness::{FileError, FileErrorCode, FileInfo, FileKind, FileSystem};
 use serde::{Deserialize, Serialize};
 
 /// Prompt template definition

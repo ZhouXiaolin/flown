@@ -72,6 +72,7 @@ impl AssistantMessageEventStream {
     /// boxed [`Stream`] of [`AssistantMessageEvent`]s (e.g. flown-agent's
     /// proxy/harness stream functions). Equivalent to pi-ai's
     /// `AssistantMessageEventStream` constructed from a raw event stream.
+    #[doc(hidden)]
     pub fn from_stream(raw: RawEventStream) -> Self {
         Self {
             source: EventStreamSource::Raw(raw),
@@ -283,12 +284,25 @@ struct RegisteredProvider {
 }
 
 static API_PROVIDER_REGISTRY: RwLock<Option<HashMap<Api, RegisteredProvider>>> = RwLock::new(None);
-
 /// Initialize the registry if needed
 fn ensure_registry() {
     let mut registry = API_PROVIDER_REGISTRY.write().unwrap();
     if registry.is_none() {
         *registry = Some(HashMap::new());
+    }
+}
+
+/// Mirror pi-ai's side-effect import of `providers/register-builtins.ts`.
+///
+/// Rust has no module-load hook, so we lazily bootstrap built-ins on the first
+/// public registry access only when the registry has never been initialized.
+/// `clear_api_providers()` intentionally leaves the registry initialized but
+/// empty, so later reads do not auto-reinstall built-ins — matching pi-ai
+/// after `clearApiProviders()`.
+fn ensure_built_in_providers_bootstrapped() {
+    let needs_bootstrap = API_PROVIDER_REGISTRY.read().unwrap().is_none();
+    if needs_bootstrap {
+        register_built_in_api_providers();
     }
 }
 
@@ -299,7 +313,7 @@ pub fn register_api_provider(provider: Arc<dyn ApiProvider>) {
 
 /// Register an API provider tagged with an optional `source_id` so it can
 /// later be removed via [`unregister_api_providers`].
-pub fn register_api_provider_with_source(
+pub(crate) fn register_api_provider_with_source(
     provider: Arc<dyn ApiProvider>,
     source_id: Option<String>,
 ) {
@@ -318,6 +332,7 @@ pub fn register_api_provider_with_source(
 
 /// Get an API provider by API type
 pub fn get_api_provider(api: &Api) -> Option<Arc<dyn ApiProvider>> {
+    ensure_built_in_providers_bootstrapped();
     ensure_registry();
     let registry = API_PROVIDER_REGISTRY.read().unwrap();
     registry
@@ -327,6 +342,7 @@ pub fn get_api_provider(api: &Api) -> Option<Arc<dyn ApiProvider>> {
 
 /// Get all registered API providers
 pub fn get_api_providers() -> Vec<Arc<dyn ApiProvider>> {
+    ensure_built_in_providers_bootstrapped();
     ensure_registry();
     let registry = API_PROVIDER_REGISTRY.read().unwrap();
     registry
@@ -348,18 +364,18 @@ pub fn unregister_api_providers(source_id: &str) {
 /// Clear all registered providers
 pub fn clear_api_providers() {
     let mut registry = API_PROVIDER_REGISTRY.write().unwrap();
-    *registry = None;
+    *registry = Some(HashMap::new());
 }
 
 /// Register every built-in API provider, mirroring pi-ai's
 /// `registerBuiltInApiProviders()` (`providers/register-builtins.ts:345`).
 ///
 /// Unlike the TS package (which auto-registers via a side-effect import at
-/// module load), Rust requires the embedder to call this explicitly — there is
-/// no top-level side-effect hook.
+/// module load), Rust bootstraps the built-ins lazily on first registry
+/// access. Callers can still invoke this directly after
+/// [`clear_api_providers`] to restore the default registry.
 pub fn register_built_in_api_providers() {
-    crate::providers::anthropic::register_anthropic_provider();
-    crate::providers::openai_completions::register_openai_completions_provider();
+    crate::providers::register_built_in_api_providers();
 }
 
 /// Clear the registry and re-register the built-in providers, mirroring
@@ -367,6 +383,14 @@ pub fn register_built_in_api_providers() {
 pub fn reset_api_providers() {
     clear_api_providers();
     register_built_in_api_providers();
+}
+
+/// Test-only helper that returns the registry to the uninitialized state so
+/// the next public access lazily bootstraps built-ins again.
+#[cfg(test)]
+pub fn reset_api_providers_to_uninitialized() {
+    let mut registry = API_PROVIDER_REGISTRY.write().unwrap();
+    *registry = None;
 }
 
 /// Inject the provider's environment-variable API key into `options` when the
@@ -406,6 +430,13 @@ pub fn stream(
     let provider = get_api_provider(&model.api).ok_or_else(|| AiError::MissingProvider {
         api: model.api.clone(),
     })?;
+    let expected_api = provider.api();
+    if model.api != expected_api {
+        return Err(AiError::MismatchedApi {
+            actual: model.api.clone(),
+            expected: expected_api,
+        });
+    }
     let merged = with_env_api_key(model, options);
     Ok(provider.stream(model, context, merged.as_ref()))
 }
@@ -421,6 +452,13 @@ pub fn stream_simple(
     let provider = get_api_provider(&model.api).ok_or_else(|| AiError::MissingProvider {
         api: model.api.clone(),
     })?;
+    let expected_api = provider.api();
+    if model.api != expected_api {
+        return Err(AiError::MismatchedApi {
+            actual: model.api.clone(),
+            expected: expected_api,
+        });
+    }
     let mut merged = options.cloned().unwrap_or_default();
     merged.base = with_env_api_key(model, Some(&merged.base)).unwrap_or_default();
     Ok(provider.stream_simple(model, context, Some(&merged)))
@@ -446,4 +484,30 @@ pub async fn complete(
     options: Option<&StreamOptions>,
 ) -> Result<AssistantMessage> {
     Ok(stream(model, context, options)?.result().await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::get_model;
+
+    #[test]
+    fn builtins_are_available_without_manual_registration_from_uninitialized_registry() {
+        let mut registry = API_PROVIDER_REGISTRY.write().unwrap();
+        *registry = None;
+        drop(registry);
+
+        let model = get_model("deepseek", "deepseek-v4-flash").expect("model");
+        let context = crate::types::Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        };
+
+        let stream_result = stream(&model, &context, None);
+        assert!(
+            stream_result.is_ok(),
+            "built-in providers should be lazily bootstrapped like pi-mono side-effect imports"
+        );
+    }
 }

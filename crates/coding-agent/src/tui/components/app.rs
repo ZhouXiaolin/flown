@@ -13,20 +13,19 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use iodilos::prelude::*;
 
+use crate::core::extensions::SlashCommandScope;
 use crate::tui::components::editor::InputEditor;
-use crate::tui::components::hint_bar::HintBar;
 use crate::tui::components::status_line::StatusLine;
 use crate::tui::components::transcript::Transcript;
 // The `view!` macro expands `Transcript()` into
 // `Transcript::new(TranscriptProps { … })`, so the generated prop structs must
 // be in scope at the call site.
 use crate::tui::components::editor::InputEditorProps;
-use crate::tui::components::hint_bar::HintBarProps;
 use crate::tui::components::status_line::StatusLineProps;
 use crate::tui::components::transcript::TranscriptProps;
 use crate::tui::editor::{self, EditorAction};
 use crate::tui::state::UiState;
-use flown_agent::harness::AgentHarness;
+use flown_agent::AgentHarness;
 
 #[component]
 pub fn App() -> Node {
@@ -53,18 +52,17 @@ pub fn App() -> Node {
             Transcript()
             StatusLine()
             InputEditor()
-            HintBar()
         }
     }
 }
 
 /// The global key router. Returns `true` if the key was consumed. Operates on
 /// the conversation stack's **active** layer, so all input/streaming targets
-/// whichever view is visible (main or btw).
+/// whichever view is visible.
 fn handle_app_key(
     key: KeyEvent,
     stack: &Rc<crate::tui::conversation::ConversationStack>,
-    agent: Option<&Arc<AgentHarness>>,
+    _agent: Option<&Arc<AgentHarness>>,
     config: &crate::config::Config,
 ) -> bool {
     let state = Rc::clone(&stack.active().state);
@@ -96,21 +94,25 @@ fn handle_app_key(
         iodilos::quit();
         return true;
     }
-    // Ctrl-C: in a btw layer with empty input, exit btw (discard). Otherwise
+    // Ctrl-C: with empty input, close a dismissible/pending overlap. Otherwise
     // clear non-empty input, or quit the app (main layer, empty input).
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         let has_input = state.input.with(|input| !input.is_empty());
+        let has_overlap = stack.overlap_is_active_or_pending();
+        tracing::info!(target: "flown::overlap", has_input, has_overlap, "Ctrl+C received");
         if has_input {
             state.input.update(|input| input.clear());
             state.slash_popup.set(None);
-        } else if stack.active_is_btw() {
-            // In a btw layer: Ctrl+C exits btw (discards it). CommandSide
-            // holds the bound RuntimeControl; expose exit through it.
+        } else if has_overlap {
+            // CommandSide holds the bound RuntimeControl; expose overlap close
+            // through it so App stays independent of extension-specific logic.
             let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
+            tracing::info!(target: "flown::overlap", has_side = command_side.is_some(), "Ctrl+C in overlap, dispatching close");
             if let Some(cs) = command_side.as_ref() {
-                cs.exit_active_btw();
+                cs.close_active_overlap();
             }
         } else {
+            tracing::info!(target: "flown::overlap", "Ctrl+C in main, quitting app");
             iodilos::quit();
         }
         return true;
@@ -125,32 +127,41 @@ fn handle_app_key(
     }
 
     // Route everything else to the editor glue.
-    // Build the merged command view for autocomplete: static commands first,
-    // then extension-registered commands (e.g. /mcp, /btw) appended in
-    // registration order. The popup captures a snapshot of this each time it
-    // opens.
+    // Build the merged command view for autocomplete when the active surface
+    // participates in global slash commands.
     let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
-    let mut commands = crate::tui::slash_commands::static_command_entries();
-    if let Some(cs) = command_side.as_ref() {
-        for cmd in cs.commands() {
-            commands.push(crate::tui::slash_commands::CommandEntry {
-                name: cmd.name.clone(),
-                description: cmd.meta.description.clone(),
-                subcommands: cmd
-                    .meta
-                    .subcommands
-                    .iter()
-                    .map(|s| crate::tui::slash_commands::SubcommandEntry {
-                        name: s.name.clone(),
-                        description: s.description.clone(),
-                    })
-                    .collect(),
-            });
+    let slash_commands_enabled = stack.active_slash_command_scope() == SlashCommandScope::Global;
+    let mut commands = Vec::new();
+    if slash_commands_enabled {
+        commands = crate::tui::slash_commands::static_command_entries();
+        if let Some(cs) = command_side.as_ref() {
+            for cmd in cs.commands() {
+                commands.push(crate::tui::slash_commands::CommandEntry {
+                    name: cmd.name.clone(),
+                    description: cmd.meta.description.clone(),
+                    subcommands: cmd
+                        .meta
+                        .subcommands
+                        .iter()
+                        .map(|s| crate::tui::slash_commands::SubcommandEntry {
+                            name: s.name.clone(),
+                            description: s.description.clone(),
+                        })
+                        .collect(),
+                });
+            }
         }
     }
     let mut input = state.input.get();
     let mut popup = state.slash_popup.get();
-    let action = editor::handle_key(&mut input, &mut popup, key, config, &commands);
+    let action = editor::handle_key(
+        &mut input,
+        &mut popup,
+        key,
+        config,
+        &commands,
+        slash_commands_enabled,
+    );
     state.input.set(input);
     state.slash_popup.set(popup);
 
@@ -164,7 +175,10 @@ fn handle_app_key(
             state.input.update(|input| input.clear());
             state.slash_popup.set(None);
 
-            if let Some(inv) = crate::tui::slash_commands::parse_skill_command(&text) {
+            let skill_invocation = slash_commands_enabled
+                .then(|| crate::tui::slash_commands::parse_skill_command(&text))
+                .flatten();
+            if let Some(inv) = skill_invocation {
                 // `/skill:<name> [<request>]` is a parameterized family handled
                 // up front: it needs the agent handle to trigger a turn, which
                 // the generic slash dispatcher lacks. The transcript shows the
@@ -175,16 +189,24 @@ fn handle_app_key(
                             return true;
                         }
                         state.push_user(&text);
-                        if let Some(agent) = agent {
-                            state.busy.set(true);
-                            state.status.update(|s| s.busy = true);
-                            let agent = Arc::clone(agent);
-                            let prompt = crate::tui::slash_commands::build_skill_prompt(&inv);
-                            tokio::spawn(async move {
-                                let _ = agent.prompt(&prompt, None).await;
-                            });
-                        } else {
-                            state.push_error("No LLM agent available. Check your config.");
+                        let prompt = crate::tui::slash_commands::build_skill_prompt(&inv);
+                        // Route through the MAIN layer's driver (skills run on
+                        // the main agent, not whatever overlap is active).
+                        let main_layer = stack.main_layer();
+                        match main_layer.submit_prompt(prompt) {
+                            crate::tui::conversation::SubmitOutcome::Queued => {
+                                state.busy.set(true);
+                                state.status.update(|s| s.busy = true);
+                            }
+                            crate::tui::conversation::SubmitOutcome::NoAgent => {
+                                state.push_error("No LLM agent available. Check your config.");
+                            }
+                            crate::tui::conversation::SubmitOutcome::DriverGone => {
+                                state.push_error("Layer driver exited. Cannot send prompt.");
+                            }
+                            crate::tui::conversation::SubmitOutcome::ChannelFull => {
+                                state.push_error("Layer driver busy (command queue full).");
+                            }
                         }
                     }
                     Err(available) => {
@@ -202,17 +224,14 @@ fn handle_app_key(
                         }
                     }
                 }
-            } else if text.starts_with('/') {
-                // Extension commands (e.g. /mcp, /btw) get first crack at
-                // dispatch. CommandSide routes control commands (/btw) to the
-                // bound RuntimeControl and effect commands (/mcp) to their
-                // handler. If it claims the line, skip the static path.
-                let command_side =
-                    use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
-                if let Some(cs) = command_side.as_ref() {
-                    if cs.dispatch(&text) {
-                        return true;
-                    }
+            } else if slash_commands_enabled && text.starts_with('/') {
+                // Extension commands get first crack at dispatch. CommandSide
+                // routes control commands to the bound RuntimeControl and
+                // effect commands to their handler.
+                if let Some(cs) = command_side.as_ref()
+                    && cs.dispatch(&text)
+                {
+                    return true;
                 }
                 let mut handle: Rc<UiState> = Rc::clone(&state);
                 let should_quit = crate::tui::slash_commands::handle_slash_command(
@@ -232,25 +251,32 @@ fn handle_app_key(
                     return true;
                 }
                 state.push_user(&text);
-                // Use the ACTIVE layer's harness (may differ from the main
-                // agent handle when in a btw layer). Fall back to the main
-                // agent only when the active layer has no harness.
+                // Submit through the ACTIVE layer's driver command channel.
+                // The driver (a per-layer tokio task) awaits prompt() inline —
+                // no per-prompt tokio::spawn. try_send is non-blocking, so this
+                // is safe to call from the iodilos on_key thread.
                 let active_layer = stack.active();
-                let target = active_layer.harness.as_ref().or(agent);
-                if let Some(agent) = target {
-                    state.busy.set(true);
-                    state.status.update(|s| s.busy = true);
-                    let agent = Arc::clone(agent);
-                    let prompt = text;
-                    // Spawn the harness driver on tokio. We're on the iodilos
-                    // thread; tokio::spawn hands the future to the runtime.
-                    // Events arrive via the subscriber registered for this
-                    // layer (runtime.rs for main; enter_btw for btw).
-                    tokio::spawn(async move {
-                        let _ = agent.prompt(&prompt, None).await;
-                    });
-                } else {
-                    state.push_error("No LLM agent available. Check your config.");
+                let active_kind = active_layer.kind;
+                tracing::info!(
+                    target: "flown::prompt",
+                    layer = ?active_kind,
+                    text_len = text.len(),
+                    "ui prompt submitted"
+                );
+                match active_layer.submit_prompt(text) {
+                    crate::tui::conversation::SubmitOutcome::Queued => {
+                        state.busy.set(true);
+                        state.status.update(|s| s.busy = true);
+                    }
+                    crate::tui::conversation::SubmitOutcome::NoAgent => {
+                        state.push_error("No LLM agent available. Check your config.");
+                    }
+                    crate::tui::conversation::SubmitOutcome::DriverGone => {
+                        state.push_error("Layer driver exited. Cannot send prompt.");
+                    }
+                    crate::tui::conversation::SubmitOutcome::ChannelFull => {
+                        state.push_error("Layer driver busy (command queue full).");
+                    }
                 }
             }
             true

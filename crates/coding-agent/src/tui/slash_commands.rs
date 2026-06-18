@@ -395,6 +395,9 @@ mod tests {
             skill_name: "docx".into(),
             request: Some("怎么改首页".into()),
         };
-        assert_eq!(build_skill_prompt(&inv), "use skill:docx and 考虑 怎么改首页");
+        assert_eq!(
+            build_skill_prompt(&inv),
+            "use skill:docx and 考虑 怎么改首页"
+        );
     }
 }

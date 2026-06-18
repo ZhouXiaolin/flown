@@ -1,5 +1,5 @@
-use super::types::*;
 use super::jsonl_storage::SessionError;
+use super::types::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -112,7 +112,8 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     fn create_entry_id(&self) -> String {
-        generate_entry_id()
+        let by_id = self.by_id.read();
+        generate_entry_id_with_check(|id| by_id.contains_key(id))
     }
 
     async fn append_entry(&self, entry: SessionTreeEntry) {
@@ -140,8 +141,12 @@ impl SessionStorage for InMemorySessionStorage {
         let by_id = self.by_id.read();
         let mut path = Vec::new();
         let mut current_id = leaf_id.map(|s| s.to_string());
+        let mut seen = std::collections::HashSet::new();
 
         while let Some(id) = current_id {
+            if !seen.insert(id.clone()) {
+                break;
+            }
             if let Some(entry) = by_id.get(&id) {
                 current_id = entry.parent_id().map(|s| s.to_string());
                 path.push(entry.clone());
@@ -159,19 +164,12 @@ impl SessionStorage for InMemorySessionStorage {
     }
 }
 
-/// Generate a short entry ID (8 chars from UUIDv7), with collision detection.
-/// Tries up to 100 times with 8-char prefix; falls back to full UUID.
-/// Aligned with pi-mono `generateEntryId(byId)`.
-pub fn generate_entry_id() -> String {
-    generate_entry_id_with_check(|_| false)
-}
-
-/// Generate entry ID with an external collision check.
+/// Generate a UUIDv7 entry ID with collision checking.
 pub fn generate_entry_id_with_check(exists: impl Fn(&str) -> bool) -> String {
     for _ in 0..100 {
-        let id = &uuid::Uuid::now_v7().to_string()[..8];
-        if !exists(id) {
-            return id.to_string();
+        let id = uuid::Uuid::now_v7().to_string();
+        if !exists(&id) {
+            return id;
         }
     }
     uuid::Uuid::now_v7().to_string()

@@ -28,6 +28,7 @@ schemars = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 async-stream = { workspace = true }
+regex = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }

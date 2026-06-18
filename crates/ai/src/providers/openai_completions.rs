@@ -1,4 +1,4 @@
-use crate::api_registry::{ApiProvider, RawEventStream};
+use crate::api_registry::{ApiProvider, AssistantMessageEventStream, RawEventStream};
 use crate::models::{calculate_cost, clamp_thinking_level, transform_messages};
 use crate::providers::common::{
     build_copilot_dynamic_headers, is_cloudflare_ai_gateway, is_cloudflare_provider,
@@ -15,6 +15,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DEFAULT_MAX_RETRY_DELAY_MS: u64 = 60_000;
+
+/// Public OpenAI-compatible chat-completions provider options, mirroring
+/// pi-mono's `OpenAICompletionsOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAICompletionsOptions {
+    pub base: StreamOptions,
+    pub tool_choice: Option<OpenAICompletionsToolChoice>,
+    pub reasoning_effort: Option<ThinkingLevel>,
+}
+
+/// Tool-choice override for OpenAI-compatible chat completions.
+#[derive(Debug, Clone)]
+pub enum OpenAICompletionsToolChoice {
+    Auto,
+    None,
+    Required,
+    Function { name: String },
+}
 
 #[derive(Debug, Clone)]
 struct OpenAiCompletionsCompat {
@@ -189,16 +207,15 @@ impl OpenAiCompletionsCompat {
     }
 }
 
-/// OpenAI-compatible chat completions provider
-pub struct OpenAiCompletionsProvider {
-    client: Client,
-}
+/// Function style OpenAI-compatible chat completions provider. Mirrors
+/// pi-ai's `streamOpenAICompletions` / `streamSimpleOpenAICompletions`: a unit
+/// struct implementing [`ApiProvider`] for registry dispatch. Not exported —
+/// embedders register the built-in via [`crate::register_built_in_api_providers`].
+struct OpenAiCompletionsApiProvider;
 
-impl OpenAiCompletionsProvider {
-    pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+impl OpenAiCompletionsApiProvider {
+    fn client() -> Client {
+        Client::new()
     }
 
     fn build_request_body(
@@ -853,6 +870,7 @@ impl OpenAiCompletionsStreamParser {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                diagnostics: None,
                 timestamp: chrono::Utc::now(),
             },
             has_finish_reason: false,
@@ -991,6 +1009,7 @@ impl OpenAiCompletionsStreamParser {
             output,
             cache_read,
             cache_write,
+            cache_write_1h: None,
             total_tokens: input + output + cache_read + cache_write,
             cost: Cost::default(),
         };
@@ -1548,7 +1567,21 @@ fn stream_openai_completions(
         let event_stream = response.bytes_stream().eventsource();
         futures::pin_mut!(event_stream);
 
+        // Per-chunk idle timeout: if the SSE stream produces no event for this
+        // long, treat the connection as silently hung (provider sent partial
+        // output then neither sent more data nor closed). A *total* timeout
+        // (request.timeout) would wrongly kill long-but-active responses; this
+        // only fires when the stream truly stalls, yielding an Error so the turn
+        // unwinds instead of wedging prompt().await forever.
+        const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
         loop {
+            // Get the next SSE event, racing it against abort (when a signal is
+            // registered) and against the idle timeout (always). The timeout
+            // only fires when the stream truly stalls, yielding an Error so the
+            // turn unwinds instead of wedging prompt().await forever.
+            let idle = futures_timer::Delay::new(SSE_IDLE_TIMEOUT);
+            futures::pin_mut!(idle);
             let event = if let Some(signal) = signal.clone() {
                 futures::pin_mut!(signal);
                 futures::select! {
@@ -1560,9 +1593,37 @@ fn stream_openai_completions(
                         return;
                     }
                     event = event_stream.next().fuse() => event,
+                    _ = (&mut idle).fuse() => {
+                        yield AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: AssistantMessage {
+                                error_message: Some(
+                                    "stream idle timeout (no data for 60s)".into(),
+                                ),
+                                stop_reason: StopReason::Error,
+                                ..parser.partial()
+                            },
+                        };
+                        return;
+                    }
                 }
             } else {
-                event_stream.next().await
+                futures::select! {
+                    event = event_stream.next().fuse() => event,
+                    _ = (&mut idle).fuse() => {
+                        yield AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: AssistantMessage {
+                                error_message: Some(
+                                    "stream idle timeout (no data for 60s)".into(),
+                                ),
+                                stop_reason: StopReason::Error,
+                                ..parser.partial()
+                            },
+                        };
+                        return;
+                    }
+                }
             };
 
             let Some(event) = event else {
@@ -1603,7 +1664,7 @@ fn stream_openai_completions(
     })
 }
 
-impl ApiProvider for OpenAiCompletionsProvider {
+impl ApiProvider for OpenAiCompletionsApiProvider {
     fn api(&self) -> Api {
         Api::Known(KnownApi::OpenAiCompletions)
     }
@@ -1613,15 +1674,16 @@ impl ApiProvider for OpenAiCompletionsProvider {
         model: &Model,
         context: &crate::types::Context,
         options: Option<&StreamOptions>,
-    ) -> RawEventStream {
-        let client = self.client.clone();
+    ) -> AssistantMessageEventStream {
+        let client = Self::client();
         let model = model.clone();
         let context = context.clone();
         let options = options.cloned();
         let body = self.build_request_body(&model, &context, options.as_ref());
         let messages = context.messages.clone();
 
-        stream_openai_completions(client, model, options, body, messages)
+        let raw = stream_openai_completions(client, model, options, body, messages);
+        AssistantMessageEventStream::from_raw(raw)
     }
 
     fn stream_simple(
@@ -1629,8 +1691,8 @@ impl ApiProvider for OpenAiCompletionsProvider {
         model: &Model,
         context: &crate::types::Context,
         options: Option<&SimpleStreamOptions>,
-    ) -> RawEventStream {
-        let client = self.client.clone();
+    ) -> AssistantMessageEventStream {
+        let client = Self::client();
         let model = model.clone();
         let mut options = options.cloned();
         if let Some(options) = options.as_mut() {
@@ -1641,20 +1703,36 @@ impl ApiProvider for OpenAiCompletionsProvider {
         let body = self.build_simple_request_body(&model, context, options.as_ref());
         let messages = context.messages.clone();
 
-        stream_openai_completions(
+        let raw = stream_openai_completions(
             client,
             model,
             options.map(|options| options.base),
             body,
             messages,
-        )
+        );
+        AssistantMessageEventStream::from_raw(raw)
     }
 }
 
+pub fn stream_openai_completions_public(
+    model: &Model,
+    context: &crate::types::Context,
+    options: Option<&StreamOptions>,
+) -> AssistantMessageEventStream {
+    OpenAiCompletionsApiProvider.stream(model, context, options)
+}
+
+pub fn stream_simple_openai_completions(
+    model: &Model,
+    context: &crate::types::Context,
+    options: Option<&SimpleStreamOptions>,
+) -> AssistantMessageEventStream {
+    OpenAiCompletionsApiProvider.stream_simple(model, context, options)
+}
+
 /// Register the openai-completions provider
-pub fn register_openai_completions_provider() {
-    let provider = Arc::new(OpenAiCompletionsProvider::new());
-    crate::api_registry::register_api_provider(provider);
+pub(crate) fn register_openai_completions_provider() {
+    crate::api_registry::register_api_provider(Arc::new(OpenAiCompletionsApiProvider));
 }
 
 #[cfg(test)]
@@ -1729,6 +1807,8 @@ mod tests {
                 supports_eager_tool_input_streaming: None,
                 supports_cache_control_on_tools: None,
                 force_adaptive_thinking: None,
+                supports_temperature: None,
+                allow_empty_signature: None,
             }),
         }
     }
@@ -1759,7 +1839,7 @@ mod tests {
 
     #[test]
     fn openai_completions_builds_deepseek_simple_params_like_pi_ai() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut options = SimpleStreamOptions::default();
         options.base.max_tokens = Some(1024);
         options.base.temperature = Some(0.2);
@@ -1783,7 +1863,7 @@ mod tests {
 
     #[test]
     fn openai_completions_disables_deepseek_thinking_when_reasoning_is_absent() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
 
         let body = provider.build_simple_request_body(&test_model(), &test_context(), None);
 
@@ -1792,7 +1872,7 @@ mod tests {
 
     #[test]
     fn openai_completions_converts_tools_and_tool_history_like_pi_ai() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut context = test_context();
         context.tools = Some(vec![Tool {
             name: "lookup".to_string(),
@@ -1838,6 +1918,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
                 error_message: None,
+                diagnostics: None,
                 timestamp: chrono::Utc::now(),
             }));
 
@@ -1847,7 +1928,7 @@ mod tests {
 
     #[test]
     fn openai_completions_converts_tool_results_with_names_images_and_bridges() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.input.push("image".to_string());
         if let Some(compat) = model.compat.as_mut() {
@@ -1874,6 +1955,7 @@ mod tests {
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
                     error_message: None,
+                    diagnostics: None,
                     timestamp: chrono::Utc::now(),
                 }),
                 Message::ToolResult(ToolResultMessage {
@@ -1962,7 +2044,7 @@ mod tests {
 
     #[test]
     fn openai_completions_skips_empty_assistant_and_round_trips_reasoning_details() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let context = Context {
             system_prompt: None,
             messages: vec![
@@ -1977,6 +2059,7 @@ mod tests {
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
                     error_message: None,
+                    diagnostics: None,
                     timestamp: chrono::Utc::now(),
                 }),
                 Message::Assistant(AssistantMessage {
@@ -1999,6 +2082,7 @@ mod tests {
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
                     error_message: None,
+                    diagnostics: None,
                     timestamp: chrono::Utc::now(),
                 }),
                 Message::ToolResult(ToolResultMessage {
@@ -2127,7 +2211,7 @@ mod tests {
 
     #[test]
     fn openai_completions_uses_pi_cache_retention_env_default() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.provider = Provider::Known(KnownProvider::OpenAi);
         model.base_url = "https://api.openai.com/v1".to_string();
@@ -2156,7 +2240,7 @@ mod tests {
 
     #[test]
     fn openai_completions_sets_prompt_cache_key_for_openai_short_retention() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.provider = Provider::Known(KnownProvider::OpenAi);
         model.base_url = "https://api.openai.com/v1".to_string();
@@ -2395,7 +2479,7 @@ mod tests {
 
     #[tokio::test]
     async fn deepseek_stream_returns_aborted_when_signal_is_cancelled_before_request() {
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let signal = AbortSignal::new();
         signal.cancel();
 
@@ -2444,7 +2528,7 @@ mod tests {
 
         let captured = Arc::new(Mutex::new(None::<ProviderResponse>));
         let captured_for_hook = captured.clone();
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.base_url = format!("http://{}", addr);
 
@@ -2493,7 +2577,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.base_url = format!("http://{}", addr);
         let mut stream = provider.stream(&model, &test_context(), None);
@@ -2554,7 +2638,7 @@ mod tests {
             }
         });
 
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.base_url = format!("http://{}", addr);
         let mut stream = provider.stream(
@@ -2616,7 +2700,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.provider = Provider::Known(KnownProvider::CloudflareAiGateway);
         model.base_url = format!(
@@ -2687,7 +2771,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let provider = OpenAiCompletionsProvider::new();
+        let provider = OpenAiCompletionsApiProvider;
         let mut model = test_model();
         model.provider = Provider::Known(KnownProvider::GithubCopilot);
         model.base_url = format!("http://{}", addr);
@@ -2720,6 +2804,7 @@ mod tests {
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
                     error_message: None,
+                    diagnostics: None,
                     timestamp: chrono::Utc::now(),
                 }),
             ],

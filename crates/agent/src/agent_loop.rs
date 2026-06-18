@@ -1,5 +1,9 @@
 use crate::types::*;
-use flown_ai::types::*;
+use flown_ai::{
+    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, Model,
+    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingLevel, Tool, ToolCall,
+    ToolResultContent, ToolResultMessage, Usage, validate_tool_arguments,
+};
 use futures::{
     Future, FutureExt,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -399,7 +403,9 @@ async fn stream_assistant_response(
 
     let llm_tools: Vec<Tool> = context
         .tools
-        .iter()
+        .as_ref()
+        .into_iter()
+        .flatten()
         .map(|t| Tool {
             name: t.name.clone(),
             description: t.description.clone(),
@@ -414,7 +420,7 @@ async fn stream_assistant_response(
     let llm_context = Context {
         system_prompt: Some(context.system_prompt.clone()),
         messages: llm_messages,
-        tools: Some(llm_tools),
+        tools: (!llm_tools.is_empty()).then_some(llm_tools),
     };
 
     // Get API key if available
@@ -684,7 +690,11 @@ async fn prepare_tool_call(
     config: &AgentLoopConfig,
     signal: Option<AbortSignal>,
 ) -> PreparedToolCall {
-    let Some(tool) = context.tools.iter().find(|t| t.name == tool_call.name) else {
+    let Some(tool) = context
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.iter().find(|t| t.name == tool_call.name))
+    else {
         return PreparedToolCall::Immediate(FinalizedToolCall {
             tool_call: tool_call.clone(),
             result: create_named_error_tool_result(&tool_call.name, "not found"),
@@ -854,8 +864,8 @@ async fn execute_tool_calls(
     let has_sequential = tool_calls.iter().any(|tc| {
         context
             .tools
-            .iter()
-            .find(|t| t.name == tc.name)
+            .as_ref()
+            .and_then(|tools| tools.iter().find(|t| t.name == tc.name))
             .and_then(|t| t.execution_mode.as_ref())
             .map(|m| *m == ToolExecutionMode::Sequential)
             .unwrap_or(false)

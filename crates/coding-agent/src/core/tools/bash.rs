@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use flown_agent::harness::env::types::{ExecOptions, ExecutionEnv, ExecutionErrorCode};
-use flown_agent::types::{AgentTool, AgentToolError, ToolExecutionMode};
+use flown_agent::{ExecOptions, ExecutionEnv, ExecutionErrorCode};
+use flown_agent::{AgentTool, AgentToolError, ToolExecutionMode};
 use serde_json::{Value, json};
 
 use super::common::*;

@@ -1,4 +1,4 @@
-use crate::api_registry::{ApiProvider, RawEventStream};
+use crate::api_registry::{ApiProvider, AssistantMessageEventStream, RawEventStream};
 use crate::models::{calculate_cost, clamp_thinking_level, transform_messages};
 use crate::providers::common::{
     build_copilot_dynamic_headers, is_cloudflare_ai_gateway,
@@ -26,6 +26,8 @@ struct AnthropicCompat {
     send_session_affinity_headers: bool,
     supports_cache_control_on_tools: bool,
     force_adaptive_thinking: bool,
+    supports_temperature: bool,
+    allow_empty_signature: bool,
 }
 
 impl AnthropicCompat {
@@ -52,19 +54,72 @@ impl AnthropicCompat {
             force_adaptive_thinking: compat
                 .and_then(|compat| compat.force_adaptive_thinking)
                 .unwrap_or(false),
+            supports_temperature: compat
+                .and_then(|compat| compat.supports_temperature)
+                .unwrap_or(true),
+            allow_empty_signature: compat
+                .and_then(|compat| compat.allow_empty_signature)
+                .unwrap_or(false),
         }
     }
 }
 
-pub struct AnthropicProvider {
-    client: Client,
+/// Effort level for adaptive-thinking Anthropic models, mirroring pi-ai's
+/// `AnthropicEffort` union. `"max"` forces unconstrained thinking (Opus 4.6
+/// only); the others map to Claude 4.7+ adaptive output_config.effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicEffort {
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    Max,
 }
 
-impl AnthropicProvider {
-    pub fn new() -> Self {
-        Self {
-            client: Client::new(),
-        }
+/// How thinking content is returned in Anthropic API responses, mirroring
+/// pi-ai's `AnthropicThinkingDisplay`. `"summarized"` yields readable
+/// thinking text; `"omitted"` returns empty thinking blocks with the
+/// signature only (faster time-to-first-text-token when the UI does not
+/// surface thinking).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+/// Public Anthropic provider options, mirroring pi-mono's `AnthropicOptions`.
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicOptions {
+    pub base: StreamOptions,
+    pub thinking_enabled: Option<bool>,
+    pub thinking_budget_tokens: Option<u32>,
+    pub effort: Option<AnthropicEffort>,
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
+    pub interleaved_thinking: Option<bool>,
+    pub tool_choice: Option<AnthropicToolChoice>,
+}
+
+/// Anthropic tool choice policy, mirroring pi-mono's public union type.
+#[derive(Debug, Clone)]
+pub enum AnthropicToolChoice {
+    Auto,
+    Any,
+    None,
+    Tool { name: String },
+}
+
+/// Function-style Anthropic provider. Mirrors pi-ai's `streamAnthropic` /
+/// `streamSimpleAnthropic`: a unit struct implementing [`ApiProvider`] so the
+/// registry can dispatch to it. Not exported — embedders register the
+/// built-in via [`crate::register_built_in_api_providers`].
+struct AnthropicApiProvider;
+
+impl AnthropicApiProvider {
+    fn client() -> Client {
+        Client::new()
     }
 
     fn build_request_body(
@@ -733,6 +788,7 @@ impl AnthropicStreamParser {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                diagnostics: None,
                 timestamp: chrono::Utc::now(),
             },
             is_oauth,
@@ -1471,7 +1527,7 @@ fn stream_anthropic(
     })
 }
 
-impl ApiProvider for AnthropicProvider {
+impl ApiProvider for AnthropicApiProvider {
     fn api(&self) -> Api {
         Api::Known(KnownApi::AnthropicMessages)
     }
@@ -1481,13 +1537,14 @@ impl ApiProvider for AnthropicProvider {
         model: &Model,
         context: &Context,
         options: Option<&StreamOptions>,
-    ) -> RawEventStream {
+    ) -> AssistantMessageEventStream {
         let model = model.clone();
         let tools = context.tools.clone().unwrap_or_default();
         let messages = context.messages.clone();
         let options = options.cloned();
         let body = self.build_request_body(&model, context, options.as_ref(), None);
-        stream_anthropic(self.client.clone(), model, options, body, tools, messages)
+        let raw = stream_anthropic(Self::client(), model, options, body, tools, messages);
+        AssistantMessageEventStream::from_raw(raw)
     }
 
     fn stream_simple(
@@ -1495,7 +1552,7 @@ impl ApiProvider for AnthropicProvider {
         model: &Model,
         context: &Context,
         options: Option<&SimpleStreamOptions>,
-    ) -> RawEventStream {
+    ) -> AssistantMessageEventStream {
         let model = model.clone();
         let mut options = options.cloned();
         if let Some(options) = options.as_mut() {
@@ -1506,17 +1563,34 @@ impl ApiProvider for AnthropicProvider {
         let body = self.build_simple_request_body(&model, context, options.as_ref());
         let tools = context.tools.clone().unwrap_or_default();
         let messages = context.messages.clone();
-        stream_anthropic(
-            self.client.clone(),
+        let raw = stream_anthropic(
+            Self::client(),
             model,
             options.map(|options| options.base),
             body,
             tools,
             messages,
-        )
+        );
+        AssistantMessageEventStream::from_raw(raw)
     }
 }
 
-pub fn register_anthropic_provider() {
-    crate::api_registry::register_api_provider(Arc::new(AnthropicProvider::new()));
+pub fn stream_anthropic_public(
+    model: &Model,
+    context: &Context,
+    options: Option<&StreamOptions>,
+) -> AssistantMessageEventStream {
+    AnthropicApiProvider.stream(model, context, options)
+}
+
+pub fn stream_simple_anthropic(
+    model: &Model,
+    context: &Context,
+    options: Option<&SimpleStreamOptions>,
+) -> AssistantMessageEventStream {
+    AnthropicApiProvider.stream_simple(model, context, options)
+}
+
+pub(crate) fn register_anthropic_provider() {
+    crate::api_registry::register_api_provider(Arc::new(AnthropicApiProvider));
 }

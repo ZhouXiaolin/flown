@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, sync::Arc};
 
-pub use flown_ai::types::AbortSignal;
+pub use flown_ai::AbortSignal;
 use serde::{Deserialize, Serialize};
 
 /// File system error codes
@@ -26,17 +26,47 @@ pub enum FileErrorCode {
 
 /// File system error
 #[derive(Debug, thiserror::Error)]
-#[error("{code}")]
+#[error("{message}")]
 pub struct FileError {
     pub code: FileErrorCode,
+    pub message: String,
     pub path: Option<String>,
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl FileError {
     pub fn new(code: FileErrorCode, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let message = format!("{code}: {path}");
         Self {
             code,
-            path: Some(path.into()),
+            message,
+            path: Some(path),
+            source: None,
+        }
+    }
+
+    pub fn with_message(code: FileErrorCode, message: impl Into<String>, path: Option<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            path,
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        code: FileErrorCode,
+        message: impl Into<String>,
+        path: Option<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            path,
+            source: Some(Box::new(source)),
         }
     }
 }
@@ -60,9 +90,34 @@ pub enum ExecutionErrorCode {
 
 /// Shell execution error
 #[derive(Debug, thiserror::Error)]
-#[error("{code}")]
+#[error("{message}")]
 pub struct ExecutionError {
     pub code: ExecutionErrorCode,
+    pub message: String,
+    #[source]
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl ExecutionError {
+    pub fn new(code: ExecutionErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        code: ExecutionErrorCode,
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 pub type ShellOutputUpdateFn = Arc<dyn Fn(&str) -> Result<(), ExecutionError> + Send + Sync>;

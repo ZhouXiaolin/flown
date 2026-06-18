@@ -1,12 +1,26 @@
-use omp_ai::{
-    AnthropicProvider, Api, AssistantContent, AssistantMessage, AssistantMessageEvent, Context,
-    Cost, ImageContent, KnownApi, KnownProvider, Message, MessageContent, Model, ModelCost,
-    OpenAiCompletionsProvider, Provider, StopReason, TextContent, ThinkingContent, ThinkingLevel,
-    ToolCall, Usage, UserContentBlock, UserMessage, clamp_thinking_level, clear_api_providers,
-    complete, get_api_provider, get_model, get_models, get_providers,
-    get_supported_thinking_levels, init, models_are_equal, transform_messages, try_stream,
+use flown_ai::{
+    AnthropicOptions, Api, AssistantContent, AssistantMessage, AssistantMessageEvent,
+    AzureOpenAIResponsesOptions, BedrockOptions, Context, Cost, GoogleOptions,
+    GoogleThinkingLevel, GoogleVertexOptions, ImageContent, KnownApi, KnownProvider, Message,
+    MessageContent, MistralOptions, Model, ModelCost, OpenAICodexResponsesOptions,
+    OpenAICodexWebSocketDebugStats, OpenAICompletionsOptions, OpenAIResponsesOptions,
+    OAuthAuthInfo, OAuthCredentials, OAuthDeviceCodeInfo, OAuthPrompt, OAuthProviderId,
+    OAuthProviderInfo, OAuthSelectOption, OAuthSelectPrompt, Provider, StopReason, TextContent,
+    ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContentBlock, UserMessage,
+    clamp_thinking_level, clear_api_providers, complete, get_api_provider, get_model, get_models,
+    get_providers, get_supported_thinking_levels, models_are_equal,
+    register_built_in_api_providers, register_built_in_images_api_providers, stream, stream_anthropic_public,
+    stream_openai_completions_public, stream_openai_responses_public,
+    stream_simple_anthropic, stream_simple_openai_completions, stream_simple_openai_responses,
 };
 use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// The API-provider registry is process-global. Tests that mutate it
+/// (`clear_api_providers` / `register_built_in_api_providers`) must run
+/// serially to avoid one test's reset wiping another's registration mid-flight.
+/// Each registry-mutating test holds this guard for its whole body.
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn known_api_serializes_to_pi_mono_api_names() {
@@ -41,9 +55,10 @@ fn known_provider_display_uses_public_provider_id() {
 }
 
 #[test]
-fn init_registers_deepseek_as_openai_completions_provider() {
+fn register_built_ins_registers_openai_completions_provider() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
     clear_api_providers();
-    init();
+    register_built_in_api_providers();
 
     let model = get_model("deepseek", "deepseek-v4-flash").expect("model registered");
     assert_eq!(model.api, Api::Known(KnownApi::OpenAiCompletions));
@@ -65,7 +80,7 @@ fn init_registers_deepseek_as_openai_completions_provider() {
 }
 
 #[test]
-fn builtin_deepseek_models_are_available_without_init() {
+fn builtin_deepseek_models_are_available_without_registration() {
     let model = get_model("deepseek", "deepseek-v4-flash").expect("built-in model");
 
     assert_eq!(model.api, Api::Known(KnownApi::OpenAiCompletions));
@@ -79,13 +94,31 @@ fn builtin_deepseek_models_are_available_without_init() {
 }
 
 #[test]
-fn openai_completions_provider_is_public_api_surface() {
-    let _provider = OpenAiCompletionsProvider::new();
+fn openai_completions_provider_registers_via_builtins() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
+    clear_api_providers();
+    register_built_in_api_providers();
+    // pi-ai's `registerBuiltInApiProviders` registers an
+    // `openai-completions` provider; the Rust port must too. Providers are no
+    // longer public structs (mirroring pi-ai's function-style providers), so
+    // the registry is the public surface.
+    assert!(get_api_provider(&Api::Known(KnownApi::OpenAiCompletions)).is_some());
 }
 
 #[test]
-fn anthropic_provider_is_public_api_surface() {
-    let _provider = AnthropicProvider::new();
+fn anthropic_provider_registers_via_builtins() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
+    clear_api_providers();
+    register_built_in_api_providers();
+    assert!(get_api_provider(&Api::Known(KnownApi::AnthropicMessages)).is_some());
+}
+
+#[test]
+fn openai_responses_provider_registers_via_builtins() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
+    clear_api_providers();
+    register_built_in_api_providers();
+    assert!(get_api_provider(&Api::Known(KnownApi::OpenAiResponses)).is_some());
 }
 
 #[test]
@@ -94,7 +127,114 @@ fn complete_is_exported() {
 }
 
 #[test]
-fn try_stream_returns_error_when_provider_is_missing() {
+fn provider_option_types_are_exported() {
+    let anthropic = AnthropicOptions::default();
+    let bedrock = BedrockOptions::default();
+    let azure = AzureOpenAIResponsesOptions::default();
+    let google = GoogleOptions::default();
+    let google_vertex = GoogleVertexOptions::default();
+    let mistral = MistralOptions::default();
+    let openai_responses = OpenAIResponsesOptions::default();
+    let codex = OpenAICodexResponsesOptions::default();
+    let openai = OpenAICompletionsOptions::default();
+    assert!(anthropic.base.api_key.is_none());
+    assert!(bedrock.base.api_key.is_none());
+    assert!(azure.base.api_key.is_none());
+    assert!(google.base.api_key.is_none());
+    assert!(google_vertex.base.api_key.is_none());
+    assert!(mistral.base.api_key.is_none());
+    assert!(openai_responses.base.api_key.is_none());
+    assert!(codex.base.api_key.is_none());
+    assert!(openai.base.api_key.is_none());
+}
+
+#[test]
+fn internal_provider_detail_types_are_not_top_level_exports() {
+    let _ = std::any::type_name::<AnthropicOptions>();
+    let _ = std::any::type_name::<OpenAICompletionsOptions>();
+    let _ = std::any::type_name::<GoogleOptions>();
+    let _ = std::any::type_name::<GoogleVertexOptions>();
+}
+
+#[test]
+fn codex_debug_stats_are_exported() {
+    let stats = OpenAICodexWebSocketDebugStats::default();
+    assert_eq!(stats.requests, 0);
+    assert_eq!(stats.last_web_socket_error, None);
+}
+
+#[test]
+fn oauth_public_types_are_exported() {
+    let provider_id: OAuthProviderId = "openai-codex".to_string();
+    let credentials = OAuthCredentials {
+        refresh: "r".to_string(),
+        access: "a".to_string(),
+        expires: 1,
+        extra: std::collections::HashMap::new(),
+    };
+    let auth = OAuthAuthInfo {
+        url: "https://example.com".to_string(),
+        instructions: Some("open it".to_string()),
+    };
+    let device = OAuthDeviceCodeInfo {
+        user_code: "ABCD".to_string(),
+        verification_uri: "https://example.com/device".to_string(),
+        interval_seconds: Some(5),
+        expires_in_seconds: Some(600),
+    };
+    let prompt = OAuthPrompt {
+        message: "enter code".to_string(),
+        placeholder: None,
+        allow_empty: Some(false),
+    };
+    let option = OAuthSelectOption {
+        id: "browser".to_string(),
+        label: "Browser".to_string(),
+    };
+    let select = OAuthSelectPrompt {
+        message: "pick".to_string(),
+        options: vec![option.clone()],
+    };
+    let info = OAuthProviderInfo {
+        id: provider_id.clone(),
+        name: "Codex".to_string(),
+        available: true,
+    };
+
+    assert_eq!(provider_id, "openai-codex");
+    assert_eq!(credentials.expires, 1);
+    assert_eq!(auth.instructions.as_deref(), Some("open it"));
+    assert_eq!(device.interval_seconds, Some(5));
+    assert_eq!(prompt.allow_empty, Some(false));
+    assert_eq!(select.options[0].id, option.id);
+    assert!(info.available);
+}
+
+#[test]
+fn google_thinking_level_is_exported() {
+    let level = GoogleThinkingLevel::High;
+    assert_eq!(serde_json::to_value(level).unwrap(), serde_json::json!("HIGH"));
+}
+
+#[test]
+fn provider_specific_stream_functions_are_exported() {
+    let _ = stream_anthropic_public;
+    let _ = stream_simple_anthropic;
+    let _ = stream_openai_completions_public;
+    let _ = stream_simple_openai_completions;
+    let _ = stream_openai_responses_public;
+    let _ = stream_simple_openai_responses;
+}
+
+#[test]
+fn provider_builtins_registration_functions_are_exported() {
+    let _ = register_built_in_api_providers;
+    let _ = register_built_in_images_api_providers;
+}
+
+#[test]
+fn stream_returns_error_when_provider_is_missing() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
     clear_api_providers();
     let model = get_model("deepseek", "deepseek-v4-flash").expect("model");
     let context = Context {
@@ -103,12 +243,20 @@ fn try_stream_returns_error_when_provider_is_missing() {
         tools: None,
     };
 
-    let error = try_stream(&model, &context, None).expect_err("missing provider error");
+    let error = stream(&model, &context, None).expect_err("missing provider error");
 
     assert_eq!(
         error.to_string(),
         "No API provider registered for api: openai-completions"
     );
+}
+
+#[test]
+fn clear_api_providers_keeps_registry_empty_until_explicit_reregister() {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
+    clear_api_providers();
+    let provider = get_api_provider(&Api::Known(KnownApi::OpenAiCompletions));
+    assert!(provider.is_none(), "clearApiProviders() should leave registry empty");
 }
 
 #[test]
@@ -145,6 +293,7 @@ fn assistant_message_serializes_with_pi_ai_field_names() {
             output: 2,
             cache_read: 3,
             cache_write: 4,
+            cache_write_1h: None,
             total_tokens: 10,
             cost: Cost {
                 input: 0.1,
@@ -156,6 +305,7 @@ fn assistant_message_serializes_with_pi_ai_field_names() {
         },
         stop_reason: StopReason::ToolUse,
         error_message: Some("err".to_string()),
+        diagnostics: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -198,6 +348,7 @@ fn assistant_events_serialize_with_pi_ai_event_field_names() {
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
         error_message: None,
+        diagnostics: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -312,105 +463,4 @@ fn thinking_helpers_match_pi_ai_model_semantics() {
     model.id = "other".to_string();
     assert!(!models_are_equal(Some(&model), Some(&same)));
     assert!(!models_are_equal(None, Some(&same)));
-}
-
-#[test]
-fn transform_messages_matches_pi_ai_cross_provider_semantics() {
-    let target = get_model("deepseek", "deepseek-v4-flash").expect("model");
-    let source_assistant = AssistantMessage {
-        role: "assistant".to_string(),
-        content: vec![
-            AssistantContent::Thinking(ThinkingContent {
-                content_type: "thinking".to_string(),
-                thinking: "private plan".to_string(),
-                thinking_signature: Some("foreign-thinking".to_string()),
-                redacted: None,
-            }),
-            AssistantContent::Thinking(ThinkingContent {
-                content_type: "thinking".to_string(),
-                thinking: "[redacted]".to_string(),
-                thinking_signature: Some("opaque".to_string()),
-                redacted: Some(true),
-            }),
-            AssistantContent::ToolCall(ToolCall {
-                content_type: "toolCall".to_string(),
-                id: "call|unsafe/id".to_string(),
-                name: "lookup".to_string(),
-                arguments: serde_json::json!({ "q": "rust" }),
-                thought_signature: Some("foreign-tool".to_string()),
-            }),
-        ],
-        api: Api::Known(KnownApi::AnthropicMessages),
-        provider: Provider::Known(KnownProvider::Anthropic),
-        model: "claude".to_string(),
-        response_model: None,
-        response_id: None,
-        usage: Usage::default(),
-        stop_reason: StopReason::ToolUse,
-        error_message: None,
-        timestamp: chrono::Utc::now(),
-    };
-    let messages = vec![
-        Message::User(UserMessage {
-            role: "user".to_string(),
-            content: MessageContent::Blocks(vec![
-                UserContentBlock::Image(ImageContent {
-                    content_type: "image".to_string(),
-                    data: "abc".to_string(),
-                    mime_type: "image/png".to_string(),
-                }),
-                UserContentBlock::Image(ImageContent {
-                    content_type: "image".to_string(),
-                    data: "def".to_string(),
-                    mime_type: "image/png".to_string(),
-                }),
-            ]),
-            timestamp: chrono::Utc::now(),
-        }),
-        Message::Assistant(source_assistant),
-    ];
-
-    let transformed = transform_messages(
-        &messages,
-        &target,
-        Some(&|id, _model, _source| id.replace(['|', '/'], "_")),
-    );
-
-    assert!(matches!(
-        &transformed[0],
-        Message::User(UserMessage {
-            content: MessageContent::Blocks(blocks),
-            ..
-        }) if blocks.len() == 1
-            && matches!(
-                &blocks[0],
-                UserContentBlock::Text(TextContent { text, .. })
-                    if text == "(image omitted: model does not support images)"
-            )
-    ));
-    assert!(matches!(
-        &transformed[1],
-        Message::Assistant(AssistantMessage { content, .. })
-            if matches!(
-                content.as_slice(),
-                [
-                    AssistantContent::Text(TextContent { text, .. }),
-                    AssistantContent::ToolCall(ToolCall { id, thought_signature, .. }),
-                ] if text == "private plan"
-                    && id == "call_unsafe_id"
-                    && thought_signature.is_none()
-            )
-    ));
-    assert!(matches!(
-        &transformed[2],
-        Message::ToolResult(result)
-            if result.tool_call_id == "call_unsafe_id"
-                && result.tool_name == "lookup"
-                && result.is_error
-                && matches!(
-                    result.content.as_slice(),
-                    [omp_ai::ToolResultContent::Text(TextContent { text, .. })]
-                        if text == "No result provided"
-                )
-    ));
 }

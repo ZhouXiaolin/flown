@@ -3,7 +3,7 @@
 //! flown's agent runs on **tokio** (`AgentHarness::prompt` is async). iodilos
 //! runs its own single-threaded, `Rc`/`thread_local`-based event loop via
 //! `Renderer::run_blocking`. These two loops cannot merge, so a `flume` channel
-//! carries `HarnessEvent`s from the tokio side to the iodilos side:
+//! carries `AgentHarnessEvent`s from the tokio side to the iodilos side:
 //!
 //! ```text
 //!   [tokio multi-thread runtime]              [iodilos main thread]
@@ -11,7 +11,7 @@
 //!     ├ build harness + register subscriber       └ spawn_local(event pump)
 //!     └ tokio::spawn(harness.prompt(text))──┐          └ rx.recv_async().await
 //!         harness.execute_turn()             │ flume         → state.* updates
-//!         emit_any(HarnessEvent) ────────────┴──────────►     (signal writes →
+//!         emit_any(AgentHarnessEvent) ────────────┴──────────►     (signal writes →
 //!                                                            dirty flag → redraw)
 //! ```
 //!
@@ -35,7 +35,7 @@ use crate::cli;
 use crate::config::Config;
 use crate::tui::components::app::{App, AppProps};
 use crate::tui::state::{BUSY_FRAMES, StatusInfo, UiState};
-use flown_agent::harness::HarnessEvent;
+use flown_agent::AgentHarnessEvent;
 
 /// Run the TUI. Called from `interactive_mode.rs` after the harness + config are
 /// built on the tokio runtime.
@@ -49,26 +49,21 @@ pub async fn run_tui(
     // Build the harness on the tokio runtime (it needs async init).
     // `build_agent` returns the harness plus the live McpManager (when MCP is
     // configured); the manager is handed to the extension layer below.
-    let (harness, mcp_manager, built_in_tools) = match cli::build_agent(
-        &model_str,
-        api_key.clone(),
-        &config,
-    )
-    .await
-    {
-        Ok((h, mcp)) => {
-            // The harness was constructed with the built-in tools; the extension
-            // layer needs them too so it can prepend them to every set_tools
-            // call (set_tools is full-replace — see extensions::runner::ToolSide).
-            let built_in = h.tools();
-            (Some(Arc::new(h)), mcp, Some(built_in))
-        }
-        Err(e) => {
-            eprintln!("Warning: Could not initialize agent: {e}");
-            eprintln!("Running in session-only mode (no LLM).");
-            (None, None, None)
-        }
-    };
+    let (harness, mcp_manager, built_in_tools) =
+        match cli::build_agent(&model_str, api_key.clone(), &config).await {
+            Ok((h, mcp)) => {
+                // The harness was constructed with the built-in tools; the extension
+                // layer needs them too so it can prepend them to every set_tools
+                // call (set_tools is full-replace — see extensions::runner::ToolSide).
+                let built_in = h.tools();
+                (Some(Arc::new(h)), mcp, Some(built_in))
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not initialize agent: {e}");
+                eprintln!("Running in session-only mode (no LLM).");
+                (None, None, None)
+            }
+        };
 
     // Build the extension layer on the tokio side. `tool_side` owns the harness
     // and reconciles runtime tool edits (MCP servers connecting/disconnecting);
@@ -108,8 +103,43 @@ pub async fn run_tui(
         });
     }
 
-    // The flume bridge: harness subscriber (tokio) → iodilos event pump.
-    let (event_tx, event_rx) = flume::unbounded::<HarnessEvent>();
+    // Bind the main harness to its transcript ATOMICALLY: one call creates the
+    // event channel, subscribes the harness to forward into it, and spawns the
+    // driver task (owning the harness Arc). This is the single place the main
+    // harness is wired to the UI, so the one-harness-one-transcript invariant
+    // is structural. Returns None in session-only mode (no harness).
+    //
+    // The initial prompt — if any — is queued on the driver's priority channel
+    // here, replacing the old `tokio::spawn(harness.prompt())`.
+    let initial_busy = initial_prompt.is_some() && harness.is_some();
+    let main_binding = harness.as_ref().map(|h| {
+        crate::tui::conversation::bind_layer_driver(
+            Arc::clone(h),
+            initial_prompt.clone(),
+        )
+    });
+    // Deconstruct the binding into independent handles. The event receiver is
+    // single-consumer (one pump), so it is NOT held on the layer — it lives
+    // only here and moves into the main pump at mount. The layer carries the
+    // sender (dropping it ends the pump), the command sender (close sends
+    // Shutdown), the unsubscribe token, and a harness clone (defensive abort).
+    use crate::tui::conversation::LayerBinding;
+    let (
+        main_harness,
+        main_cmd_tx,
+        main_event_tx,
+        main_event_rx,
+        main_unsubscribe,
+    ) = match main_binding {
+        Some(LayerBinding { harness, cmd_tx, event_tx, event_rx, unsubscribe }) => (
+            Some(harness),
+            Some(cmd_tx),
+            Some(event_tx),
+            Some(event_rx),
+            Some(unsubscribe),
+        ),
+        None => (None, None, None, None, None),
+    };
 
     // Initial status snapshot.
     let status = StatusInfo {
@@ -124,36 +154,25 @@ pub async fn run_tui(
         ..StatusInfo::default()
     };
 
-    // If there's an initial prompt, kick off the harness driver before mounting.
-    let initial_busy = initial_prompt.is_some() && harness.is_some();
-    if let Some(ref prompt) = initial_prompt {
-        if let Some(ref harness) = harness {
-            let harness = Arc::clone(harness);
-            let prompt_text = prompt.clone();
-            tokio::spawn(async move {
-                let _ = harness.prompt(&prompt_text, None).await;
-            });
-        }
-    }
-
-    // Build the BtwFactory (async — model/system_prompt are async getters) so
-    // `/btw` can fork a fresh harness from the main session's recipe. Only when
-    // a harness exists; session-only mode leaves it None and `/btw` errors.
-    let btw_factory: Option<Arc<crate::tui::conversation::BtwFactory>> = match &harness {
+    // Build the overlap factory (async — model/system_prompt are async getters)
+    // so extension overlaps can fork a fresh harness from the main session's
+    // recipe. Only when a harness exists; session-only mode leaves it None.
+    let overlap_factory: Option<Arc<crate::tui::conversation::AgentOverlapFactory>> = match &harness
+    {
         Some(h) => {
             let model = h.model().await;
             let system_prompt = h.system_prompt().await;
             // built_in_tools already extracted for the extension layer; reuse
-            // the harness's current tool set as the btw recipe.
+            // the harness's current tool set as the overlap recipe.
             let tools = h.tools();
             // api_key_fn is private on the harness; build_agent captured the
             // key closure separately. Reconstruct from the key we have.
             let api_key_for_factory = api_key.clone();
-            let api_key_fn: flown_agent::harness::GetApiKeyAndHeadersFn =
-                std::sync::Arc::new(move |_model: &flown_ai::types::Model| {
+            let api_key_fn: flown_agent::GetApiKeyAndHeadersFn =
+                std::sync::Arc::new(move |_model: &flown_ai::Model| {
                     api_key_for_factory.clone().map(|k| (k, None))
                 });
-            Some(Arc::new(crate::tui::conversation::BtwFactory {
+            Some(Arc::new(crate::tui::conversation::AgentOverlapFactory {
                 model,
                 env: std::sync::Arc::new(crate::native_env::NativeExecutionEnv::new()),
                 built_in_tools: tools,
@@ -169,17 +188,21 @@ pub async fn run_tui(
     // iodilos's event loop until quit.
     let mut renderer = Renderer::new()?;
 
-    // Captures for the mount closure: the harness handle + event sender (for the
-    // App's on_key to spawn new prompts). `status` seeds the initial snapshot.
-    // `mount_command_table` is the extension command registry, bound to the
-    // UiState sink inside the mount closure (where Rc<UiState> exists).
-    let mount_harness = harness.clone();
+    // Captures for the mount closure: the binding parts (harness, cmd sender,
+    // event sender, unsubscribe), the event receiver (for the pump), the status
+    // snapshot, and the extension command registry. `status` seeds the initial
+    // snapshot; `mount_command_table` is bound to the UiState sink inside the
+    // mount closure (where Rc<UiState> exists).
+    let mount_harness = main_harness;
     let mount_status = status.clone();
     let mount_busy = initial_busy;
-    let mount_event_tx = event_tx.clone();
+    let mount_event_tx = main_event_tx;
+    let mount_unsubscribe = std::cell::Cell::new(main_unsubscribe);
     let mount_config = config.clone();
     let mut mount_command_table = command_table;
-    let mount_btw_factory = btw_factory.clone();
+    let mount_overlap_factory = overlap_factory.clone();
+    let mount_cmd_tx = main_cmd_tx;
+    let mount_event_rx = main_event_rx;
 
     renderer.mount(move || {
         // The shared reactive state, seeded with the initial status + busy flag.
@@ -187,50 +210,38 @@ pub async fn run_tui(
         state.status.update(|s| *s = mount_status.clone());
         state.busy.set(mount_busy);
 
-        // Register the main harness subscriber ONCE at mount. It forwards each
-        // HarnessEvent into the main layer's flume channel. The unsubscribe
-        // token is held by the main ConversationLayer (kept for symmetry with
-        // btw layers, though main is never torn down).
-        let main_unsubscribe: Option<Box<dyn Fn()>> = mount_harness.as_ref().map(|harness| {
-            let tx = mount_event_tx.clone();
-            let unsub = harness.subscribe(move |event: &HarnessEvent| {
-                let _ = tx.send(event.clone());
-            });
-            // The harness subscribe returns a Send+Sync unsubscribe; wrap it
-            // for the iodilos-held layer.
-            let wrapped: Box<dyn Fn()> = Box::new(move || {
-                unsub();
-            });
-            wrapped
-        });
-
+        // The main harness binding (channel + subscriber + driver) was created
+        // before mount in `bind_layer_driver`. Its event receiver feeds the main
+        // pump spawned below; its sender + unsubscribe ride on the main layer.
         // Build the conversation stack. The main layer wraps the state, the
-        // main harness, and the main event channel; its sender stays alive for
-        // the app's lifetime (main is never popped). btw layers are pushed by
-        // RuntimeControl::enter_btw.
+        // main harness binding's sender + unsubscribe, and the driver's command
+        // sender; its senders stay alive for the app's lifetime (main is never
+        // popped). Overlap layers are pushed by RuntimeControl::open_overlap.
         let main_layer = crate::tui::conversation::ConversationLayer {
             kind: crate::tui::conversation::LayerKind::Main,
+            overlap: None,
             state: Rc::clone(&state),
             harness: mount_harness.clone(),
-            event_tx: mount_event_tx.clone(),
-            unsubscribe: main_unsubscribe,
+            event_tx: mount_event_tx.clone().expect("main event_tx present when harness exists; binding created before mount"),
+            unsubscribe: mount_unsubscribe.take(),
+            cmd_tx: mount_cmd_tx.clone(),
         };
         let stack = crate::tui::conversation::ConversationStack::new(
             main_layer,
-            mount_btw_factory.clone(),
+            mount_overlap_factory.clone(),
         );
 
-        // RuntimeControl is the iodilos-side capability for `/btw`. Built here
-        // (not during register, which runs on tokio) because it holds the
-        // Rc<ConversationStack>.
+        // RuntimeControl is the iodilos-side capability for extension control
+        // commands. Built here (not during register, which runs on tokio)
+        // because it holds the Rc<ConversationStack>.
         let runtime_control =
             crate::tui::conversation::RuntimeControl::new(Rc::clone(&stack), mount_config.clone());
 
         // Bind the extension command table to the live stack, producing the
         // dispatch-capable CommandSide. The sink routes each CommandEffect to
         // the ACTIVE layer's UiState (so /mcp notify shows in whatever view is
-        // visible). Then bind `/btw`'s control handler with the RuntimeControl
-        // — done before wrapping in Rc because bind_control needs &mut.
+        // visible). Then bind control handlers with the RuntimeControl — done
+        // before wrapping in Rc because bind_control needs &mut.
         let command_side: Option<Rc<crate::core::extensions::CommandSide>> =
             mount_command_table.take().map(|table| {
                 let sink = Rc::new(crate::core::extensions::CommandSink {
@@ -254,18 +265,11 @@ pub async fn run_tui(
                     },
                 });
                 let mut side = table.bind(sink);
-                // Bind `/btw`'s control handler: parse args → enter_btw(prompt).
+                // Bind the generic control capability. Control commands bring
+                // their own handler from the extension registration.
                 let rc =
                     Rc::clone(&runtime_control) as Rc<dyn crate::core::extensions::ControlRuntime>;
-                let handler: std::rc::Rc<
-                    dyn Fn(&str, &dyn crate::core::extensions::ControlRuntime),
-                > = std::rc::Rc::new(
-                    |args: &str, rt: &dyn crate::core::extensions::ControlRuntime| {
-                        let prompt = crate::core::extensions::parse_btw_args(args);
-                        rt.enter_btw(prompt);
-                    },
-                );
-                side.bind_control("/btw", rc, handler);
+                side.bind_control_runtime(rc);
                 Rc::new(side)
             });
         provide_context(command_side);
@@ -278,22 +282,21 @@ pub async fn run_tui(
         provide_context(mount_config.clone());
 
         // The event pump: drain the main channel and translate each event into
-        // main UiState mutations. btw layers spawn their own identical pump in
-        // RuntimeControl::enter_btw.
+        // main UiState mutations. Overlap layers spawn their own identical pump
+        // in RuntimeControl::open_overlap.
         let pump_state = Rc::clone(&state);
-        let pump_rx = event_rx;
-        spawn_local(async move {
-            let mut accumulated_text = String::new();
-            let mut in_thinking = false;
-            while let Ok(event) = pump_rx.recv_async().await {
-                translate_event(
-                    event,
-                    &pump_state,
-                    &mut accumulated_text,
-                    &mut in_thinking,
-                );
-            }
-        });
+        // The main pump consumes the binding's event_rx (single-consumer). Only
+        // spawn it when a harness (and thus a receiver) exists; in session-only
+        // mode there are no events to pump.
+        if let Some(pump_rx) = mount_event_rx {
+            spawn_local(async move {
+                let mut accumulated_text = String::new();
+                let mut in_thinking = false;
+                while let Ok(event) = pump_rx.recv_async().await {
+                    translate_event(event, &pump_state, &mut accumulated_text, &mut in_thinking);
+                }
+            });
+        }
 
         // Busy-spinner tick: advance the spinner frame while the active layer's
         // agent is running. Registered once at mount; reads the stack so it
@@ -318,23 +321,23 @@ pub async fn run_tui(
     Ok(())
 }
 
-/// Translate one `HarnessEvent` into `UiState` mutations. A near-verbatim port
+/// Translate one `AgentHarnessEvent` into `UiState` mutations. A near-verbatim port
 /// of the old `interactive_mode.rs` event-match block, but every `transcript.*`
 /// call becomes a `state.*` call. Persistence is now owned by the harness
 /// (MessageEnd/TurnEnd → session.append_message), so this function no longer
 /// ships messages to a separate persistence task.
 pub(crate) fn translate_event(
-    event: HarnessEvent,
+    event: AgentHarnessEvent,
     state: &UiState,
     accumulated_text: &mut String,
     in_thinking: &mut bool,
 ) {
-    use flown_ai::types::AssistantMessageEvent;
+    use flown_ai::AssistantMessageEvent;
 
     match event {
-        HarnessEvent::AgentStart => {}
+        AgentHarnessEvent::AgentStart => {}
 
-        HarnessEvent::MessageUpdate {
+        AgentHarnessEvent::MessageUpdate {
             assistant_message_event,
             ..
         } => match assistant_message_event {
@@ -359,21 +362,42 @@ pub(crate) fn translate_event(
                 state.push_thinking(std::mem::take(accumulated_text));
                 *in_thinking = false;
             }
+            AssistantMessageEvent::Done { message, .. }
+                if !assistant_is_waiting_for_tool(&message) =>
+            {
+                accumulated_text.clear();
+                *in_thinking = false;
+                state.busy.set(false);
+                state.status.update(|s| s.busy = false);
+            }
+            AssistantMessageEvent::Error { .. } => {
+                accumulated_text.clear();
+                *in_thinking = false;
+                state.busy.set(false);
+                state.status.update(|s| s.busy = false);
+            }
             _ => {}
         },
 
-        HarnessEvent::MessageEnd { message } => match &message {
-            flown_agent::AgentMessage::Assistant(_) => {
+        AgentHarnessEvent::MessageEnd { message } => match &message {
+            flown_agent::AgentMessage::Assistant(message)
+                if !assistant_is_waiting_for_tool(message) =>
+            {
                 // The finalized assistant message is persisted by the harness.
-                // Reset the streaming accumulator for the next message.
+                // Reset the streaming accumulator for the next message. A
+                // ToolUse stop reason is still active work, so it is cleared by
+                // AgentEnd/Abort/Settled instead.
                 accumulated_text.clear();
+                *in_thinking = false;
+                state.busy.set(false);
+                state.status.update(|s| s.busy = false);
             }
             flown_agent::AgentMessage::ToolResult(result) if result.is_error => {
                 let output: String = result
                     .content
                     .iter()
                     .filter_map(|c| match c {
-                        flown_ai::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                        flown_ai::ToolResultContent::Text(t) => Some(t.text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -390,13 +414,13 @@ pub(crate) fn translate_event(
             _ => {}
         },
 
-        HarnessEvent::ToolExecutionStart {
+        AgentHarnessEvent::ToolExecutionStart {
             tool_name, args, ..
         } => {
             state.push_tool_call(&tool_name, &args);
         }
 
-        HarnessEvent::ToolExecutionEnd {
+        AgentHarnessEvent::ToolExecutionEnd {
             tool_name,
             result,
             is_error,
@@ -422,11 +446,259 @@ pub(crate) fn translate_event(
             }
         }
 
-        HarnessEvent::AgentEnd { .. } => {
+        AgentHarnessEvent::TurnEnd {
+            message: flown_agent::AgentMessage::Assistant(message),
+            ..
+        } if !assistant_is_waiting_for_tool(&message) => {
+            accumulated_text.clear();
+            *in_thinking = false;
+            state.busy.set(false);
+            state.status.update(|s| s.busy = false);
+        }
+
+        AgentHarnessEvent::AgentEnd { .. }
+        | AgentHarnessEvent::Abort { .. }
+        | AgentHarnessEvent::Settled { .. } => {
+            accumulated_text.clear();
+            *in_thinking = false;
             state.busy.set(false);
             state.status.update(|s| s.busy = false);
         }
 
         _ => {}
+    }
+}
+
+fn assistant_is_waiting_for_tool(message: &flown_ai::AssistantMessage) -> bool {
+    matches!(message.stop_reason, flown_ai::StopReason::ToolUse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use flown_agent::AgentMessage;
+    use flown_ai::{
+        Api, AssistantContent, AssistantMessage, AssistantMessageEvent, KnownApi, KnownProvider,
+        Provider, StopReason, TextContent, ToolCall, Usage,
+    };
+    use iodilos::prelude::TextAreaState;
+
+    fn assistant(content: Vec<AssistantContent>, stop_reason: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            role: "assistant".to_string(),
+            content,
+            api: Api::Known(KnownApi::OpenAiCompletions),
+            provider: Provider::Known(KnownProvider::OpenAi),
+            model: "test-model".to_string(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason,
+            error_message: None,
+            diagnostics: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn assistant_message(content: Vec<AssistantContent>, stop_reason: StopReason) -> AgentMessage {
+        AgentMessage::Assistant(assistant(content, stop_reason))
+    }
+
+    fn busy_state() -> UiState {
+        let state = UiState::new(TextAreaState::default());
+        state.busy.set(true);
+        state.status.update(|status| status.busy = true);
+        state
+    }
+
+    #[test]
+    fn assistant_message_end_clears_busy_for_final_text() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::MessageEnd {
+                message: assistant_message(
+                    vec![AssistantContent::Text(TextContent {
+                        content_type: "text".to_string(),
+                        text: "done".to_string(),
+                        text_signature: None,
+                    })],
+                    StopReason::Stop,
+                ),
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(!state.busy.get());
+        assert!(!state.status.get().busy);
+        assert!(accumulated_text.is_empty());
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn assistant_message_end_keeps_busy_for_tool_call() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::MessageEnd {
+                message: assistant_message(
+                    vec![AssistantContent::ToolCall(ToolCall {
+                        content_type: "toolCall".to_string(),
+                        id: "call-1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({}),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                ),
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(state.busy.get());
+        assert!(state.status.get().busy);
+        assert_eq!(accumulated_text, "partial");
+        assert!(in_thinking);
+    }
+
+    #[test]
+    fn assistant_done_clears_busy_for_final_text() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::MessageUpdate {
+                message: assistant_message(Vec::new(), StopReason::Stop),
+                assistant_message_event: AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: assistant(
+                        vec![AssistantContent::Text(TextContent {
+                            content_type: "text".to_string(),
+                            text: "done".to_string(),
+                            text_signature: None,
+                        })],
+                        StopReason::Stop,
+                    ),
+                },
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(!state.busy.get());
+        assert!(!state.status.get().busy);
+        assert!(accumulated_text.is_empty());
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn assistant_done_keeps_busy_for_tool_call() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::MessageUpdate {
+                message: assistant_message(Vec::new(), StopReason::ToolUse),
+                assistant_message_event: AssistantMessageEvent::Done {
+                    reason: StopReason::ToolUse,
+                    message: assistant(
+                        vec![AssistantContent::ToolCall(ToolCall {
+                            content_type: "toolCall".to_string(),
+                            id: "call-1".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({}),
+                            thought_signature: None,
+                        })],
+                        StopReason::ToolUse,
+                    ),
+                },
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(state.busy.get());
+        assert!(state.status.get().busy);
+        assert_eq!(accumulated_text, "partial");
+        assert!(in_thinking);
+    }
+
+    #[test]
+    fn assistant_message_end_stop_reason_decides_finality() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::MessageEnd {
+                message: assistant_message(
+                    vec![
+                        AssistantContent::Text(TextContent {
+                            content_type: "text".to_string(),
+                            text: "done".to_string(),
+                            text_signature: None,
+                        }),
+                        AssistantContent::ToolCall(ToolCall {
+                            content_type: "toolCall".to_string(),
+                            id: "call-1".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({}),
+                            thought_signature: None,
+                        }),
+                    ],
+                    StopReason::Stop,
+                ),
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(!state.busy.get());
+        assert!(!state.status.get().busy);
+        assert!(accumulated_text.is_empty());
+        assert!(!in_thinking);
+    }
+
+    #[test]
+    fn final_turn_end_clears_busy() {
+        let state = busy_state();
+        let mut accumulated_text = "partial".to_string();
+        let mut in_thinking = true;
+
+        translate_event(
+            AgentHarnessEvent::TurnEnd {
+                message: assistant_message(
+                    vec![AssistantContent::Text(TextContent {
+                        content_type: "text".to_string(),
+                        text: "done".to_string(),
+                        text_signature: None,
+                    })],
+                    StopReason::Stop,
+                ),
+                tool_results: Vec::new(),
+            },
+            &state,
+            &mut accumulated_text,
+            &mut in_thinking,
+        );
+
+        assert!(!state.busy.get());
+        assert!(!state.status.get().busy);
+        assert!(accumulated_text.is_empty());
+        assert!(!in_thinking);
     }
 }

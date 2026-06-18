@@ -1,5 +1,5 @@
-use flown_agent::types::{AgentToolError, AgentToolResult};
-use flown_ai::types::{TextContent, ToolResultContent};
+use flown_agent::{AgentToolError, AgentToolResult};
+use flown_ai::{TextContent, ToolResultContent};
 use serde_json::Value;
 
 pub const DEFAULT_MAX_LINES: usize = 2000;

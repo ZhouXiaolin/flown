@@ -125,11 +125,7 @@ impl Config {
     /// Resolve provider name and API key for a model string like "provider/model".
     /// Returns (provider_name, api_key).
     pub fn resolve_provider_and_key(&self, model_str: &str) -> (String, Option<String>) {
-        let provider_name = model_str
-            .split('/')
-            .next()
-            .unwrap_or(model_str)
-            .to_string();
+        let provider_name = model_str.split('/').next().unwrap_or(model_str).to_string();
 
         let api_key = self.providers.get(&provider_name).map(|p| p.key.clone());
 

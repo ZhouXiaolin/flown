@@ -13,16 +13,13 @@
 //! See `docs/m2a-extension-api-draft.md` and the threading-model note in
 //! [`super::types`].
 
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use flown_agent::harness::AgentHarness;
-use flown_agent::types::AgentTool;
+use flown_agent::{AgentHarness, AgentTool};
 
 use super::types::{
-    CommandEffect, ControlRuntime, Extension, ExtensionApi, RegisteredCommand,
-    ToolHandle,
+    CommandEffect, ControlRuntime, Extension, ExtensionApi, RegisteredCommand, ToolHandle,
 };
 
 /// Run every extension's `register` on the tokio side, then split the result
@@ -79,8 +76,7 @@ impl ToolSide {
         let any_dirty = self
             .tool_stores
             .iter()
-            .map(|s| ToolHandle::from_store(s.clone()).take_dirty())
-            .any(|d| d);
+            .any(|s| ToolHandle::from_store(s.clone()).take_dirty());
         if !any_dirty {
             return;
         }
@@ -124,16 +120,9 @@ impl CommandTable {
             commands: self.commands,
             sink,
             control: None,
-            control_handlers: HashMap::new(),
         }
     }
 }
-
-/// An iodilos-side control handler: receives the args (everything after the
-/// command name) and the [`ControlRuntime`]. Bound at mount (not during
-/// `register`, which runs on tokio) because it drives `Rc`-based state. NOT
-/// `Send`.
-type ControlHandler = Rc<dyn Fn(&str, &dyn ControlRuntime)>;
 
 /// iodilos-side runtime: dispatches extension slash commands and interprets
 /// their [`CommandEffect`]s into `UiState` operations. NOT `Send` — it owns the
@@ -144,10 +133,6 @@ pub struct CommandSide {
     /// The conversation-stack capability, bound at mount. Present when a
     /// `RuntimeControl` exists (i.e. the TUI is mounted with a live stack).
     control: Option<Rc<dyn ControlRuntime>>,
-    /// Per-name control handlers (`/btw` → its enter/exit logic). Populated by
-    /// [`Self::bind_control`] at mount; looked up for commands whose
-    /// `needs_control` is `true`.
-    control_handlers: HashMap<String, ControlHandler>,
 }
 
 /// Sink the iodilos side uses to apply [`CommandEffect`]s. Holds the live
@@ -166,26 +151,24 @@ impl CommandSide {
         &self.commands
     }
 
-    /// Bind the conversation-stack capability and a control handler for a
-    /// command name. Called once at mount, after the [`ControlRuntime`] exists.
-    /// `name` must match a registered command with `needs_control == true`.
-    pub fn bind_control(&mut self, name: &str, runtime: Rc<dyn ControlRuntime>, handler: ControlHandler) {
+    /// Bind the conversation-stack capability. Control commands carry their
+    /// own registered handler; the runtime is the generic capability passed to
+    /// that handler.
+    pub fn bind_control_runtime(&mut self, runtime: Rc<dyn ControlRuntime>) {
         self.control = Some(runtime);
-        self.control_handlers.insert(name.to_string(), handler);
     }
 
-    /// Whether a control capability is bound (i.e. `/btw` can run).
+    /// Whether a control capability is bound.
     pub fn has_control(&self) -> bool {
         self.control.is_some()
     }
 
-    /// Exit the active btw layer, if any. Reaches the bound [`ControlRuntime`]
-    /// (the same one `/btw` uses). Called by `app.rs`'s Ctrl-C handler when the
-    /// active layer is a btw layer. No-op when no control is bound or the
-    /// active layer is Main (the runtime's `exit_btw` guards on that itself).
-    pub fn exit_active_btw(&self) {
+    /// Close the active extension overlap, if any. Reaches the bound
+    /// [`ControlRuntime`]. No-op when no control is bound or the active layer is
+    /// Main.
+    pub fn close_active_overlap(&self) {
         if let Some(rt) = self.control.as_ref() {
-            rt.exit_btw();
+            rt.close_active_overlap();
         }
     }
 
@@ -205,23 +188,21 @@ impl CommandSide {
 
     /// Dispatch a command. For effect commands (`/mcp`) it calls the handler
     /// and applies the returned [`CommandEffect`]. For control commands
-    /// (`/btw`) it calls the bound control handler with the [`ControlRuntime`].
+    /// it calls the bound control handler with the [`ControlRuntime`].
     /// Returns `true` if a registered command handled it.
     pub fn dispatch(&self, text: &str) -> bool {
         let Some((cmd, args)) = self.resolve(text) else {
             return false;
         };
-        if cmd.needs_control {
-            if let (Some(rt), Some(handler)) =
-                (self.control.as_ref(), self.control_handlers.get(&cmd.name))
-            {
-                handler(&args, rt.as_ref());
-                return true;
-            }
-            // needs_control but no runtime bound (session-only mode): fall
-            // through to the effect handler so the placeholder can surface an
-            // error rather than silently no-op'ing.
+        if cmd.needs_control
+            && let (Some(rt), Some(handler)) = (self.control.as_ref(), cmd.control_handler.as_ref())
+        {
+            handler(&args, rt.as_ref());
+            return true;
         }
+        // needs_control but no runtime bound (session-only mode): fall through
+        // to the effect handler so the placeholder can surface an error rather
+        // than silently no-op'ing.
         let effect = (cmd.handler)(&args);
         self.apply(effect);
         true
@@ -244,8 +225,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    fn mcp_command_side_with_events(
-    ) -> (CommandSide, Rc<RefCell<Vec<(&'static str, String)>>>) {
+    fn mcp_command_side_with_events() -> (CommandSide, Rc<RefCell<Vec<(&'static str, String)>>>) {
         let mut api = ExtensionApi::new();
         super::super::mcp::McpExtension::new(Config::default(), None).register(&mut api);
         let (commands, _, _, _) = api.into_parts();

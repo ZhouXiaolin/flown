@@ -3,23 +3,22 @@
 //! `/btw` is a **control** command: its handler needs the iodilos-side
 //! [`ControlRuntime`](super::types::ControlRuntime) to drive the conversation
 //! stack (fork the main session, push a layer, optionally submit a prompt).
-//! That capability holds `Rc`-based state and cannot be `Send`, so — unlike
-//! `/mcp`'s effect handler — the real `/btw` logic is bound at mount
-//! (`runtime.rs`) into [`CommandSide`](super::runner::CommandSide), not during
-//! `register` (which runs on tokio).
+//! That capability is supplied by the TUI at mount time; this extension owns the
+//! `/btw` policy and calls only the generic overlap API.
 //!
-//! What `register` does here is purely metadata: it tells the layer the
-//! command exists (for autocomplete + `/help`) and marks it
-//! `needs_control`. The placeholder handler surfaces a clear error if the
-//! control capability is somehow absent at dispatch time (session-only mode).
+//! `register` records the command metadata and its control handler. If the
+//! runtime capability is absent at dispatch time, the generic command layer
+//! surfaces a clear unavailable error.
 //!
 //! Argument parsing (`/btw` vs `/btw <message>`) is a pure, unit-tested
 //! function so it stays testable without a TUI.
 
-use super::types::{CommandEffect, CommandMeta, Extension, ExtensionApi};
+use super::types::{
+    CommandMeta, ControlRuntime, Extension, ExtensionApi, OverlapOptions, SlashCommandScope,
+};
 
-/// The `/btw` extension. Stateless beyond the (unused here) registration — all
-/// real work happens in the iodilos-side control handler bound at mount.
+/// The `/btw` extension. Stateless beyond registration; all btw policy is in
+/// [`open_btw_overlap`].
 pub struct BtwExtension;
 
 impl BtwExtension {
@@ -45,14 +44,7 @@ impl Extension for BtwExtension {
             CommandMeta::simple(
                 "Open a temporary side conversation (forks current history; Ctrl+C to exit)",
             ),
-            // Placeholder effect handler: only reached if dispatch falls
-            // through (no control capability bound). Surfaces a clear message
-            // rather than silently no-op'ing.
-            std::sync::Arc::new(|_args: &str| {
-                CommandEffect::NotifyError(
-                    "/btw is unavailable in this mode (no conversation runtime).".to_string(),
-                )
-            }),
+            std::sync::Arc::new(open_btw_overlap),
         );
     }
 }
@@ -72,6 +64,21 @@ pub fn parse_btw_args(args: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Runtime handler for `/btw`.
+///
+/// All btw-specific policy lives here. The TUI runtime only sees a generic
+/// overlap request: open an agent-backed overlay, disable slash commands inside
+/// it, display a badge, and keep it single-instance.
+pub fn open_btw_overlap(args: &str, rt: &dyn ControlRuntime) {
+    let mut options = OverlapOptions::new("btw");
+    options.badge = Some("BTW".to_string());
+    options.single_instance_key = Some("btw".to_string());
+    options.dismissible = true;
+    options.slash_commands = SlashCommandScope::Disabled;
+    options.initial_prompt = parse_btw_args(args);
+    rt.open_overlap(options);
 }
 
 #[cfg(test)]
@@ -99,6 +106,9 @@ mod tests {
 
     #[test]
     fn btw_trims_surrounding_whitespace() {
-        assert_eq!(parse_btw_args("  hello world  "), Some("hello world".to_string()));
+        assert_eq!(
+            parse_btw_args("  hello world  "),
+            Some("hello world".to_string())
+        );
     }
 }

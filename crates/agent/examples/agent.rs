@@ -1,6 +1,6 @@
 use flown_agent::{Agent, AgentEvent, AgentMessage, AgentOptions, AgentTool, AgentToolResult};
 use flown_ai::register_built_in_api_providers;
-use flown_ai::types::*;
+use flown_ai::{MessageContent, ToolResultContent, UserMessage};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -88,13 +88,13 @@ async fn main() -> anyhow::Result<()> {
         Box::pin(async { std::env::var("DEEPSEEK_API_KEY").ok() })
     }));
     let agent = Agent::new(options);
-    agent.set_tools(vec![create_bash_tool()]);
-    agent.set_system_prompt(
-        "You are a helpful coding agent. Use the bash tool to run commands."
-            .to_string(),
-    );
+    agent.state().update(|state| {
+        state.tools = vec![create_bash_tool()];
+        state.system_prompt =
+            "You are a helpful coding agent. Use the bash tool to run commands.".to_string();
+    });
 
-    println!("Agent ready. Model: {}", agent.state().model.name);
+    println!("Agent ready. Model: {}", agent.state().snapshot().model.name);
     println!();
 
     // Subscribe to lifecycle events (callback model). Listeners are awaited in

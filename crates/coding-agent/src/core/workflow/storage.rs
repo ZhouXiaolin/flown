@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use flown_agent::harness::session::create_session_id;
+use flown_agent::create_session_id;
 
 pub fn write_workflow_draft(
     workflows_dir: &Path,

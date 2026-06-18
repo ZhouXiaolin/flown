@@ -1,6 +1,7 @@
 use super::jsonl_storage::SessionError;
 use super::session::Session;
 use super::storage::{SessionStorage, create_session_id as storage_create_session_id};
+use crate::harness::{FileError, FileErrorCode};
 use super::types::{ForkPosition, SessionTreeEntry};
 
 pub fn create_session_id() -> String {
@@ -13,6 +14,18 @@ pub fn create_timestamp() -> String {
 
 pub fn to_session(storage: Box<dyn SessionStorage>) -> Session {
     Session::new(storage)
+}
+
+pub fn get_file_system_result_or_throw<T>(
+    result: Result<T, FileError>,
+    message: &str,
+) -> Result<T, SessionError> {
+    result.map_err(|error| {
+        match error.code {
+            FileErrorCode::NotFound => SessionError::NotFound(format!("{message}: {error}")),
+            _ => SessionError::Storage(format!("{message}: {error}")),
+        }
+    })
 }
 
 pub async fn get_entries_to_fork(

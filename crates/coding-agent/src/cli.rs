@@ -116,7 +116,8 @@ pub async fn cmd_chat(
         Some(prompt.join(" "))
     };
 
-    crate::interactive_mode::run_tui(config, model_str, provider_name, api_key, initial_prompt).await
+    crate::interactive_mode::run_tui(config, model_str, provider_name, api_key, initial_prompt)
+        .await
 }
 
 pub fn cmd_config(action: Option<ConfigAction>) -> anyhow::Result<()> {
@@ -174,9 +175,15 @@ pub async fn cmd_mcp(action: Option<McpAction>) -> anyhow::Result<()> {
                         crate::core::types::McpServerStatus::Error => "⚠",
                     };
                     let tool_count = info.tool_count;
-                    let error_info = info.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default();
-                    println!("  {status_icon} {} — {} ({} tool(s)){}",
-                        info.name, info.command, tool_count, error_info);
+                    let error_info = info
+                        .error
+                        .as_deref()
+                        .map(|e| format!(" ({e})"))
+                        .unwrap_or_default();
+                    println!(
+                        "  {status_icon} {} — {} ({} tool(s)){}",
+                        info.name, info.command, tool_count, error_info
+                    );
                 }
             }
         }
@@ -188,10 +195,15 @@ pub async fn cmd_mcp(action: Option<McpAction>) -> anyhow::Result<()> {
                 manager.connect_all().await;
                 let tool_infos = manager.tool_infos();
                 if tool_infos.is_empty() {
-                    println!("No MCP tools available (servers may be disconnected or have no tools).");
+                    println!(
+                        "No MCP tools available (servers may be disconnected or have no tools)."
+                    );
                 } else {
                     // Group tools by server
-                    let mut by_server: std::collections::BTreeMap<String, Vec<&crate::core::types::ToolInfo>> = std::collections::BTreeMap::new();
+                    let mut by_server: std::collections::BTreeMap<
+                        String,
+                        Vec<&crate::core::types::ToolInfo>,
+                    > = std::collections::BTreeMap::new();
                     for tool in &tool_infos {
                         let server = tool.source.as_deref().unwrap_or("unknown").to_string();
                         by_server.entry(server).or_default().push(tool);
@@ -220,9 +232,13 @@ pub async fn cmd_mcp(action: Option<McpAction>) -> anyhow::Result<()> {
             let arguments: serde_json::Value = serde_json::from_str(&args)
                 .map_err(|e| anyhow::anyhow!("invalid --args JSON: {e}"))?;
             let mut manager = McpManager::new(config.mcp_servers.clone());
-            manager.connect(&server).await
+            manager
+                .connect(&server)
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to connect to MCP server '{server}': {e}"))?;
-            let result = manager.call_tool(&format!("mcp__{server}__{tool}"), arguments).await
+            let result = manager
+                .call_tool(&format!("mcp__{server}__{tool}"), arguments)
+                .await
                 .map_err(|e| anyhow::anyhow!("MCP tool call failed: {e}"))?;
             println!("{result}");
         }
@@ -250,18 +266,18 @@ pub async fn build_agent(
     api_key: Option<String>,
     config: &Config,
 ) -> anyhow::Result<(
-    flown_agent::harness::AgentHarness,
+    flown_agent::AgentHarness,
     Option<Arc<tokio::sync::Mutex<crate::core::mcp::McpManager>>>,
 )> {
-    flown_ai::init();
+    flown_ai::register_built_in_api_providers();
 
     let (provider_hint, model_id) = model_str
         .find('/')
         .map(|i| (&model_str[..i], &model_str[i + 1..]))
         .unwrap_or(("", model_str));
 
-    let model = flown_ai::models::get_model(provider_hint, model_id)
-        .or_else(|| flown_ai::models::get_model("", model_id));
+    let model = flown_ai::get_model(provider_hint, model_id)
+        .or_else(|| flown_ai::get_model("", model_id));
 
     let model = match model {
         Some(m) => m,
@@ -303,12 +319,15 @@ pub async fn build_agent(
             None
         };
 
-    let system_prompt = crate::core::system_prompt::build_system_prompt(crate::core::system_prompt::BuildSystemPromptOptions {
-        cwd: cwd.clone(),
-        context_files,
-        skills,
-        ..Default::default()
-    }).await;
+    let system_prompt = crate::core::system_prompt::build_system_prompt(
+        crate::core::system_prompt::BuildSystemPromptOptions {
+            cwd: cwd.clone(),
+            context_files,
+            skills,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // Execution environment (cloned: moved into harness `env` and into tool builders).
     let env = Arc::new(crate::native_env::NativeExecutionEnv::new());
@@ -322,11 +341,8 @@ pub async fn build_agent(
     // (harness.rs:1709-1738), so coding-agent no longer needs its own persistence
     // task. Session is not Clone, so it is created directly via the repo and
     // moved into the harness by value.
-    use flown_agent::harness::session::{
-        JsonlSessionCreateOptions, JsonlSessionRepo, SessionRepo,
-    };
-    let fs: Arc<dyn flown_agent::harness::env::types::FileSystem> =
-        Arc::new(crate::core::real_fs::RealFileSystem::new());
+    use flown_agent::{FileSystem, JsonlSessionCreateOptions, JsonlSessionRepo, SessionRepo};
+    let fs: Arc<dyn FileSystem> = Arc::new(crate::core::real_fs::RealFileSystem::new());
     let sessions_root = dirs::home_dir()
         .map(|h| h.join(".flown").join("agent").join("sessions"))
         .map(|p| p.to_string_lossy().to_string())
@@ -340,22 +356,23 @@ pub async fn build_agent(
         })
         .await?;
 
-    let harness = flown_agent::harness::AgentHarness::new(flown_agent::harness::AgentHarnessOptions {
-        env,
-        session,
-        tools,
-        system_prompt: flown_agent::harness::SystemPromptConfig::Static(system_prompt),
-        model,
-        thinking_level: Some(flown_ai::types::ThinkingLevel::Off),
-        get_api_key_and_headers: Some(Arc::new(move |_model: &flown_ai::types::Model| {
-            api_key.clone().map(|k| (k, None))
-        })),
-        resources: None,
-        stream_options: None,
-        active_tool_names: None,
-        steering_mode: None,
-        follow_up_mode: None,
-    });
+    let harness =
+        flown_agent::AgentHarness::new(flown_agent::AgentHarnessOptions {
+            env,
+            session,
+            tools,
+            system_prompt: flown_agent::SystemPromptConfig::Static(system_prompt),
+            model,
+            thinking_level: Some(flown_ai::ThinkingLevel::Off),
+            get_api_key_and_headers: Some(Arc::new(move |_model: &flown_ai::Model| {
+                api_key.clone().map(|k| (k, None))
+            })),
+            resources: None,
+            stream_options: None,
+            active_tool_names: None,
+            steering_mode: None,
+            follow_up_mode: None,
+        });
 
     Ok((harness, mcp_manager))
 }

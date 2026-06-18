@@ -4,8 +4,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use flown_agent::harness::AgentHarness;
-use flown_ai::types::{AssistantContent, AssistantMessage};
+use flown_agent::AgentHarness;
+use flown_ai::{AssistantContent, AssistantMessage};
 
 use crate::core::types::WorkflowSource;
 use crate::core::workflow::metadata::{WorkflowDescriptor, extract_workflow_metadata};

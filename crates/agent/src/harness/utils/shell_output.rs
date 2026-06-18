@@ -1,7 +1,5 @@
 use super::truncate::{DEFAULT_MAX_BYTES, truncate_tail};
-use crate::harness::env::types::{
-    AbortSignal, ExecOptions, ExecutionEnv, ExecutionError, ExecutionErrorCode,
-};
+use crate::harness::{AbortSignal, ExecOptions, ExecutionEnv, ExecutionError, ExecutionErrorCode};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -95,7 +93,7 @@ pub async fn execute_shell_with_capture(
         .expect("capture error lock poisoned")
         .clone()
     {
-        return Err(ExecutionError { code });
+        return Err(ExecutionError::new(code, "shell output capture failed"));
     }
 
     let total_bytes = *total_bytes.lock().expect("total bytes lock poisoned");
@@ -104,14 +102,10 @@ pub async fn execute_shell_with_capture(
         let path = env
             .create_temp_file(Some("bash-"), Some(".log"))
             .await
-            .map_err(|_| ExecutionError {
-                code: ExecutionErrorCode::Unknown,
-            })?;
+            .map_err(|e| ExecutionError::with_source(ExecutionErrorCode::Unknown, "failed to create temp file", e))?;
         env.append_file(&path, tail_output.as_bytes())
             .await
-            .map_err(|_| ExecutionError {
-                code: ExecutionErrorCode::Unknown,
-            })?;
+            .map_err(|e| ExecutionError::with_source(ExecutionErrorCode::Unknown, "failed to write full output log", e))?;
         full_output_path = Some(path);
     }
 

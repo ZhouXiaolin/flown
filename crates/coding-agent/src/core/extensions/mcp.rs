@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use flown_agent::types::{AgentTool, AgentToolError, AgentToolResult, ToolExecutionMode};
+use flown_agent::{AgentTool, AgentToolError, AgentToolResult, ToolExecutionMode};
 use serde_json::Value;
 
 use crate::config::Config;
@@ -137,8 +137,8 @@ fn mcp_manager_tools(mcp: Arc<tokio::sync::Mutex<McpManager>>) -> Vec<AgentTool>
 
                         match result {
                             Ok(output) => Ok(AgentToolResult {
-                                content: vec![flown_ai::types::ToolResultContent::Text(
-                                    flown_ai::types::TextContent {
+                                content: vec![flown_ai::ToolResultContent::Text(
+                                    flown_ai::TextContent {
                                         content_type: "text".to_string(),
                                         text: output,
                                         text_signature: None,
@@ -217,10 +217,7 @@ fn mcp_list_text(config: &Config) -> String {
 /// server: connected (with tool count), error (with message), or disconnected.
 /// Otherwise falls back to a config-only view (enabled/disabled) so the command
 /// is never empty.
-fn mcp_status_text(
-    config: &Config,
-    mcp: Option<&Arc<tokio::sync::Mutex<McpManager>>>,
-) -> String {
+fn mcp_status_text(config: &Config, mcp: Option<&Arc<tokio::sync::Mutex<McpManager>>>) -> String {
     if config.mcp_servers.is_empty() {
         return "No MCP servers configured.".into();
     }
@@ -278,7 +275,7 @@ fn mcp_status_text(
 // it via `core::tools` still resolve. (No MCP code uses it; kept for stability
 // of the module's public surface during the move.)
 #[allow(unused_imports)]
-use flown_agent::harness::env::types::ExecutionEnv as _ExecutionEnv;
+use flown_agent::ExecutionEnv as _ExecutionEnv;
 
 #[cfg(test)]
 mod tests {

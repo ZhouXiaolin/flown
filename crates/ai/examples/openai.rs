@@ -1,11 +1,11 @@
-use omp_ai::types::*;
-use omp_ai::{get_model, init, stream_simple};
+use flown_ai::*;
+use flown_ai::{get_model, register_built_in_api_providers, stream_simple};
 use futures::stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize the AI module
-    init();
+    register_built_in_api_providers();
 
     // Get the DeepSeek V4 Flash model
     let model =
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         reasoning: None,
         thinking_budgets: None,
     };
-    let mut stream = stream_simple(&model, &context, Some(&options));
+    let mut stream = stream_simple(&model, &context, Some(&options))?;
 
     let mut in_thinking = false;
 

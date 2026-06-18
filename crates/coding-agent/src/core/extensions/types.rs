@@ -26,12 +26,11 @@
 //! moved to iodilos) without forcing `CommandContext` to be `Sync`, which is
 //! impossible while it carries `Rc<UiState>`. An effect is plain `Send` data;
 //! iodilos interprets it. This is also more testable (effects are values) and
-//! accommodates future btw commands as new `CommandEffect` variants.
+//! accommodates future control commands through generic runtime capabilities.
 
 use std::sync::Arc;
 
-use flown_agent::types::AgentTool;
-
+use flown_agent::AgentTool;
 
 // ── Extension trait ─────────────────────────────────────────────────────
 
@@ -88,8 +87,8 @@ pub struct SubcommandDef {
 /// iodilos). The iodilos-side dispatcher interprets each variant.
 ///
 /// Variants are added when a real extension needs them — never preemptively.
-/// M2a needs only the notify pair. Future btw (M3) will add e.g.
-/// `PushTranscript { prompt }`.
+/// M2a needs only the notify pair. Control commands use [`ControlRuntime`]
+/// when they need live TUI capabilities.
 #[derive(Debug, Clone)]
 pub enum CommandEffect {
     /// Push an informational line into the transcript. Does not trigger a turn.
@@ -100,6 +99,38 @@ pub enum CommandEffect {
     ClearTranscript,
 }
 
+/// Whether an extension-owned overlap participates in global slash commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlashCommandScope {
+    #[default]
+    Global,
+    Disabled,
+}
+
+/// Options for opening an extension-owned agent overlap.
+#[derive(Debug, Clone)]
+pub struct OverlapOptions {
+    pub extension_id: String,
+    pub badge: Option<String>,
+    pub single_instance_key: Option<String>,
+    pub dismissible: bool,
+    pub slash_commands: SlashCommandScope,
+    pub initial_prompt: Option<String>,
+}
+
+impl OverlapOptions {
+    pub fn new(extension_id: impl Into<String>) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            badge: None,
+            single_instance_key: None,
+            dismissible: true,
+            slash_commands: SlashCommandScope::Global,
+            initial_prompt: None,
+        }
+    }
+}
+
 /// Handler invoked when the user runs a registered extension command.
 ///
 /// `args` is everything after the command name (trimmed, re-joined). The
@@ -107,6 +138,7 @@ pub enum CommandEffect {
 /// directly, which keeps it `Send + Sync` regardless of the iodilos thread's
 /// `Rc`-based state.
 pub type CommandHandler = Arc<dyn Fn(&str) -> CommandEffect + Send + Sync>;
+pub type ControlHandler = Arc<dyn Fn(&str, &dyn ControlRuntime) + Send + Sync>;
 
 /// A fully-registered command, captured by [`ExtensionApi`] during `register`
 /// and moved into the iodilos-side [`super::CommandSide`].
@@ -114,33 +146,33 @@ pub struct RegisteredCommand {
     pub name: String,
     pub meta: CommandMeta,
     pub handler: CommandHandler,
+    pub control_handler: Option<ControlHandler>,
     /// When `true`, the command needs the iodilos-side [`ControlRuntime`] to
-    /// drive the conversation stack (e.g. `/btw`). The effect `handler` is
-    /// ignored for such commands; [`super::CommandSide`] looks up a
-    /// [`ControlHandler`] bound at mount by name and dispatches through it.
-    /// Effect-only commands (`/mcp`) leave this `false` and use `handler`.
+    /// drive the conversation stack. [`super::CommandSide`] supplies the live
+    /// runtime to `control_handler`; effect-only commands (`/mcp`) leave this
+    /// `false` and use `handler`.
     pub needs_control: bool,
 }
 
-// ── Control-runtime (iodilos-side capability, for commands like /btw) ────
+// ── Control-runtime (iodilos-side capability) ───────────────────────────
 
 /// Iodilos-side capability handed to *control* commands (those registered with
 /// [`ExtensionApi::register_control_command`]). Lets a command drive the
-/// conversation stack — enter/exit a btw layer, submit a turn, notify —
-/// without returning a plain [`CommandEffect`], because "enter btw then
-/// optionally send a message" is sequential logic over live runtime state.
+/// conversation stack — open/close an extension layer, submit a turn, notify —
+/// without returning a plain [`CommandEffect`] when sequential logic over live
+/// runtime state is required.
 ///
 /// This mirrors pi-mono's `ExtensionCommandContext` (handler receives a
 /// stateful `ctx`, not a pure effect). Implementations live on the iodilos
 /// thread and hold `Rc`-based state, so this trait is **not** `Send` and is
 /// never constructed during `register` (which runs on tokio). `CommandSide`
-/// builds the impl at mount and binds it to the command by name.
+/// receives the impl at mount and passes it to registered control handlers.
 pub trait ControlRuntime {
-    /// Enter a btw layer, forking the active session's history. If `prompt` is
-    /// `Some`, submit it as a turn on the new layer immediately.
-    fn enter_btw(&self, prompt: Option<String>);
-    /// Exit the active btw layer (aborts it, discards it). No-op on Main.
-    fn exit_btw(&self);
+    /// Open an extension-owned agent overlap. The runtime owns the generic
+    /// mechanics; the extension owns the options and policy.
+    fn open_overlap(&self, options: OverlapOptions);
+    /// Close the active dismissible overlap. No-op on Main.
+    fn close_active_overlap(&self);
     /// Submit `text` as a user turn on the active layer's harness.
     fn send_to_active(&self, text: String);
     /// Push an informational line into the active layer's transcript.
@@ -149,8 +181,6 @@ pub trait ControlRuntime {
     fn notify_error_active(&self, text: String);
     /// Clear the active layer's transcript.
     fn clear_active(&self);
-    /// Whether the active layer is a btw layer.
-    fn active_is_btw(&self) -> bool;
 }
 
 // ── ToolHandle (runtime add/remove) ─────────────────────────────────────
@@ -293,11 +323,12 @@ impl ExtensionApi {
             name: name.to_string(),
             meta,
             handler,
+            control_handler: None,
             needs_control: false,
         });
     }
 
-    /// Register a control slash command (`/btw`) that needs the iodilos-side
+    /// Register a control slash command that needs the iodilos-side
     /// [`ControlRuntime`] to drive the conversation stack. Only the metadata
     /// (`name`/`meta`) is captured here; the actual handler is an
     /// iodilos-side closure bound at mount (see [`super::CommandSide`]),
@@ -307,12 +338,17 @@ impl ExtensionApi {
         &mut self,
         name: &str,
         meta: CommandMeta,
-        placeholder: CommandHandler,
+        control_handler: ControlHandler,
     ) {
         self.commands.push(RegisteredCommand {
             name: name.to_string(),
             meta,
-            handler: placeholder,
+            handler: Arc::new(|_| {
+                CommandEffect::NotifyError(
+                    "control command unavailable in this runtime".to_string(),
+                )
+            }),
+            control_handler: Some(control_handler),
             needs_control: true,
         });
     }

@@ -13,17 +13,19 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-
 #[component]
 pub fn HintBar() -> Node {
     let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
-    let state = Rc::clone(&stack.active().state);
-    let busy = state.busy;
+    let active_index = stack.active_index_signal();
 
     let node = Node::new_richtext();
-    // Seed the initial line (idle), then keep it in sync with `busy`.
+    // Seed the initial line (idle), then keep it in sync with the active
+    // layer's `busy` signal. Reading active_index first makes the effect
+    // re-bind to the new layer on push/pop.
     let seed_node = node.clone();
     create_effect(move || {
+        active_index.get();
+        let busy = Rc::clone(&stack.active().state).busy;
         let line = if busy.get() {
             Line::from(vec![
                 Span::styled("  ⟳ ", Style::default().fg(Color::Yellow)),

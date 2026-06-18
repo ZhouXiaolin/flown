@@ -1,8 +1,37 @@
-use super::compaction::{estimate_message_tokens, extract_file_ops, serialize_conversation};
-use crate::harness::session::types::*;
-use crate::harness::types::{BranchSummaryError, BranchSummaryErrorCode};
+use super::compaction::{estimate_message_tokens, estimate_tokens, extract_file_ops, serialize_conversation};
+use crate::harness::types::*;
+use crate::harness::{BranchSummaryError, BranchSummaryErrorCode};
+use crate::harness::session::{
+    ContentBlock, CustomMessageContent, SessionMessage, SessionTreeEntry,
+};
 use crate::types::AgentMessage;
-use flown_ai::types::*;
+use flown_ai::{
+    AbortSignal, AssistantContent, Context, Message, MessageContent, Model, SimpleStreamOptions,
+    StopReason, ThinkingLevel, ToolResultContent, Usage, UserMessage,
+};
+
+/// File-operation details stored on generated branch summary entries.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BranchSummaryDetails {
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+}
+
+/// Prepared branch content for summarization.
+#[derive(Debug, Clone, Default)]
+pub struct BranchPreparation {
+    pub messages: Vec<AgentMessage>,
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+    pub total_tokens: u64,
+}
+
+/// Entries selected for branch summarization.
+#[derive(Debug, Clone, Default)]
+pub struct CollectEntriesResult {
+    pub entries: Vec<SessionTreeEntry>,
+    pub common_ancestor_id: Option<String>,
+}
 
 /// Collect entries for branch summary
 pub fn collect_entries_for_branch_summary(
@@ -39,6 +68,26 @@ pub fn collect_entries_for_branch_summary(
     result
 }
 
+/// Public alias that exposes the pi-mono branch-summary collection shape.
+pub fn collect_entries_for_branch_summary_result(
+    entries: &[SessionTreeEntry],
+    old_leaf_id: &str,
+    target_id: &str,
+) -> CollectEntriesResult {
+    let old_path = get_path_set(entries, old_leaf_id);
+    let target_path = get_path(entries, target_id);
+    let common_ancestor_id = target_path
+        .iter()
+        .rev()
+        .find(|id| old_path.contains(*id))
+        .cloned();
+
+    CollectEntriesResult {
+        entries: collect_entries_for_branch_summary(entries, old_leaf_id, target_id),
+        common_ancestor_id,
+    }
+}
+
 /// Branch summary result
 #[derive(Debug, Clone)]
 pub struct BranchSummaryResult {
@@ -68,8 +117,8 @@ const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this convers
 /// Branch summary preamble
 const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
-/// Prepare branch entries for summarization within a token budget
-pub fn prepare_branch_entries(
+/// Internal tuple-based helper for branch summarization preparation.
+fn prepare_branch_entries_tuple(
     entries: &[SessionTreeEntry],
     token_budget: u64,
 ) -> (Vec<AgentMessage>, Vec<String>, Vec<String>) {
@@ -80,7 +129,7 @@ pub fn prepare_branch_entries(
     for entry in entries.iter().rev() {
         let msg = match entry {
             SessionTreeEntry::Message {
-                message: super::super::session::types::SessionMessage(msg),
+                message: SessionMessage(msg),
                 ..
             } => {
                 // Skip tool results
@@ -146,6 +195,24 @@ pub fn prepare_branch_entries(
     (messages, read_files, modified_files)
 }
 
+/// Prepare branch entries for summarization within a token budget.
+pub fn prepare_branch_entries(
+    entries: &[SessionTreeEntry],
+    token_budget: u64,
+) -> BranchPreparation {
+    let (messages, read_files, modified_files) = prepare_branch_entries_tuple(entries, token_budget);
+    let total_tokens = messages
+        .iter()
+        .map(estimate_tokens)
+        .sum();
+    BranchPreparation {
+        messages,
+        read_files,
+        modified_files,
+        total_tokens,
+    }
+}
+
 /// Generate branch summary using LLM
 pub async fn generate_branch_summary_with_llm(
     entries: &[SessionTreeEntry],
@@ -156,7 +223,12 @@ pub async fn generate_branch_summary_with_llm(
     let context_window = options.model.context_window as u64; // u32 → u64
     let token_budget = context_window - options.reserve_tokens;
 
-    let (messages, read_files, modified_files) = prepare_branch_entries(entries, token_budget);
+    let BranchPreparation {
+        messages,
+        read_files,
+        modified_files,
+        ..
+    } = prepare_branch_entries(entries, token_budget);
 
     if messages.is_empty() {
         return Ok(BranchSummaryResult {
@@ -173,7 +245,7 @@ pub async fn generate_branch_summary_with_llm(
                 id: String::new(),
                 parent_id: None,
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                message: super::super::session::types::SessionMessage(m.clone()),
+                message: SessionMessage(m.clone()),
             })
             .collect::<Vec<_>>(),
     );
@@ -211,7 +283,14 @@ pub async fn generate_branch_summary_with_llm(
     stream_options.base.api_key = Some(options.api_key.clone());
     stream_options.base.signal = options.signal.clone();
 
-    let response = complete_simple(&options.model, &context, Some(&stream_options)).await;
+    let response = complete_simple(&options.model, &context, Some(&stream_options))
+        .await
+        .map_err(|err| {
+            BranchSummaryError::new(
+                BranchSummaryErrorCode::SummarizationFailed,
+                format!("Branch summary failed: {err}"),
+            )
+        })?;
 
     match response.stop_reason {
         StopReason::Aborted => Err(BranchSummaryError::new(
@@ -252,6 +331,14 @@ pub async fn generate_branch_summary_with_llm(
             })
         }
     }
+}
+
+/// Pi-mono-aligned alias for the public branch-summary generator.
+pub async fn generate_branch_summary(
+    entries: &[SessionTreeEntry],
+    options: &GenerateBranchSummaryOptions,
+) -> Result<BranchSummaryResult, BranchSummaryError> {
+    generate_branch_summary_with_llm(entries, options).await
 }
 
 /// Get path from entry to root as a set of IDs

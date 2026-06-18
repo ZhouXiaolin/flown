@@ -25,13 +25,15 @@ const TRANSCRIPT_CHROME_COLS: u16 = 4;
 #[component]
 pub fn Transcript() -> impl IntoView {
     let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
-    let state = Rc::clone(&stack.active().state);
+    let active_index = stack.active_index_signal();
     let terminal_size = use_terminal_size();
-    let scroll_state = Rc::clone(&state);
 
     let content = Node::new_richtext();
     let content_for_effect = content.clone();
+    let stack_for_effect = Rc::clone(&stack);
     create_effect(move || {
+        active_index.get();
+        let state = Rc::clone(&stack_for_effect.active().state);
         let (terminal_width, terminal_height) = terminal_size.get();
         let viewport_lines = transcript_viewport_lines(terminal_height);
         let render_width = transcript_render_width(terminal_width);
@@ -46,10 +48,15 @@ pub fn Transcript() -> impl IntoView {
         });
     });
 
-    let on_scroll = Callback::new(move |direction| match direction {
-        ScrollDirection::Up => scroll_state.scroll_up(3),
-        ScrollDirection::Down => scroll_state.scroll_down(3),
-        ScrollDirection::Left | ScrollDirection::Right => {}
+    // Scroll acts on whatever layer is active at scroll time (not mount time).
+    let scroll_stack = Rc::clone(&stack);
+    let on_scroll = Callback::new(move |direction| {
+        let state = Rc::clone(&scroll_stack.active().state);
+        match direction {
+            ScrollDirection::Up => state.scroll_up(3),
+            ScrollDirection::Down => state.scroll_down(3),
+            ScrollDirection::Left | ScrollDirection::Right => {}
+        }
     });
     let mut props = ScrollableViewportProps::new(content, on_scroll);
     props.border_color = Color::Rgb(40, 40, 48);
@@ -61,9 +68,7 @@ fn transcript_viewport_lines(terminal_height: u16) -> usize {
 }
 
 fn transcript_render_width(terminal_width: u16) -> usize {
-    terminal_width
-        .saturating_sub(TRANSCRIPT_CHROME_COLS)
-        .max(1) as usize
+    terminal_width.saturating_sub(TRANSCRIPT_CHROME_COLS).max(1) as usize
 }
 
 pub(crate) fn visible_transcript_lines(

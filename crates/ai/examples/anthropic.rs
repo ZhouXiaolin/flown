@@ -1,10 +1,10 @@
-use omp_ai::types::*;
-use omp_ai::{get_model, init, stream_simple};
+use flown_ai::*;
+use flown_ai::{get_model, register_built_in_api_providers, stream_simple};
 use futures::stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init();
+    register_built_in_api_providers();
 
     let api_key = std::env::var("MIMO_API_KEY")?;
     let model =
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         thinking_budgets: None,
     };
 
-    let mut stream = stream_simple(&model, &context, Some(&options));
+    let mut stream = stream_simple(&model, &context, Some(&options))?;
 
     while let Some(event) = stream.next().await {
         match event {

@@ -1,5 +1,9 @@
-pub use flown_ai::types::AbortSignal;
-use flown_ai::types::*;
+pub use flown_ai::AbortSignal;
+use flown_ai::{
+    AssistantContent, AssistantMessage, AssistantMessageEvent, Context, ImageContent, Message,
+    Model, OnPayloadFn, OnResponseFn, SimpleStreamOptions, ThinkingBudgets, ThinkingLevel, Tool,
+    ToolCall, ToolResultContent, ToolResultMessage, Transport, UserMessage,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
@@ -12,7 +16,7 @@ pub type StreamFn = Arc<
             Model,
             Context,
             Option<SimpleStreamOptions>,
-        ) -> flown_ai::api_registry::AssistantMessageEventStream
+        ) -> flown_ai::AssistantMessageEventStream
         + Send
         + Sync,
 >;
@@ -277,7 +281,7 @@ impl Clone for AgentTool {
 pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<AgentMessage>,
-    pub tools: Vec<AgentTool>,
+    pub tools: Option<Vec<AgentTool>>,
 }
 
 /// Agent state
@@ -287,6 +291,7 @@ pub struct AgentState {
     pub model: Model,
     pub thinking_level: ThinkingLevel,
     pub messages: Vec<AgentMessage>,
+    pub tools: Vec<AgentTool>,
     pub is_streaming: bool,
     pub streaming_message: Option<AgentMessage>,
     pub pending_tool_calls: HashSet<String>,

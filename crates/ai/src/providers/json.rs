@@ -1,4 +1,4 @@
-pub(super) fn parse_streaming_json(raw: &str) -> serde_json::Value {
+pub fn parse_streaming_json(raw: &str) -> serde_json::Value {
     if raw.trim().is_empty() {
         return serde_json::json!({});
     }
@@ -78,7 +78,7 @@ fn trim_trailing_comma(json: &mut String) {
     }
 }
 
-pub(super) fn repair_json(raw: &str) -> String {
+pub fn repair_json(raw: &str) -> String {
     let mut repaired = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     let mut in_string = false;

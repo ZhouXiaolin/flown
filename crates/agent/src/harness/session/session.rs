@@ -1,6 +1,7 @@
 use super::storage::SessionStorage;
 use super::types::*;
 use crate::types::{AgentMessage, CustomAgentMessage};
+use flown_ai::{MessageContent, UserMessage};
 
 /// Session wraps a SessionStorage and provides the tree-based transcript API
 pub struct Session {
@@ -72,9 +73,9 @@ impl Session {
         follow_up_text: &str,
     ) -> Vec<SessionTreeEntry> {
         source.copy_branch_to(self, from_id).await;
-        self.append_message(AgentMessage::User(flown_ai::types::UserMessage {
+        self.append_message(AgentMessage::User(UserMessage {
             role: "user".to_string(),
-            content: flown_ai::types::MessageContent::Text(follow_up_text.to_string()),
+            content: MessageContent::Text(follow_up_text.to_string()),
             timestamp: chrono::Utc::now(),
         }))
         .await;
@@ -282,7 +283,10 @@ impl Session {
     }
 
     /// Set leaf ID directly
-    pub async fn set_leaf_id(&self, leaf_id: &str) -> Result<(), super::jsonl_storage::SessionError> {
+    pub async fn set_leaf_id(
+        &self,
+        leaf_id: &str,
+    ) -> Result<(), super::jsonl_storage::SessionError> {
         self.storage.set_leaf_id(Some(leaf_id.to_string())).await
     }
 
@@ -360,9 +364,9 @@ pub fn build_session_context(entries: &[SessionTreeEntry]) -> SessionContext {
     if let Some(compaction_entry) = compaction {
         // Add compaction summary as a message
         if let SessionTreeEntry::Compaction { summary, .. } = compaction_entry {
-            messages.push(AgentMessage::User(flown_ai::types::UserMessage {
+            messages.push(AgentMessage::User(UserMessage {
                 role: "user".to_string(),
-                content: flown_ai::types::MessageContent::Text(format!(
+                content: MessageContent::Text(format!(
                     "The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>",
                     summary
                 )),
@@ -427,9 +431,9 @@ fn entry_to_message(entry: &SessionTreeEntry) -> Option<AgentMessage> {
             summary,
             from_id: _,
             ..
-        } => Some(AgentMessage::User(flown_ai::types::UserMessage {
+        } => Some(AgentMessage::User(UserMessage {
             role: "user".to_string(),
-            content: flown_ai::types::MessageContent::Text(format!(
+            content: MessageContent::Text(format!(
                 "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{}\n</summary>",
                 summary
             )),
@@ -459,9 +463,9 @@ fn entry_to_message(entry: &SessionTreeEntry) -> Option<AgentMessage> {
                         .join("\n")
                 }
             };
-            Some(AgentMessage::User(flown_ai::types::UserMessage {
+            Some(AgentMessage::User(UserMessage {
                 role: "user".to_string(),
-                content: flown_ai::types::MessageContent::Text(text),
+                content: MessageContent::Text(text),
                 timestamp: chrono::Utc::now(),
             }))
         }

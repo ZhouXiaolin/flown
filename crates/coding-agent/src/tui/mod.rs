@@ -16,7 +16,7 @@ pub mod conversation;
 pub mod editor;
 pub mod markdown;
 pub mod runtime;
+mod slash_commands;
 pub mod state;
 pub mod theme;
 pub mod tool_format;
-mod slash_commands;

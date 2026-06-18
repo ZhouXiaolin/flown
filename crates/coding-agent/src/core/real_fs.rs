@@ -1,4 +1,4 @@
-use flown_agent::harness::env::types::*;
+use flown_agent::{FileError, FileErrorCode, FileInfo, FileKind, FileSystem};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -106,12 +106,14 @@ impl FileSystem for RealFileSystem {
         let full = resolve_path(&self.cwd, path);
         // Create parent directories if needed
         if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    FileError::new(FileErrorCode::PermissionDenied, path)
-                }
-                _ => FileError::new(FileErrorCode::Unknown, path),
-            })?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        FileError::new(FileErrorCode::PermissionDenied, path)
+                    }
+                    _ => FileError::new(FileErrorCode::Unknown, path),
+                })?;
         }
         fs::write(&full, content).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => {

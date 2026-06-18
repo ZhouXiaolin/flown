@@ -74,8 +74,6 @@ pub enum KnownApi {
     GoogleGenerativeAi,
     #[serde(rename = "google-vertex")]
     GoogleVertex,
-    #[serde(rename = "deepseek-completions")]
-    DeepseekCompletions,
 }
 
 /// API identifier - either known or custom
@@ -107,7 +105,6 @@ impl std::fmt::Display for KnownApi {
             KnownApi::BedrockConverseStream => "bedrock-converse-stream",
             KnownApi::GoogleGenerativeAi => "google-generative-ai",
             KnownApi::GoogleVertex => "google-vertex",
-            KnownApi::DeepseekCompletions => "deepseek-completions",
         };
         write!(f, "{}", id)
     }
@@ -308,6 +305,10 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub headers: Option<HashMap<String, String>>,
     pub timeout_ms: Option<u64>,
+    /// WebSocket connect timeout in milliseconds for providers that support
+    /// WebSocket transports. Covers the connection/open handshake only;
+    /// stream idleness after connection uses `timeout_ms`.
+    pub websocket_connect_timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
@@ -335,6 +336,10 @@ impl std::fmt::Debug for StreamOptions {
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .field("headers", &self.headers)
             .field("timeout_ms", &self.timeout_ms)
+            .field(
+                "websocket_connect_timeout_ms",
+                &self.websocket_connect_timeout_ms,
+            )
             .field("max_retries", &self.max_retries)
             .field("tool_choice", &self.tool_choice)
             .field("thinking_enabled", &self.thinking_enabled)
@@ -360,6 +365,7 @@ impl Clone for StreamOptions {
             session_id: self.session_id.clone(),
             headers: self.headers.clone(),
             timeout_ms: self.timeout_ms,
+            websocket_connect_timeout_ms: self.websocket_connect_timeout_ms,
             max_retries: self.max_retries,
             max_retry_delay_ms: self.max_retry_delay_ms,
             metadata: self.metadata.clone(),
@@ -387,6 +393,7 @@ impl Default for StreamOptions {
             session_id: None,
             headers: None,
             timeout_ms: None,
+            websocket_connect_timeout_ms: None,
             max_retries: None,
             max_retry_delay_ms: None,
             metadata: None,
@@ -450,6 +457,59 @@ pub struct ImageContent {
     pub mime_type: String,
 }
 
+/// Phase discriminator carried inside a [`TextSignatureV1`] envelope.
+///
+/// Some providers split response generation into a "commentary" phase
+/// (intermediate reasoning) and a "final_answer" phase (the user-facing
+/// reply); the phase lets downstream tooling disambiguate the two when
+/// both share a single signature field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSignaturePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+/// Structured envelope stored inside [`TextContent::text_signature`] when
+/// the provider returns more than a bare id. Mirrors pi-ai's
+/// `TextSignatureV1` (types.ts:229-233).
+///
+/// The legacy form — a plain id string — is still supported: callers
+/// should try JSON-parsing `text_signature` as `TextSignatureV1` and
+/// fall back to treating the whole string as the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextSignatureV1 {
+    pub v: u8,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<TextSignaturePhase>,
+}
+
+impl TextSignatureV1 {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            v: 1,
+            id: id.into(),
+            phase: None,
+        }
+    }
+
+    pub fn with_phase(mut self, phase: TextSignaturePhase) -> Self {
+        self.phase = Some(phase);
+        self
+    }
+}
+
+/// Try to parse `raw` as a `TextSignatureV1` JSON envelope. If that fails
+/// (or `raw` is empty), returns a `TextSignatureV1` whose `id` is the
+/// bare string — matching pi-ai's "legacy id string" fallback.
+pub fn parse_text_signature(raw: &str) -> TextSignatureV1 {
+    if raw.is_empty() {
+        return TextSignatureV1::new("");
+    }
+    serde_json::from_str::<TextSignatureV1>(raw).unwrap_or_else(|_| TextSignatureV1::new(raw))
+}
+
 /// Tool call from assistant
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -475,6 +535,14 @@ pub struct Usage {
     pub cache_read: u32,
     #[serde(rename = "cacheWrite", alias = "cache_write")]
     pub cache_write: u32,
+    /// Subset of `cache_write` written with 1h retention. Only Anthropic
+    /// reports this split; other providers leave it `None`.
+    #[serde(
+        rename = "cacheWrite1h",
+        alias = "cache_write_1h",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_write_1h: Option<u32>,
     #[serde(rename = "totalTokens", alias = "total_tokens")]
     pub total_tokens: u32,
     pub cost: Cost,
@@ -541,6 +609,8 @@ pub struct AssistantMessage {
         skip_serializing_if = "Option::is_none"
     )]
     pub error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<crate::diagnostics::AssistantMessageDiagnostic>>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -795,6 +865,22 @@ pub struct Compat {
         skip_serializing_if = "Option::is_none"
     )]
     pub force_adaptive_thinking: Option<bool>,
+    /// Whether the model accepts the Anthropic `temperature` request field.
+    /// Claude Opus 4.7+ rejects non-default temperature values. Default: true.
+    #[serde(
+        rename = "supportsTemperature",
+        alias = "supports_temperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_temperature: Option<bool>,
+    /// Whether to replay empty thinking signatures as `signature: ""` instead
+    /// of converting thinking to text. Default: false.
+    #[serde(
+        rename = "allowEmptySignature",
+        alias = "allow_empty_signature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allow_empty_signature: Option<bool>,
 }
 
 /// Event from assistant message stream

@@ -4,7 +4,7 @@ use super::repo_utils::{create_session_id, create_timestamp, get_entries_to_fork
 use super::session::Session;
 use super::storage::SessionStorage;
 use super::types::{ForkPosition, JsonlSessionMetadata};
-use crate::harness::env::types::{FileKind, FileSystem};
+use crate::harness::{FileKind, FileSystem};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]

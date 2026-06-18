@@ -1,11 +1,14 @@
-use crate::agent_loop::{run_agent_loop, run_agent_loop_continue, AgentEventSink};
+use crate::agent_loop::{AgentEventSink, run_agent_loop, run_agent_loop_continue};
 use crate::types::*;
-use flown_ai::types::*;
+use flown_ai::{
+    AbortSignal, Message, MessageContent, OnPayloadFn, OnResponseFn, TextContent,
+    ThinkingBudgets, ThinkingLevel, Transport, UserContentBlock, UserMessage,
+};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Agent options for construction.
@@ -134,10 +137,10 @@ impl MessageQueue {
 #[derive(Clone)]
 pub struct Agent {
     state: Arc<RwLock<AgentState>>,
-    tools: Arc<RwLock<Vec<AgentTool>>>,
     steering_queue: Arc<RwLock<MessageQueue>>,
     follow_up_queue: Arc<RwLock<MessageQueue>>,
-    listeners: Arc<RwLock<Vec<AgentListener>>>,
+    listeners: Arc<RwLock<Vec<(usize, AgentListener)>>>,
+    next_listener_id: Arc<AtomicUsize>,
     // Per-run handle: abort signal + completion notifier + "active" flag.
     run: Arc<RwLock<Option<RunHandle>>>,
     convert_to_llm: Arc<dyn Fn(Vec<AgentMessage>) -> Vec<Message> + Send + Sync>,
@@ -203,15 +206,39 @@ struct RunHandle {
     idle: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone)]
+pub struct AgentStateHandle {
+    state: Arc<RwLock<AgentState>>,
+}
+
+impl AgentStateHandle {
+    pub(crate) fn new(state: Arc<RwLock<AgentState>>) -> Self {
+        Self { state }
+    }
+
+    pub fn snapshot(&self) -> AgentState {
+        self.state.read().clone()
+    }
+
+    pub fn read<R>(&self, reader: impl FnOnce(&AgentState) -> R) -> R {
+        reader(&self.state.read())
+    }
+
+    pub fn update(&self, updater: impl FnOnce(&mut AgentState)) {
+        updater(&mut self.state.write());
+    }
+}
+
 impl Agent {
     pub fn new(options: AgentOptions) -> Self {
         flown_ai::register_built_in_api_providers();
         let initial_state = options.initial_state.unwrap_or_else(|| AgentState {
             system_prompt: String::new(),
-            model: flown_ai::models::get_model("deepseek", "deepseek-v4-flash")
+            model: flown_ai::get_model("deepseek", "deepseek-v4-flash")
                 .expect("Default model not found"),
             thinking_level: ThinkingLevel::Off,
             messages: Vec::new(),
+            tools: Vec::new(),
             is_streaming: false,
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
@@ -220,7 +247,6 @@ impl Agent {
 
         Self {
             state: Arc::new(RwLock::new(initial_state)),
-            tools: Arc::new(RwLock::new(Vec::new())),
             steering_queue: Arc::new(RwLock::new(MessageQueue::new(
                 options.steering_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
@@ -228,6 +254,7 @@ impl Agent {
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             ))),
             listeners: Arc::new(RwLock::new(Vec::new())),
+            next_listener_id: Arc::new(AtomicUsize::new(0)),
             run: Arc::new(RwLock::new(None)),
             convert_to_llm: options
                 .convert_to_llm
@@ -253,35 +280,20 @@ impl Agent {
     /// Subscribe to lifecycle events. Returns a guard whose `Drop`/`unsubscribe`
     /// removes the listener. Listeners are awaited in subscription order.
     pub fn subscribe(&self, listener: AgentListener) -> Subscription {
-        self.listeners.write().push(listener);
+        let listener_id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
+        self.listeners.write().push((listener_id, listener));
         let listeners = self.listeners.clone();
-        let idx = self.listeners.read().len() - 1;
         Subscription::new(Box::new(move || {
-            if idx < listeners.read().len() {
-                listeners.write().remove(idx);
-            }
+            listeners
+                .write()
+                .retain(|(candidate_id, _)| *candidate_id != listener_id);
         }))
     }
 
-    // ── State snapshot + setters (JS `state.x = y` mapping) ────────
+    // ── State snapshot ─────────────────────────────────────────────
 
-    pub fn state(&self) -> AgentState {
-        self.state.read().clone()
-    }
-    pub fn set_model(&self, model: Model) {
-        self.state.write().model = model;
-    }
-    pub fn set_thinking_level(&self, level: ThinkingLevel) {
-        self.state.write().thinking_level = level;
-    }
-    pub fn set_system_prompt(&self, prompt: String) {
-        self.state.write().system_prompt = prompt;
-    }
-    pub fn set_tools(&self, tools: Vec<AgentTool>) {
-        *self.tools.write() = tools;
-    }
-    pub fn set_messages(&self, messages: Vec<AgentMessage>) {
-        self.state.write().messages = messages;
+    pub fn state(&self) -> AgentStateHandle {
+        AgentStateHandle::new(self.state.clone())
     }
 
     // ── Queue modes ────────────────────────────────────────────────
@@ -329,12 +341,10 @@ impl Agent {
         self.run.read().as_ref().map(|h| h.signal.clone())
     }
 
-    /// Abort the current run (cancels its abort signal + clears queues).
+    /// Abort the current run, if one is active.
     pub fn abort(&self) {
-        self.clear_all_queues();
-        if let Some(handle) = self.run.write().take() {
+        if let Some(handle) = self.run.read().as_ref() {
             handle.signal.cancel();
-            handle.idle.notify_waiters();
         }
     }
 
@@ -541,7 +551,11 @@ impl Agent {
                 // listener Arcs out of the guard first so the guard is dropped
                 // before the await (RwLockReadGuard is not Send).
                 let signal = signal_slot.read().as_ref().map(|h| h.signal.clone());
-                let snapshot: Vec<AgentListener> = listeners.read().clone();
+                let snapshot: Vec<AgentListener> = listeners
+                    .read()
+                    .iter()
+                    .map(|(_, listener)| listener.clone())
+                    .collect();
                 for listener in snapshot {
                     listener(event.clone(), signal.clone()).await;
                 }
@@ -572,11 +586,10 @@ impl Agent {
 
     fn create_context_snapshot(&self) -> AgentContext {
         let state = self.state.read();
-        let tools = self.tools.read();
         AgentContext {
             system_prompt: state.system_prompt.clone(),
             messages: state.messages.clone(),
-            tools: tools.clone(),
+            tools: Some(state.tools.clone()),
         }
     }
 

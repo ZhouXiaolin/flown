@@ -1,7 +1,13 @@
-use crate::harness::session::types::*;
-use crate::harness::types::{CompactionError, CompactionErrorCode};
+use crate::harness::types::*;
+use crate::harness::{CompactionError, CompactionErrorCode};
+use crate::harness::session::{
+    ContentBlock, CustomMessageContent, SessionMessage, SessionTreeEntry,
+};
 use crate::types::AgentMessage;
-use flown_ai::types::*;
+use flown_ai::{
+    AbortSignal, AssistantContent, Context, Message, MessageContent, Model, SimpleStreamOptions,
+    StopReason, ThinkingLevel, ToolCall, ToolResultContent, Usage, UserContentBlock, UserMessage,
+};
 
 /// Compaction settings.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -468,7 +474,9 @@ pub fn serialize_conversation(entries: &[SessionTreeEntry]) -> String {
                                     .as_object()
                                     .map(|obj| {
                                         obj.iter()
-                                            .map(|(k, v)| format!("{}={}", k, safe_json_stringify(v)))
+                                            .map(|(k, v)| {
+                                                format!("{}={}", k, safe_json_stringify(v))
+                                            })
                                             .collect::<Vec<_>>()
                                             .join(", ")
                                     })
@@ -479,7 +487,10 @@ pub fn serialize_conversation(entries: &[SessionTreeEntry]) -> String {
                     }
 
                     if !thinking_parts.is_empty() {
-                        parts.push(format!("[Assistant thinking]: {}", thinking_parts.join("\n")));
+                        parts.push(format!(
+                            "[Assistant thinking]: {}",
+                            thinking_parts.join("\n")
+                        ));
                     }
                     if !text_parts.is_empty() {
                         parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
@@ -499,7 +510,10 @@ pub fn serialize_conversation(entries: &[SessionTreeEntry]) -> String {
                         .collect::<Vec<_>>()
                         .join("");
                     if !text.is_empty() {
-                        parts.push(format!("[Tool result]: {}", truncate_for_summary(&text, 2000)));
+                        parts.push(format!(
+                            "[Tool result]: {}",
+                            truncate_for_summary(&text, 2000)
+                        ));
                     }
                 }
                 AgentMessage::Custom(msg) => {
@@ -644,7 +658,14 @@ pub async fn generate_summary(
         }
     }
 
-    let response = complete_simple(model, &context, Some(&options)).await;
+    let response = complete_simple(model, &context, Some(&options))
+        .await
+        .map_err(|err| {
+            CompactionError::new(
+                CompactionErrorCode::SummarizationFailed,
+                format!("Summarization failed: {err}"),
+            )
+        })?;
     match response.stop_reason {
         StopReason::Aborted => Err(CompactionError::new(
             CompactionErrorCode::Aborted,
@@ -718,7 +739,14 @@ pub async fn generate_turn_prefix_summary(
         }
     }
 
-    let response = complete_simple(model, &context, Some(&options)).await;
+    let response = complete_simple(model, &context, Some(&options))
+        .await
+        .map_err(|err| {
+            CompactionError::new(
+                CompactionErrorCode::SummarizationFailed,
+                format!("Summarization failed: {err}"),
+            )
+        })?;
     match response.stop_reason {
         StopReason::Aborted => Err(CompactionError::new(
             CompactionErrorCode::Aborted,

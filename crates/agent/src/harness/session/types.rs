@@ -1,4 +1,8 @@
-use flown_ai::types::*;
+use flown_ai::{
+    Api, AssistantContent, AssistantMessage, ImageContent, KnownApi, KnownProvider, MessageContent,
+    Provider, StopReason, TextContent, ThinkingContent, ToolCall, ToolResultContent,
+    ToolResultMessage, Usage, UserMessage,
+};
 use serde::{Deserialize, Serialize};
 
 /// Session tree entry base fields
@@ -46,14 +50,14 @@ impl Serialize for SessionMessage {
                     .content
                     .iter()
                     .map(|c| match c {
-                        flown_ai::types::AssistantContent::Text(t) => {
+                        AssistantContent::Text(t) => {
                             serde_json::json!({
                                 "type": "text",
                                 "text": t.text,
                                 "textSignature": t.text_signature,
                             })
                         }
-                        flown_ai::types::AssistantContent::Thinking(t) => {
+                        AssistantContent::Thinking(t) => {
                             serde_json::json!({
                                 "type": "thinking",
                                 "thinking": t.thinking,
@@ -61,7 +65,7 @@ impl Serialize for SessionMessage {
                                 "redacted": t.redacted,
                             })
                         }
-                        flown_ai::types::AssistantContent::ToolCall(tc) => {
+                        AssistantContent::ToolCall(tc) => {
                             serde_json::json!({
                                 "type": "toolCall",
                                 "id": tc.id,
@@ -117,7 +121,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
 
         match role {
             "user" => {
-                let msg: flown_ai::types::UserMessage =
+                let msg: UserMessage =
                     serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(SessionMessage(crate::types::AgentMessage::User(msg)))
             }
@@ -126,15 +130,11 @@ impl<'de> Deserialize<'de> for SessionMessage {
                 let api = value
                     .get("api")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or(flown_ai::types::Api::Known(
-                        flown_ai::types::KnownApi::OpenAiCompletions,
-                    ));
+                    .unwrap_or(Api::Known(KnownApi::OpenAiCompletions));
                 let provider = value
                     .get("provider")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or(flown_ai::types::Provider::Known(
-                        flown_ai::types::KnownProvider::OpenAi,
-                    ));
+                    .unwrap_or(Provider::Known(KnownProvider::OpenAi));
                 let model = value
                     .get("model")
                     .and_then(|v| v.as_str())
@@ -147,7 +147,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
                 let stop_reason = value
                     .get("stopReason")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or(flown_ai::types::StopReason::Stop);
+                    .unwrap_or(StopReason::Stop);
                 let timestamp = value
                     .get("timestamp")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -176,13 +176,11 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .get("textSignature")
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
-                                    Some(flown_ai::types::AssistantContent::Text(
-                                        flown_ai::types::TextContent {
+                                    Some(AssistantContent::Text(TextContent {
                                             content_type: "text".to_string(),
                                             text,
                                             text_signature,
-                                        },
-                                    ))
+                                        }))
                                 }
                                 "thinking" => {
                                     let thinking = block
@@ -195,14 +193,12 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string());
                                     let redacted = block.get("redacted").and_then(|v| v.as_bool());
-                                    Some(flown_ai::types::AssistantContent::Thinking(
-                                        flown_ai::types::ThinkingContent {
+                                    Some(AssistantContent::Thinking(ThinkingContent {
                                             content_type: "thinking".to_string(),
                                             thinking,
                                             thinking_signature,
                                             redacted,
-                                        },
-                                    ))
+                                        }))
                                 }
                                 "toolCall" => {
                                     let id = block
@@ -219,15 +215,13 @@ impl<'de> Deserialize<'de> for SessionMessage {
                                         .get("arguments")
                                         .cloned()
                                         .unwrap_or(serde_json::Value::Null);
-                                    Some(flown_ai::types::AssistantContent::ToolCall(
-                                        flown_ai::types::ToolCall {
+                                    Some(AssistantContent::ToolCall(ToolCall {
                                             content_type: "toolCall".to_string(),
                                             id,
                                             name,
                                             arguments,
                                             thought_signature: None,
-                                        },
-                                    ))
+                                        }))
                                 }
                                 _ => None,
                             }
@@ -238,7 +232,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
                 };
 
                 Ok(SessionMessage(crate::types::AgentMessage::Assistant(
-                    flown_ai::types::AssistantMessage {
+                    AssistantMessage {
                         role: "assistant".to_string(),
                         content,
                         api,
@@ -249,6 +243,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
                         usage,
                         stop_reason,
                         error_message,
+                        diagnostics: None,
                         timestamp,
                     },
                 )))
@@ -290,7 +285,7 @@ impl<'de> Deserialize<'de> for SessionMessage {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_else(|| chrono::Utc::now());
                 Ok(SessionMessage(crate::types::AgentMessage::ToolResult(
-                    flown_ai::types::ToolResultMessage {
+                    ToolResultMessage {
                         role: "toolResult".to_string(),
                         tool_call_id,
                         tool_name,
@@ -307,17 +302,17 @@ impl<'de> Deserialize<'de> for SessionMessage {
 }
 
 fn tool_result_content_to_json(
-    content: &[flown_ai::types::ToolResultContent],
+    content: &[ToolResultContent],
 ) -> Vec<serde_json::Value> {
     content
         .iter()
         .map(|block| match block {
-            flown_ai::types::ToolResultContent::Text(text) => serde_json::json!({
+            ToolResultContent::Text(text) => serde_json::json!({
                 "type": "text",
                 "text": text.text,
                 "textSignature": text.text_signature,
             }),
-            flown_ai::types::ToolResultContent::Image(image) => serde_json::json!({
+            ToolResultContent::Image(image) => serde_json::json!({
                 "type": "image",
                 "data": image.data,
                 "mimeType": image.mime_type,
@@ -328,10 +323,9 @@ fn tool_result_content_to_json(
 
 fn tool_result_content_from_json(
     block: &serde_json::Value,
-) -> Option<flown_ai::types::ToolResultContent> {
+) -> Option<ToolResultContent> {
     match block.get("type").and_then(|v| v.as_str())? {
-        "text" => Some(flown_ai::types::ToolResultContent::Text(
-            flown_ai::types::TextContent {
+        "text" => Some(ToolResultContent::Text(TextContent {
                 content_type: "text".to_string(),
                 text: block
                     .get("text")
@@ -343,10 +337,8 @@ fn tool_result_content_from_json(
                     .or_else(|| block.get("text_signature"))
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string),
-            },
-        )),
-        "image" => Some(flown_ai::types::ToolResultContent::Image(
-            flown_ai::types::ImageContent {
+            })),
+        "image" => Some(ToolResultContent::Image(ImageContent {
                 content_type: "image".to_string(),
                 data: block
                     .get("data")
@@ -359,8 +351,7 @@ fn tool_result_content_from_json(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-            },
-        )),
+            })),
         _ => None,
     }
 }

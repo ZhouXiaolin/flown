@@ -1,9 +1,9 @@
-use flown_agent::harness::env::types::FileSystem;
-use flown_agent::harness::session::{
-    JsonlSessionCreateOptions, JsonlSessionForkOptions, JsonlSessionListOptions, JsonlSessionRepo,
-    JsonlSessionMetadata, Session, SessionError, SessionRepo,
+use flown_agent::FileSystem;
+use flown_agent::{
+    JsonlSessionCreateOptions, JsonlSessionForkOptions, JsonlSessionListOptions,
+    JsonlSessionMetadata, JsonlSessionRepo, Session, SessionError, SessionRepo,
 };
-use flown_agent::types::AgentMessage;
+use flown_agent::AgentMessage;
 use std::sync::Arc;
 
 /// Manages conversation sessions with JSONL persistence.
@@ -79,9 +79,7 @@ impl SessionManager {
     }
 
     /// Get the current session, or create a new one if none exists.
-    pub async fn get_or_create_session(
-        &mut self,
-    ) -> Result<&JsonlSessionMetadata, SessionError> {
+    pub async fn get_or_create_session(&mut self) -> Result<&JsonlSessionMetadata, SessionError> {
         if self.current_session.is_some() {
             return Ok(self.current_metadata.as_ref().unwrap());
         }
@@ -126,19 +124,14 @@ impl SessionManager {
     // --- Message appending ---
 
     /// Append a user message to the current session.
-    pub async fn append_user_message(
-        &mut self,
-        content: &str,
-    ) -> Result<String, SessionError> {
+    pub async fn append_user_message(&mut self, content: &str) -> Result<String, SessionError> {
         let session = self.get_or_create_session_mut().await?;
-        let msg = flown_ai::types::UserMessage {
+        let msg = flown_ai::UserMessage {
             role: "user".to_string(),
-            content: flown_ai::types::MessageContent::Text(content.to_string()),
+            content: flown_ai::MessageContent::Text(content.to_string()),
             timestamp: chrono::Utc::now(),
         };
-        let id = session
-            .append_message(AgentMessage::User(msg))
-            .await;
+        let id = session.append_message(AgentMessage::User(msg)).await;
         Ok(id)
     }
 
@@ -207,10 +200,7 @@ impl SessionManager {
 
     /// Get the session name.
     pub async fn session_name(&self) -> Option<String> {
-        self.current_session
-            .as_ref()?
-            .get_session_name()
-            .await
+        self.current_session.as_ref()?.get_session_name().await
     }
 
     // --- Context building ---
@@ -218,7 +208,7 @@ impl SessionManager {
     /// Build LLM context from the current session's branch.
     pub async fn build_context(
         &self,
-    ) -> Result<flown_agent::harness::session::SessionContext, SessionError> {
+    ) -> Result<flown_agent::SessionContext, SessionError> {
         let session = self
             .current_session
             .as_ref()

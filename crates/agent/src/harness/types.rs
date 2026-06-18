@@ -1,8 +1,11 @@
 use super::prompt_templates::PromptTemplate;
-use super::session::types::SessionTreeEntry;
+use super::session::SessionTreeEntry;
 use super::skills::Skill;
 use crate::types::*;
-use flown_ai::types::*;
+use flown_ai::{
+    AssistantMessage, AssistantMessageEvent, CacheRetention, ImageContent, Model, ThinkingLevel,
+    ToolResultContent, ToolResultMessage, Transport,
+};
 use serde::{Deserialize, Serialize};
 
 /// Agent harness phase
@@ -36,6 +39,9 @@ pub struct HarnessResources {
     pub prompt_templates: Vec<PromptTemplate>,
 }
 
+/// Public alias aligned with pi-mono's `AgentHarnessResources`.
+pub type AgentHarnessResources = HarnessResources;
+
 /// Stream options for the harness
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HarnessStreamOptions {
@@ -47,6 +53,9 @@ pub struct HarnessStreamOptions {
     pub metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub cache_retention: Option<CacheRetention>,
 }
+
+/// Public alias aligned with pi-mono's `AgentHarnessStreamOptions`.
+pub type AgentHarnessStreamOptions = HarnessStreamOptions;
 
 /// Per-request stream option patch returned by `before_provider_request`.
 ///
@@ -67,6 +76,9 @@ pub struct HarnessStreamOptionsPatch {
     #[serde(rename = "cacheRetention", alias = "cache_retention")]
     pub cache_retention: Option<CacheRetention>,
 }
+
+/// Public alias aligned with pi-mono's `AgentHarnessStreamOptionsPatch`.
+pub type AgentHarnessStreamOptionsPatch = HarnessStreamOptionsPatch;
 
 /// All harness events
 #[derive(Debug, Clone)]
@@ -207,6 +219,9 @@ pub enum HarnessEvent {
         source: ToolUpdateSource,
     },
 }
+
+/// Public alias aligned with pi-mono's `AgentHarnessEvent`.
+pub type AgentHarnessEvent = HarnessEvent;
 
 impl From<&AgentEvent> for HarnessEvent {
     fn from(event: &AgentEvent) -> Self {
@@ -445,6 +460,9 @@ pub enum HarnessErrorCode {
     Unknown,
 }
 
+/// Public alias aligned with pi-mono's `AgentHarnessErrorCode`.
+pub type AgentHarnessErrorCode = HarnessErrorCode;
+
 /// Public harness error with a stable top-level classification matching pi-mono.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
@@ -467,6 +485,9 @@ pub enum HarnessError {
     #[error("unknown error: {0}")]
     Unknown(String),
 }
+
+/// Public alias aligned with pi-mono's `AgentHarnessError`.
+pub type AgentHarnessError = HarnessError;
 
 impl HarnessError {
     pub fn code(&self) -> HarnessErrorCode {

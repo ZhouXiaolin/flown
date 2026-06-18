@@ -22,17 +22,12 @@ pub mod types;
 
 use std::sync::Arc;
 
-use flown_agent::harness::AgentHarness;
-use flown_agent::types::AgentTool;
+use flown_agent::{AgentHarness, AgentTool};
 
 use crate::config::Config;
 
-pub use runner::{build, CommandSide, CommandSink, CommandTable, ToolSide};
-pub use types::{
-    ControlRuntime, Extension,
-};
-
-pub use btw::parse_btw_args;
+pub use runner::{CommandSide, CommandSink, CommandTable, ToolSide, build};
+pub use types::{ControlRuntime, Extension, OverlapOptions, SlashCommandScope};
 
 /// Run every extension's `register` on the tokio side and split the result.
 ///

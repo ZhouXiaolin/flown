@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use flown_agent::harness::env::types::ExecutionEnv;
-use flown_agent::types::{AgentTool, AgentToolError, AgentToolResult, ToolExecutionMode};
-use flown_ai::types::{ImageContent, ToolResultContent};
+use flown_agent::ExecutionEnv;
+use flown_agent::{AgentTool, AgentToolError, AgentToolResult, ToolExecutionMode};
+use flown_ai::{ImageContent, ToolResultContent};
 use serde_json::{Value, json};
 
 use super::common::*;

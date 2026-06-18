@@ -1,6 +1,6 @@
 use super::storage::{SessionStorage, generate_entry_id_with_check};
 use super::types::*;
-use crate::harness::env::types::FileSystem;
+use crate::harness::FileSystem;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -188,7 +188,9 @@ impl JsonlSessionStorage {
             .ok_or_else(|| SessionError::InvalidSession("missing session header".to_string()))?;
 
         if line.trim().is_empty() {
-            return Err(SessionError::InvalidSession("missing session header".to_string()));
+            return Err(SessionError::InvalidSession(
+                "missing session header".to_string(),
+            ));
         }
 
         let header: JsonlHeader = serde_json::from_str(&line)

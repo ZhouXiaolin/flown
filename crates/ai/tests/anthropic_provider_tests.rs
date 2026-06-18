@@ -1,8 +1,9 @@
-use omp_ai::{
-    AbortSignal, AnthropicProvider, Api, ApiProvider, AssistantContent, AssistantMessage,
-    AssistantMessageEvent, Context, ImageContent, KnownApi, KnownProvider, Message, MessageContent,
-    Model, ModelCost, Provider, SimpleStreamOptions, StopReason, StreamOptions, TextContent,
-    ThinkingLevel, Tool, UserContentBlock, UserMessage,
+use flown_ai::{
+    AbortSignal, Api, ApiProvider, AssistantContent, AssistantMessage, AssistantMessageEvent,
+    Context, ImageContent, KnownApi, KnownProvider, Message, MessageContent, Model, ModelCost,
+    Provider, SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingLevel, Tool,
+    UserContentBlock, UserMessage, clear_api_providers, get_api_provider,
+    register_built_in_api_providers,
 };
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
 fn restore_env(key: &str, previous: Option<String>) {
     unsafe {
@@ -46,6 +48,17 @@ fn anthropic_model(base_url: String) -> Model {
         headers: None,
         compat: None,
     }
+}
+
+/// Resolve the built-in Anthropic provider from the registry. Providers are no
+/// longer public structs (mirroring pi-ai's function-style providers), so
+/// tests acquire the `dyn ApiProvider` the same way embedders do.
+fn anthropic_provider() -> Arc<dyn ApiProvider> {
+    let _guard = REGISTRY_LOCK.lock().unwrap();
+    clear_api_providers();
+    register_built_in_api_providers();
+    get_api_provider(&Api::Known(KnownApi::AnthropicMessages))
+        .expect("anthropic-messages provider registered by builtins")
 }
 
 fn test_context() -> Context {
@@ -140,7 +153,7 @@ async fn anthropic_stream_posts_pi_ai_message_payload_to_v1_messages() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut stream = provider.stream(
         &model,
@@ -276,7 +289,7 @@ async fn anthropic_stream_repairs_tool_json_arguments() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut stream = provider.stream(
         &model,
@@ -359,7 +372,7 @@ async fn anthropic_oauth_maps_claude_code_tool_names_both_directions() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut context = test_context();
     context.tools = Some(vec![Tool {
@@ -443,7 +456,7 @@ async fn anthropic_stream_errors_when_sse_ends_before_message_stop() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut stream = provider.stream(
         &model,
@@ -487,7 +500,7 @@ async fn anthropic_stream_includes_http_error_response_body() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut stream = provider.stream(
         &model,
@@ -536,7 +549,7 @@ async fn anthropic_simple_stream_maps_reasoning_to_thinking_budget() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let mut model = anthropic_model(format!("http://{}", addr));
     model.reasoning = true;
     let mut options = SimpleStreamOptions::default();
@@ -586,7 +599,7 @@ async fn anthropic_simple_stream_expands_max_tokens_for_thinking_budget() {
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let mut model = anthropic_model(format!("http://{}", addr));
     model.reasoning = true;
     let mut options = SimpleStreamOptions::default();
@@ -607,7 +620,7 @@ async fn anthropic_simple_stream_expands_max_tokens_for_thinking_budget() {
 
 #[tokio::test]
 async fn anthropic_stream_returns_aborted_when_signal_is_cancelled_after_payload_hook() {
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let signal = AbortSignal::new();
     let signal_for_hook = signal.clone();
 
@@ -677,7 +690,7 @@ async fn anthropic_stream_retries_retryable_response() {
         }
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let model = anthropic_model(format!("http://{}", addr));
     let mut stream = provider.stream(
         &model,
@@ -733,7 +746,7 @@ async fn anthropic_cloudflare_gateway_resolves_base_url_and_uses_cf_auth_header(
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let mut model = anthropic_model(format!(
         "http://127.0.0.1:{}/{{FLOWN_AI_TEST_CLOUDFLARE_ANTHROPIC_PATH}}",
         addr.port()
@@ -804,7 +817,7 @@ async fn anthropic_github_copilot_adds_dynamic_headers_for_agent_vision_request(
         socket.write_all(response.as_bytes()).await.unwrap();
     });
 
-    let provider = AnthropicProvider::new();
+    let provider = anthropic_provider();
     let mut model = anthropic_model(format!("http://{}", addr));
     model.provider = Provider::Known(KnownProvider::GithubCopilot);
     model.input.push("image".to_string());
@@ -835,6 +848,7 @@ async fn anthropic_github_copilot_adds_dynamic_headers_for_agent_vision_request(
                 usage: Default::default(),
                 stop_reason: StopReason::Stop,
                 error_message: None,
+                diagnostics: None,
                 timestamp: chrono::Utc::now(),
             }),
         ],
