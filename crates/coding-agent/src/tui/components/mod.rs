@@ -9,5 +9,6 @@ pub mod editor;
 pub mod hint_bar;
 pub mod message_block;
 pub mod model_overlay;
+pub mod overlay_conversation;
 pub mod status_line;
 pub mod transcript;

@@ -103,13 +103,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         action: CommandAction::Clear,
     },
     SlashCommand {
-        name: "/model",
-        aliases: &[],
-        description: "Switch model",
-        subcommands: &[],
-        action: CommandAction::Placeholder,
-    },
-    SlashCommand {
         name: "/compact",
         aliases: &[],
         description: "Compact conversation",

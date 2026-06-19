@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-use crate::tui::state::{BUSY_FRAMES, StatusInfo};
+use crate::tui::state::{BUSY_FRAMES, StatusInfo, UiState};
 
 #[component]
 pub fn StatusLine() -> Node {
@@ -35,6 +35,30 @@ pub fn StatusLine() -> Node {
                 tracing::info!(
                     target: "flown::statusline",
                     layer = ?active.kind,
+                    badge = badge.as_deref().unwrap_or(""),
+                    state_busy,
+                    status_busy = s.busy,
+                    frame = s.frame,
+                    "statusline render"
+                );
+            }
+            build_line(s, 0, badge.as_deref())
+        });
+        seed.set_lines(vec![line]);
+    });
+    node
+}
+
+pub fn status_line_for_state(state: Rc<UiState>, badge: Option<String>) -> Node {
+    let node = Node::new_richtext();
+    let seed = node.clone();
+    create_effect(move || {
+        let state_busy = state.busy.get();
+        let line = state.status.with(|s| {
+            if badge.is_some() || s.busy || state_busy {
+                tracing::info!(
+                    target: "flown::statusline",
+                    layer = "overlay",
                     badge = badge.as_deref().unwrap_or(""),
                     state_busy,
                     status_busy = s.busy,

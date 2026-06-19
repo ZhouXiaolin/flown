@@ -587,6 +587,7 @@ pub struct RuntimeControl {
     /// The single-overlay stack model: `/model` pushes an inset overlay; btw
     /// forks push a full-bleed overlay. Depth is 1 in v1.
     overlay_stack: Rc<crate::tui::overlay_stack::OverlayStack>,
+    harness: Option<Arc<AgentHarness>>,
     #[allow(dead_code)]
     config: Config,
 }
@@ -595,15 +596,16 @@ impl RuntimeControl {
     pub fn new(
         stack: Rc<ConversationStack>,
         overlay_stack: Rc<crate::tui::overlay_stack::OverlayStack>,
+        harness: Option<Arc<AgentHarness>>,
         config: Config,
     ) -> Rc<Self> {
         Rc::new(Self {
             stack,
             overlay_stack,
+            harness,
             config,
         })
     }
-
 }
 
 impl RuntimeControl {
@@ -773,13 +775,10 @@ impl RuntimeControl {
         });
     }
 
-    /// Fork the main session into a transient full-bleed overlay (btw). This is
-    /// the `open_overlap` build sequence lifted onto the new OverlayStack model:
-    /// the same tokio→iodilos bridge (factory.build → bind_layer_driver →
-    /// spawn_local pump), but instead of pushing a `ConversationLayer`, it
-    /// pushes an `OverlayBox(FullBleed)` whose content is a standalone
-    /// transcript bound to the forked `UiState`. Teardown (`on_close`) mirrors
-    /// `close_active_overlap`: unsubscribe → Shutdown the driver → drop.
+    /// Fork the main session into a transient full-bleed overlay (btw). The
+    /// fork owns its own `UiState` and driver; the bottom App surface remains
+    /// mounted on the main conversation while the overlay view renders
+    /// transcript/status/input for the fork.
     ///
     /// `reply` is answered once the overlay is up (or with an error if the
     /// build fails or another overlay is already active).
@@ -790,6 +789,7 @@ impl RuntimeControl {
     ) {
         let stack = self.stack.clone();
         let overlay_stack = Rc::clone(&self.overlay_stack);
+        let config = self.config.clone();
         if overlay_stack.is_active() {
             stack
                 .active()
@@ -884,44 +884,97 @@ impl RuntimeControl {
                 }
             });
 
-            // 4. Teardown closure: unsubscribe → Shutdown the driver → the
-            // binding's parts (event_tx, harness Arc, cmd_tx) drop with the
-            // captured cell. Same load-bearing order as close_active_overlap.
-            let teardown = Rc::new({
-                let unsubscribe = Rc::new(unsubscribe);
-                let cmd_tx = Rc::new(cmd_tx);
-                let _event_tx = Rc::new(event_tx);
-                let _harness = Rc::new(harness);
-                let unsubscribe = Rc::clone(&unsubscribe);
-                let cmd_tx = Rc::clone(&cmd_tx);
-                move || {
-                    (unsubscribe)();
-                    let _ = cmd_tx.try_send(LayerCommand::Shutdown);
-                    // The captured event_tx/harness Arcs drop when this closure's
-                    // cell is dropped (it is held by the OverlayStack).
+            let layer = Rc::new(ConversationLayer {
+                kind: LayerKind::Overlap,
+                overlap: Some(OverlapMeta {
+                    extension_id: "btw".to_string(),
+                    badge: Some("BTW".to_string()),
+                    single_instance_key: Some("btw".to_string()),
+                    dismissible: true,
+                    slash_commands: SlashCommandScope::Disabled,
+                }),
+                state: Rc::clone(&fork_state),
+                harness: Some(harness),
+                event_tx,
+                unsubscribe: Some(unsubscribe),
+                cmd_tx: Some(cmd_tx),
+            });
+
+            let submit_layer = Rc::clone(&layer);
+            let submit: Rc<dyn Fn(String)> = Rc::new(move |text: String| {
+                if submit_layer.state.busy.get() {
+                    return;
+                }
+                submit_layer.state.push_user(&text);
+                tracing::info!(
+                    target: "flown::prompt",
+                    layer = "btw-overlay",
+                    text_len = text.len(),
+                    "ui prompt submitted"
+                );
+                match submit_layer.submit_prompt(text) {
+                    SubmitOutcome::Queued => {
+                        submit_layer.state.busy.set(true);
+                        submit_layer.state.status.update(|s| s.busy = true);
+                    }
+                    SubmitOutcome::NoAgent => {
+                        submit_layer
+                            .state
+                            .push_error("No LLM agent available. Check your config.");
+                    }
+                    SubmitOutcome::DriverGone => {
+                        submit_layer
+                            .state
+                            .push_error("Layer driver exited. Cannot send prompt.");
+                    }
+                    SubmitOutcome::ChannelFull => {
+                        submit_layer
+                            .state
+                            .push_error("Layer driver busy (command queue full).");
+                    }
                 }
             });
 
-            // 5. Push the overlay. The content is a FACTORY (not a pre-built
-            // node): App's OverlayLayer builds it once under the mount owner
-            // (where use_terminal_size/on_key/create_effect resolve), wrapped in
-            // a sub-Owner so it is not rebuilt on spurious re-runs. Building a
-            // node here (in this spawn_local task, where CURRENT_OWNER is unset)
-            // would leave the transcript's effect/on_key unregistered — the
-            // original "/btw doesn't appear" bug.
+            let close: Rc<dyn Fn()> = Rc::new({
+                let overlay_stack = Rc::clone(&overlay_stack);
+                move || overlay_stack.pop()
+            });
+            let teardown: Rc<dyn Fn()> = Rc::new({
+                let layer = Rc::clone(&layer);
+                move || teardown_overlap_layers(vec![Rc::clone(&layer)])
+            });
             let content_state = Rc::clone(&fork_state);
+            let content_config = config.clone();
+            let content_submit = Rc::clone(&submit);
+            let content_close = Rc::clone(&close);
             let overlay = crate::tui::overlay_stack::ActiveOverlay {
                 geometry: iodilos::OverlayGeometry::FullBleed,
                 dismissible: true,
+                route_app_keys: false,
                 content: Rc::new(move || {
-                    crate::tui::components::transcript::transcript_for_state(Rc::clone(
-                        &content_state,
-                    ))
+                    crate::tui::components::overlay_conversation::overlay_conversation(
+                        crate::tui::components::overlay_conversation::OverlayConversationProps {
+                            state: Rc::clone(&content_state),
+                            badge: Some("BTW".to_string()),
+                            config: content_config.clone(),
+                            submit: Rc::clone(&content_submit),
+                            close: Rc::clone(&content_close),
+                        },
+                    )
                 }),
                 on_close: Some(Rc::clone(&teardown) as Rc<dyn Fn()>),
             };
-            overlay_stack.push(overlay);
-            let _ = reply.send(Ok(()));
+
+            if overlay_stack.push(overlay) {
+                let _ = reply.send(Ok(()));
+            } else {
+                teardown_overlap_layers(vec![layer]);
+                stack
+                    .main_layer()
+                    .state
+                    .push_system("An overlay is already active. Close it before opening another.");
+                let _ = reply.send(Ok(()));
+            }
         });
     }
 
@@ -940,25 +993,23 @@ impl RuntimeControl {
         let overlay = crate::tui::overlay_stack::ActiveOverlay {
             geometry: iodilos::OverlayGeometry::Inset { ratio: 0.125 },
             dismissible: true,
+            route_app_keys: false,
             content: content_factory,
             on_close: None,
         };
         self.overlay_stack.push(overlay);
     }
 
-    /// Handle the `OpenModelOverlay` runtime command: read the live harness from
-    /// context and push an inset overlay whose content factory builds the
-    /// ModelOverlay. The factory is NOT invoked here (this runs in the
-    /// command-pump `spawn_local` task, where CURRENT_OWNER is unset, so
-    /// `use_context`/`on_key` would not resolve); it runs once in App's
-    /// OverlayLayer render effect under the mount owner.
+    /// Handle the `OpenModelOverlay` runtime command. The content factory is NOT
+    /// invoked here (this runs in the command-pump `spawn_local` task, where
+    /// CURRENT_OWNER is unset, so `use_context`/`on_key` would not resolve); it
+    /// runs once in App's OverlayLayer render effect under the mount owner.
     pub fn handle_open_model_overlay(
         &self,
         reply: tokio::sync::oneshot::Sender<crate::core::extensions::types::CommandResult>,
     ) {
-        let harness = use_context::<Option<Arc<AgentHarness>>>();
         let overlay_stack = Rc::clone(&self.overlay_stack);
-        let content_factory: std::rc::Rc<dyn Fn() -> Node> = match &harness {
+        let content_factory: std::rc::Rc<dyn Fn() -> Node> = match &self.harness {
             Some(h) => {
                 let h = Arc::clone(h);
                 let stack = Rc::clone(&overlay_stack);
@@ -993,51 +1044,7 @@ impl RuntimeControl {
             return;
         }
         tracing::info!(target: "flown::overlap", count = layers.len(), "close_active_overlap: layers popped, shutting down drivers");
-        // Teardown order is load-bearing:
-        //   1. unsubscribe FIRST so the harness stops emitting into event_tx;
-        //   2. send Shutdown to the driver — it awaits abort() on the in-flight
-        //      turn (interrupting it cleanly) then breaks, dropping its harness
-        //      Arc. This replaces the old fire-and-forget `tokio::spawn(abort)`
-        //      that could hang forever on wait_for_idle when the stream was
-        //      stuck: here abort runs on the driver's own stack, deterministically.
-        //   3. drop the layer — its event_tx ends the pump; the cmd_tx clone
-        //      drops too, so once the driver processes Shutdown the receiver
-        //      sees "all senders gone" as a backstop.
-        for layer in layers {
-            if let Some(unsub) = &layer.unsubscribe {
-                (unsub)();
-            }
-            if let Some(tx) = &layer.cmd_tx {
-                // try_send is non-blocking; the Shutdown queues behind any
-                // in-flight command. The driver handles it after the current
-                // turn unwinds.
-                match tx.try_send(LayerCommand::Shutdown) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::warn!(
-                            target: "flown::overlap",
-                            "close: layer driver already exited"
-                        );
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        // Capacity is 8; a Full here means the driver is wedged.
-                        // Fall back to aborting the harness directly.
-                        tracing::warn!(
-                            target: "flown::overlap",
-                            "close: command channel full; forcing harness abort"
-                        );
-                        if let Some(h) = &layer.harness {
-                            let h = Arc::clone(h);
-                            tokio::spawn(async move {
-                                let _ = h.abort().await;
-                            });
-                        }
-                    }
-                }
-            }
-            // Drop the layer last; its `event_tx` goes with it, ending the pump.
-            drop(layer);
-        }
+        teardown_overlap_layers(layers);
     }
 
     pub fn send_to_active(&self, text: String) {
@@ -1085,6 +1092,43 @@ impl RuntimeControl {
 
     pub fn clear_active(&self) {
         self.stack.active().state.clear();
+    }
+}
+
+// Teardown order is load-bearing:
+// 1. unsubscribe first so the harness stops emitting into event_tx;
+// 2. send Shutdown to the driver so it aborts any in-flight turn on its own
+//    stack and exits deterministically;
+// 3. drop the layer last, ending the event pump via event_tx drop.
+fn teardown_overlap_layers(layers: Vec<Rc<ConversationLayer>>) {
+    for layer in layers {
+        if let Some(unsub) = &layer.unsubscribe {
+            (unsub)();
+        }
+        if let Some(tx) = &layer.cmd_tx {
+            match tx.try_send(LayerCommand::Shutdown) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(
+                        target: "flown::overlap",
+                        "close: layer driver already exited"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        target: "flown::overlap",
+                        "close: command channel full; forcing harness abort"
+                    );
+                    if let Some(h) = &layer.harness {
+                        let h = Arc::clone(h);
+                        tokio::spawn(async move {
+                            let _ = h.abort().await;
+                        });
+                    }
+                }
+            }
+        }
+        drop(layer);
     }
 }
 
@@ -1530,5 +1574,68 @@ mod tests {
         assert_eq!(stack.depth(), 1);
         assert_eq!(stack.active().kind, LayerKind::Main);
         assert!(!stack.overlap_is_active_or_pending());
+    }
+
+    #[test]
+    fn full_bleed_overlay_close_runs_overlay_teardown_without_switching_stack() {
+        let (main_tx, _main_rx) = flume::unbounded();
+        let main = ConversationLayer {
+            kind: LayerKind::Main,
+            overlap: None,
+            state: Rc::new(UiState::new(TextAreaState::default())),
+            harness: None,
+            event_tx: main_tx,
+            unsubscribe: None,
+            cmd_tx: None,
+        };
+        let stack = ConversationStack::new(main, None);
+        let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+        let closed = Rc::new(std::cell::Cell::new(false));
+        let closed_for_overlay = Rc::clone(&closed);
+        overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
+            geometry: iodilos::OverlayGeometry::FullBleed,
+            dismissible: true,
+            route_app_keys: false,
+            content: Rc::new(Node::new_text),
+            on_close: Some(Rc::new(move || closed_for_overlay.set(true))),
+        });
+
+        overlay_stack.pop();
+
+        assert!(closed.get());
+        assert_eq!(stack.depth(), 1);
+        assert_eq!(stack.active().kind, LayerKind::Main);
+        assert!(!overlay_stack.is_active());
+    }
+
+    #[test]
+    fn model_overlay_command_does_not_read_harness_from_context() {
+        let (_, owner) = create_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main_state = Rc::new(UiState::new(TextAreaState::default()));
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::clone(&main_state),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+            let runtime_control =
+                RuntimeControl::new(Rc::clone(&stack), overlay_stack, None, Config::default());
+            let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+
+            runtime_control.handle_open_model_overlay(reply_tx);
+
+            let reply = reply_rx
+                .try_recv()
+                .expect("model overlay command should reply synchronously");
+            assert!(reply.is_ok());
+            assert!(!stack.active().state.entries.get().is_empty());
+        });
+        owner.dispose();
     }
 }

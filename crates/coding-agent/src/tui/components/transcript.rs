@@ -63,12 +63,6 @@ pub fn Transcript() -> impl IntoView {
     ScrollableViewport::new(props)
 }
 
-/// A standalone transcript viewport bound to an explicit `Rc<UiState>`, used by
-/// the btw fork overlay (which renders a *forked* session that is not part of
-/// the main ConversationStack, so it cannot use the context-bound `Transcript()`).
-///
-/// Mirrors `Transcript()` exactly but reads the passed-in state instead of
-/// `use_context::<ConversationStack>()`. Scroll still mutates that same state.
 pub fn transcript_for_state(state: Rc<UiState>) -> Node {
     let terminal_size = use_terminal_size();
 

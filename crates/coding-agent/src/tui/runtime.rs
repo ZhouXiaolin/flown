@@ -235,6 +235,7 @@ pub async fn run_tui(
         let runtime_control = crate::tui::conversation::RuntimeControl::new(
             Rc::clone(&stack),
             Rc::clone(&overlay_stack),
+            mount_harness.clone(),
             mount_config.clone(),
         );
         let (runtime_command_tx, runtime_command_rx) = flume::unbounded();
@@ -248,10 +249,9 @@ pub async fn run_tui(
         // dispatch-capable CommandSide. Commands receive an ExtensionContext
         // backed by RuntimeCommandProxy, so UI/conversation actions target the
         // active layer without exposing UiState to extensions.
-        let command_side: Option<Rc<crate::core::extensions::CommandSide>> =
-            mount_command_table
-                .take()
-                .map(|table| Rc::new(table.bind(Arc::clone(&runtime_proxy))));
+        let command_side: Option<Rc<crate::core::extensions::CommandSide>> = mount_command_table
+            .take()
+            .map(|table| Rc::new(table.bind(Arc::clone(&runtime_proxy))));
         provide_context(command_side);
 
         // Provide the conversation stack (not a bare UiState) + handles. App

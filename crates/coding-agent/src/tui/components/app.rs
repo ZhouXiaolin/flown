@@ -42,7 +42,13 @@ pub fn App() -> Node {
     let key_agent = agent;
     let key_config = config;
     on_key(move |key: KeyEvent| -> bool {
-        handle_app_key(key, &key_stack, &key_overlay, key_agent.as_ref(), &key_config)
+        handle_app_key(
+            key,
+            &key_stack,
+            &key_overlay,
+            key_agent.as_ref(),
+            &key_config,
+        )
     });
 
     view! {
@@ -84,6 +90,13 @@ fn OverlayLayer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> Node {
     //      changes (a push or pop).
     let active = overlay.active_signal();
     let host = Node::new_view();
+    host.set_position_absolute(());
+    host.set_inset_top(0.0);
+    host.set_inset_bottom(0.0);
+    host.set_inset_left(0.0);
+    host.set_inset_right(0.0);
+    host.set_width_percent(100.0);
+    host.set_height_percent(100.0);
     let host_for_effect = host.clone();
     // (mounted_overlay, owner): the overlay currently rendered + its sub-owner.
     let mounted: Rc<RefCell<Option<(Rc<crate::tui::overlay_stack::ActiveOverlay>, Owner)>>> =
@@ -207,6 +220,9 @@ fn handle_app_key(
             tracing::info!(target: "flown::overlap", "Ctrl+C in main, quitting app");
             iodilos::quit();
         }
+        return true;
+    }
+    if overlay_stack.is_active() && !overlay_stack.routes_app_keys() {
         return true;
     }
     if key.code == KeyCode::PageUp {
@@ -374,5 +390,53 @@ fn handle_app_key(
             true
         }
         EditorAction::None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::conversation::{ConversationLayer, ConversationStack, LayerKind};
+
+    fn test_stack() -> (Rc<ConversationStack>, Rc<UiState>) {
+        let (tx, _rx) = flume::unbounded();
+        let state = Rc::new(UiState::new(TextAreaState::default()));
+        let main = ConversationLayer {
+            kind: LayerKind::Main,
+            overlap: None,
+            state: Rc::clone(&state),
+            harness: None,
+            event_tx: tx,
+            unsubscribe: None,
+            cmd_tx: None,
+        };
+        (ConversationStack::new(main, None), state)
+    }
+
+    #[test]
+    fn modal_overlay_blocks_unhandled_keys_from_main_editor() {
+        let (_, owner) = create_root(|| {
+            let (stack, state) = test_stack();
+            let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+            overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
+                geometry: iodilos::OverlayGeometry::Inset { ratio: 0.125 },
+                dismissible: true,
+                route_app_keys: false,
+                content: Rc::new(Node::new_text),
+                on_close: None,
+            });
+
+            let consumed = handle_app_key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &stack,
+                &overlay_stack,
+                None,
+                &crate::config::Config::default(),
+            );
+
+            assert!(consumed);
+            assert_eq!(state.input.get().text(), "");
+        });
+        owner.dispose();
     }
 }

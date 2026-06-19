@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flown_agent::AgentHarness;
-use flown_ai::{get_models, get_supported_thinking_levels, models_are_equal, ThinkingLevel};
+use flown_ai::{ThinkingLevel, get_models, get_supported_thinking_levels, models_are_equal};
 use iodilos::prelude::*;
 
 use crate::tui::overlay_stack::OverlayStack;
@@ -20,15 +20,15 @@ use crate::tui::overlay_stack::OverlayStack;
 /// provider it belongs to) or a thinking level.
 #[derive(Clone)]
 enum PickerRow {
-    Model { provider: String, model: flown_ai::Model },
+    Model {
+        provider: String,
+        model: flown_ai::Model,
+    },
     Thinking(ThinkingLevel),
 }
 
 /// Build the ordered flat list of rows and their keys.
-fn build_rows(
-    models: &[flown_ai::Model],
-    thinking: &[ThinkingLevel],
-) -> Vec<PickerRow> {
+fn build_rows(models: &[flown_ai::Model], thinking: &[ThinkingLevel]) -> Vec<PickerRow> {
     let mut rows: Vec<PickerRow> = Vec::new();
     for m in models {
         rows.push(PickerRow::Model {

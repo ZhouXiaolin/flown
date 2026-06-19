@@ -15,8 +15,8 @@
 
 use std::rc::Rc;
 
-use iodilos::prelude::*;
 use iodilos::OverlayGeometry;
+use iodilos::prelude::*;
 
 /// One active overlay. `content` is a factory because the node must be built
 /// inside App's render effect (the mount owner) — not in the `spawn_local`
@@ -24,6 +24,11 @@ use iodilos::OverlayGeometry;
 pub struct ActiveOverlay {
     pub geometry: OverlayGeometry,
     pub dismissible: bool,
+    /// Whether keys that the overlay content did not consume should continue
+    /// through App's editor/router. Full-bleed conversation overlays use this
+    /// so the active fork receives typing; modal pickers leave it false so
+    /// stray keys do not mutate the hidden main editor.
+    pub route_app_keys: bool,
     /// Builds the overlay's content Node. Invoked exactly once per overlay
     /// (when App mounts it), under the mount owner.
     pub content: Rc<dyn Fn() -> Node>,
@@ -57,6 +62,13 @@ impl OverlayStack {
         self.active.with(|o| o.is_some())
     }
 
+    /// True when the active overlay intentionally lets unhandled keys fall
+    /// through to App's normal editor/router.
+    pub fn routes_app_keys(&self) -> bool {
+        self.active
+            .with(|o| o.as_ref().map(|o| o.route_app_keys).unwrap_or(false))
+    }
+
     /// Push an overlay. Returns whether it took effect — rejected if another
     /// overlay is already active (v1 supports depth 1).
     pub fn push(&self, overlay: ActiveOverlay) -> bool {
@@ -69,10 +81,10 @@ impl OverlayStack {
 
     /// Pop the active overlay, running its `on_close` first. No-op if none.
     pub fn pop(&self) {
-        if let Some(overlay) = self.active.get() {
-            if let Some(on_close) = &overlay.on_close {
-                on_close();
-            }
+        if let Some(overlay) = self.active.get()
+            && let Some(on_close) = &overlay.on_close
+        {
+            on_close();
         }
         self.active.set(None);
     }
@@ -86,7 +98,8 @@ mod tests {
         ActiveOverlay {
             geometry: OverlayGeometry::Inset { ratio: 0.125 },
             dismissible: true,
-            content: Rc::new(|| Node::new_text()),
+            route_app_keys: false,
+            content: Rc::new(Node::new_text),
             on_close: None,
         }
     }
@@ -124,7 +137,8 @@ mod tests {
             let o = ActiveOverlay {
                 geometry: OverlayGeometry::FullBleed,
                 dismissible: true,
-                content: Rc::new(|| Node::new_text()),
+                route_app_keys: false,
+                content: Rc::new(Node::new_text),
                 on_close: Some(Rc::new(move || fired_for_close.set(true))),
             };
             stack.push(o);

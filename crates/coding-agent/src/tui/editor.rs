@@ -675,4 +675,36 @@ mod tests {
         // The static table no longer carries /mcp.
         assert!(SLASH_COMMANDS.iter().all(|c| c.name != "/mcp"));
     }
+
+    #[test]
+    fn model_command_is_extension_only_in_completion() {
+        let cfg = empty_config();
+        let mut commands = static_command_entries();
+        commands.push(CommandEntry {
+            name: "/model".into(),
+            description: "Select a model or thinking level".into(),
+            subcommands: Vec::new(),
+        });
+
+        let mut input = TextAreaState::default();
+        input.set_text("/model");
+        let mut popup = None;
+        try_open_slash_popup(&input, &mut popup, &cfg, &commands);
+
+        let popup = popup.expect("/model should match the extension command");
+        let model_matches = popup
+            .items
+            .iter()
+            .filter(|item| match item {
+                PopupItem::Command(idx) => popup.commands[*idx].name == "/model",
+                PopupItem::Skill(_) => false,
+            })
+            .count();
+        assert_eq!(model_matches, 1);
+        assert!(
+            SLASH_COMMANDS
+                .iter()
+                .all(|command| command.name != "/model")
+        );
+    }
 }
