@@ -1,8 +1,9 @@
 # `/btw` Extension — Design Spec
 
 - **Status**: Draft (2026-06-17)
-- **Related**: ADR-0001 (extension arch), ADR-0002 (M3 btw intent), ADR-0003
-  (M2 refinement — this work pulls the session-ops it deferred forward).
+- **Related**: ADR-0001 (async `ExtensionContext` + command proxy). The btw
+  design decisions referenced below (temporary, discarded; flown-original) live
+  in this spec, not in separate ADRs.
 - **Convention**: Solaren. Prose for humans in Chinese; identifiers stay English.
 
 ## 1. Goal
@@ -33,8 +34,8 @@ Exit: **Ctrl+C** in a btw layer drops it and returns to the main view.
 
 These together force: **an independent `AgentHarness` per btw layer, an
 independent flume channel + event pump per layer, and an independent
-`UiState` per layer.** This is ADR-0002's M3 "btw (temporary, discarded)"
-verbatim.
+`UiState` per layer.** This is the "btw (temporary, discarded)" intent from
+§2 of this spec, verbatim.
 
 ## 3. What we take from pi-mono (the essence)
 
@@ -76,7 +77,7 @@ captured `Rc<UiState>` is simply not used post-switch.
 pi-mono's `subagent` (`examples/extensions/subagent/index.ts`) spawns a
 **separate `pi` process** (`--no-session`), not an in-process multi-harness.
 pi-mono has **no transient / discardable side-conversation** concept — all its
-sessions are persistent. This confirms ADR-0002: btw is flown-original design
+sessions are persistent. This confirms that btw is flown-original design
 with no port target. The pi-mono lessons we *do* borrow are the ctx-injection
 mechanics (3.1) and the stale-guard discipline (3.2), not any btw feature.
 
@@ -404,8 +405,8 @@ effect path. `/mcp` remains effect-only — it does **not** adopt
   structurally, but the Ctrl-C "exit one level" vs "exit all" UX is deferred.
   v1: `/btw` while in btw is rejected with a notify ("already in a btw; exit
   first"). The stack depth-1 guard is one line.
-- Persistent btw (saving a btw to the session tree). That's **Fork**
-  (ADR-0005), a separate feature. btw stays discardable.
+- Persistent btw (saving a btw to the session tree). That's **Fork**, a
+  separate feature (not yet specified). btw stays discardable.
 - btw result carry-back ("bring an answer into main"). Deferred; exit is
   pure-discard in v1.
 - `/mcp` adopting `RuntimeControl`. It stays effect-only; the 6.x fixes don't
