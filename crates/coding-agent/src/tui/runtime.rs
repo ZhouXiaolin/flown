@@ -89,7 +89,20 @@ pub async fn run_tui(
         let initial = tool_side.initial_tools();
         let h = Arc::clone(harness);
         tokio::spawn(async move {
-            let _ = h.set_tools(initial, None).await;
+            // Preserve any previously-active names AND activate every tool we
+            // just registered. Without this the `set_tools(..., None)` call
+            // would keep the harness's construction-time active list (the
+            // built-in 4), and the newly-registered MCP tools would sit in the
+            // harness's `tools` map but never reach `turn_state.active_tools`
+            // — and therefore never reach the LLM's tool protocol.
+            let previous_active: Vec<String> = h.active_tool_names();
+            let mut next_active: Vec<String> = previous_active;
+            for tool in &initial {
+                if !next_active.contains(&tool.name) {
+                    next_active.push(tool.name.clone());
+                }
+            }
+            let _ = h.set_tools(initial, Some(next_active)).await;
         });
         // Reconcile loop: flush runtime tool edits (MCP server
         // connect/disconnect) into the harness. Event-driven via each
@@ -440,25 +453,12 @@ pub(crate) fn translate_event(
                 state.busy.set(false);
                 state.status.update(|s| s.busy = false);
             }
-            flown_agent::AgentMessage::ToolResult(result) if result.is_error => {
-                let output: String = result
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        flown_ai::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let msg = if output.starts_with("Error ") {
-                    output
-                } else if result.tool_name.is_empty() {
-                    format!("Error {output}")
-                } else {
-                    format!("Error {}: {output}", result.tool_name)
-                };
-                state.push_error(msg);
-            }
+            // Tool results are surfaced by the `ToolExecutionEnd` handler,
+            // which carries the structured result JSON and `is_error` flag.
+            // Handling them here too would push every result twice (the harness
+            // emits `ToolExecutionEnd` then `MessageEnd(ToolResult)` for the
+            // same result), so ToolResult messages are intentionally ignored
+            // on this path.
             _ => {}
         },
 
@@ -474,17 +474,35 @@ pub(crate) fn translate_event(
             is_error,
             ..
         } => {
-            if is_error {
-                let output = result
-                    .get("content")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|c| c.get("text").and_then(|v| v.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_else(|| serde_json::to_string_pretty(&result).unwrap_or_default());
+            let output = result
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.get("text").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| serde_json::to_string_pretty(&result).unwrap_or_default());
+
+            if tool_name == "bash" {
+                // bash output — success or failure — is shown as a styled
+                // ToolResult (indented, italic, light, capped to a few lines).
+                state.push_tool_result("bash", &output);
+                // A bash command that exits non-zero with no real output is a
+                // genuine failure (spawn/timeout); surface that as a red error
+                // in addition to the result row. Non-zero exits WITH output
+                // (grep no-match, etc.) are already represented by the result
+                // row and don't need a separate error line.
+                if is_error && !has_substantive_output(&output) {
+                    let msg = if output.starts_with("Error ") {
+                        output
+                    } else {
+                        format!("Error {tool_name}: {output}")
+                    };
+                    state.push_error(msg);
+                }
+            } else if is_error {
                 let msg = if output.starts_with("Error ") {
                     output
                 } else {
@@ -531,6 +549,38 @@ pub(crate) fn translate_event(
 
 fn assistant_is_waiting_for_tool(message: &flown_ai::AssistantMessage) -> bool {
     matches!(message.stop_reason, flown_ai::StopReason::ToolUse)
+}
+
+/// Whether a bash tool-error payload carries real command output beyond the
+/// `Command exited with code N` status line that `bash.rs` appends. Used to
+/// decide between a yellow warning and a red error: a non-zero exit with real
+/// output (stdout/stderr the command itself produced) is downgraded to a
+/// warning; a bare status line means the command genuinely failed to do
+/// anything useful and stays red.
+///
+/// Matches the format produced by `append_status` in `core/tools/common.rs`:
+/// either `"<output>\n\nCommand exited with code N"` (has output) or just
+/// `"Command exited with code N"` (no output).
+fn has_substantive_output(output: &str) -> bool {
+    let trimmed = output.trim();
+    // Strip a trailing `Command exited with code N` status line if present.
+    let without_status = match trimmed.rfind("Command exited with code ") {
+        Some(idx) => {
+            let tail = &trimmed[idx..];
+            // The status line must extend to the end of the string to count.
+            if tail
+                .trim_start_matches("Command exited with code ")
+                .parse::<i32>()
+                .is_ok()
+            {
+                trimmed[..idx].trim()
+            } else {
+                trimmed
+            }
+        }
+        None => trimmed,
+    };
+    !without_status.is_empty()
 }
 
 #[cfg(test)]
@@ -907,6 +957,214 @@ mod tests {
                 "status.thinking_level should reflect the new level, got {}",
                 snap.thinking_level
             );
+        });
+    }
+
+    #[test]
+    fn has_substantive_output_detects_real_command_output() {
+        // Real stdout/stderr before the status line → substantive.
+        assert!(has_substantive_output(
+            "grep: foo: No such file\n\nCommand exited with code 1"
+        ));
+        assert!(has_substantive_output("some warning\nCommand exited with code 2"));
+        // Bare status line, no command output → not substantive (genuine failure).
+        assert!(!has_substantive_output("Command exited with code 1"));
+        assert!(!has_substantive_output("  Command exited with code 127  "));
+        // No status line at all: anything non-empty counts as substantive.
+        assert!(has_substantive_output("anything"));
+        assert!(!has_substantive_output(""));
+        assert!(!has_substantive_output("   \n  "));
+    }
+
+    #[test]
+    fn bash_nonzero_with_output_becomes_tool_result() {
+        use serde_json::json;
+
+        fn result_with(text: &str) -> serde_json::Value {
+            json!({
+                "content": [{ "type": "text", "text": text }]
+            })
+        }
+
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            translate_event(
+                AgentHarnessEvent::ToolExecutionEnd {
+                    tool_name: "bash".to_string(),
+                    tool_call_id: "tc1".to_string(),
+                    result: result_with(
+                        "grep: nope: No such file\n\nCommand exited with code 1",
+                    ),
+                    is_error: true,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+
+            state.entries.with(|e| {
+                // Non-zero exit WITH output → exactly one ToolResult entry (no
+                // separate error line).
+                assert_eq!(e.len(), 1, "one entry should be pushed");
+                match &e[0].kind {
+                    EntryKind::ToolResult { tool, output } => {
+                        assert_eq!(tool, "bash");
+                        assert!(
+                            output.contains("grep: nope"),
+                            "result should carry the command output, got: {output}"
+                        );
+                    }
+                    other => panic!("expected ToolResult, got {:?}", other.label()),
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn bash_nonzero_without_output_is_tool_result_plus_error() {
+        use serde_json::json;
+
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            translate_event(
+                AgentHarnessEvent::ToolExecutionEnd {
+                    tool_name: "bash".to_string(),
+                    tool_call_id: "tc1".to_string(),
+                    result: json!({
+                        "content": [{ "type": "text", "text": "Command exited with code 127" }]
+                    }),
+                    is_error: true,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+
+            state.entries.with(|e| {
+                // No-output failure → a ToolResult row AND a red Error line.
+                assert_eq!(e.len(), 2, "result + error should be pushed");
+                assert!(
+                    matches!(&e[0].kind, EntryKind::ToolResult { tool, .. } if tool == "bash"),
+                    "first entry should be the bash ToolResult, got {:?}",
+                    e[0].kind.label()
+                );
+                assert!(
+                    matches!(&e[1].kind, EntryKind::Error(_)),
+                    "second entry should be an Error, got {:?}",
+                    e[1].kind.label()
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn bash_success_output_becomes_tool_result() {
+        use serde_json::json;
+
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            translate_event(
+                AgentHarnessEvent::ToolExecutionEnd {
+                    tool_name: "bash".to_string(),
+                    tool_call_id: "tc1".to_string(),
+                    result: json!({
+                        "content": [{ "type": "text", "text": "hello world\nsecond line" }]
+                    }),
+                    is_error: false,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+
+            state.entries.with(|e| {
+                assert_eq!(e.len(), 1, "successful bash should push one ToolResult");
+                match &e[0].kind {
+                    EntryKind::ToolResult { tool, output } => {
+                        assert_eq!(tool, "bash");
+                        assert!(output.contains("hello world"));
+                    }
+                    other => panic!("expected ToolResult, got {:?}", other.label()),
+                }
+            });
+        });
+    }
+
+    /// Regression: the harness emits `ToolExecutionEnd` *and then*
+    /// `MessageEnd(ToolResult)` for the same result. Both used to push a
+    /// ToolResult entry, so every bash result appeared twice on screen. The
+    /// `MessageEnd(ToolResult)` arm is now a no-op; the second event must not
+    /// add another entry.
+    #[test]
+    fn bash_result_not_duplicated_by_followup_message_end() {
+        use serde_json::json;
+
+        fn tool_result_message(text: &str, is_error: bool) -> flown_ai::ToolResultMessage {
+            use flown_ai::{TextContent, ToolResultContent, ToolResultMessage};
+            ToolResultMessage {
+                role: "toolResult".to_string(),
+                tool_call_id: "tc1".to_string(),
+                tool_name: "bash".to_string(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    content_type: "text".to_string(),
+                    text: text.to_string(),
+                    text_signature: None,
+                })],
+                details: json!({}),
+                is_error,
+                timestamp: chrono::Utc::now(),
+            }
+        }
+
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            // 1) ToolExecutionEnd — the canonical source for the UI.
+            translate_event(
+                AgentHarnessEvent::ToolExecutionEnd {
+                    tool_name: "bash".to_string(),
+                    tool_call_id: "tc1".to_string(),
+                    result: json!({
+                        "content": [{ "type": "text", "text": "ls output here" }]
+                    }),
+                    is_error: false,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+            // 2) MessageEnd(ToolResult) — emitted right after by the harness.
+            // Must NOT add a second entry.
+            translate_event(
+                AgentHarnessEvent::MessageEnd {
+                    message: AgentMessage::ToolResult(tool_result_message(
+                        "ls output here",
+                        false,
+                    )),
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+
+            state.entries.with(|e| {
+                assert_eq!(
+                    e.len(),
+                    1,
+                    "bash result must not be duplicated by the follow-up MessageEnd"
+                );
+                assert!(
+                    matches!(&e[0].kind, EntryKind::ToolResult { tool, .. } if tool == "bash"),
+                    "the single entry should be the bash ToolResult"
+                );
+            });
         });
     }
 }

@@ -32,8 +32,18 @@ pub enum EntryKind {
     User(String),
     Assistant(String),
     Thinking(String),
-    Tool(String),
+    Tool { name: String, text: String },
+    /// A finalized tool result (the output a tool produced after running).
+    /// `tool` names the source tool so the renderer can apply per-tool styling
+    /// (e.g. bash output is shown indented, italic, light, and capped to a few
+    /// lines). `output` is the raw result text.
+    ToolResult { tool: String, output: String },
     Error(String),
+    /// A soft failure: the tool ran but reported a non-fatal problem (e.g. a
+    /// bash command that exited non-zero yet still produced output). Rendered
+    /// as a warning rather than a hard error so transient non-zero exits don't
+    /// drown the transcript in red.
+    Warning(String),
     System(String),
 }
 
@@ -44,8 +54,10 @@ impl EntryKind {
             EntryKind::User(_) => "user",
             EntryKind::Assistant(_) => "assistant",
             EntryKind::Thinking(_) => "thinking",
-            EntryKind::Tool(_) => "tool",
+            EntryKind::Tool { .. } => "tool",
+            EntryKind::ToolResult { .. } => "tool_result",
             EntryKind::Error(_) => "error",
+            EntryKind::Warning(_) => "warning",
             EntryKind::System(_) => "system",
         }
     }
@@ -184,16 +196,36 @@ impl UiState {
         self.push(EntryKind::Thinking(text.into()));
     }
 
-    pub fn push_tool(&self, text: impl Into<String>) {
-        self.push(EntryKind::Tool(text.into()));
+    pub fn push_tool(&self, name: impl Into<String>, text: impl Into<String>) {
+        self.push(EntryKind::Tool {
+            name: name.into(),
+            text: text.into(),
+        });
     }
 
     pub fn push_tool_call(&self, name: &str, args: &serde_json::Value) {
-        self.push(EntryKind::Tool(format_tool_call(name, args)));
+        let text = format_tool_call(name, args);
+        self.push(EntryKind::Tool {
+            name: name.to_string(),
+            text,
+        });
+    }
+
+    /// Push a finalized tool result. `tool` selects per-tool rendering (bash
+    /// output, for instance, is shown indented + italic + capped).
+    pub fn push_tool_result(&self, tool: &str, output: impl Into<String>) {
+        self.push(EntryKind::ToolResult {
+            tool: tool.to_string(),
+            output: output.into(),
+        });
     }
 
     pub fn push_error(&self, text: impl Into<String>) {
         self.push(EntryKind::Error(text.into()));
+    }
+
+    pub fn push_warning(&self, text: impl Into<String>) {
+        self.push(EntryKind::Warning(text.into()));
     }
 
     pub fn push_system(&self, text: impl Into<String>) {

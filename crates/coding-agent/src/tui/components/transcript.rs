@@ -163,10 +163,25 @@ fn transcript_render_width(terminal_width: u16) -> usize {
 
 /// The text content an entry was last rendered from, for cache-keying. Two
 /// entries with the same text render to the same rows at the same width.
-fn entry_text(entry: &ConversationEntry) -> &str {
+///
+/// Returns `Cow<str>` because a [`EntryKind::ToolResult`] is keyed by both its
+/// source `tool` (which picks the renderer) and its `output`; embedding the
+/// tool name into the key prevents a bash result and a read result with the
+/// same body from sharing a cached render.
+fn entry_text(entry: &ConversationEntry) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     match &entry.kind {
-        EntryKind::User(s) | EntryKind::Assistant(s) | EntryKind::Thinking(s) => s,
-        EntryKind::Tool(s) | EntryKind::Error(s) | EntryKind::System(s) => s,
+        EntryKind::User(s) | EntryKind::Assistant(s) | EntryKind::Thinking(s) => {
+            Cow::Borrowed(s)
+        }
+        EntryKind::Tool { text, .. } => Cow::Borrowed(text),
+        EntryKind::ToolResult { tool, output } => {
+            // Prefix with the tool tag so different tools never collide.
+            Cow::Owned(format!("[tool_result:{tool}]\n{output}"))
+        }
+        EntryKind::Error(text)
+        | EntryKind::Warning(text)
+        | EntryKind::System(text) => Cow::Borrowed(text),
     }
 }
 
@@ -454,7 +469,7 @@ mod tests {
         // First render populates the cache.
         let first = surface_of(render_all_entries_cached(&entries, 80, &parsers, &cache));
         assert_eq!(first.row_count(), 2);
-        assert_eq!(plain(&first, 1), "* partial");
+        assert_eq!(plain(&first, 1), "● partial");
 
         // Second render with the SAME entries: cache reused, identical surface.
         let second = surface_of(render_all_entries_cached(&entries, 80, &parsers, &cache));
@@ -471,7 +486,7 @@ mod tests {
         assert_eq!(plain(&third, 0), "info hello", "unchanged entry reused");
         assert_eq!(
             plain(&third, 1),
-            "* partial answer",
+            "● partial answer",
             "streamed entry re-rendered"
         );
     }

@@ -43,26 +43,112 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     timeout,
                     ..ExecOptions::default()
                 };
+                let span = tracing::info_span!(
+                    target: "flown::tools::bash",
+                    "bash.exec",
+                    command = %command,
+                    cwd = ?options.cwd,
+                    timeout_secs = ?timeout_secs,
+                    exit_code = tracing::field::Empty,
+                    raw_bytes = tracing::field::Empty,
+                    raw_lines = tracing::field::Empty,
+                    truncated = tracing::field::Empty,
+                    truncated_by = tracing::field::Empty,
+                    output_bytes = tracing::field::Empty,
+                    output_lines = tracing::field::Empty,
+                );
+                span.in_scope(|| {
+                    tracing::info!(target: "flown::tools::bash", "bash: exec start");
+                });
                 let result = match env.exec(&command, options).await {
                     Ok(result) => result,
                     Err(error) if error.code == ExecutionErrorCode::Timeout => {
                         let secs = timeout_secs
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "?".to_string());
+                        span.in_scope(|| {
+                            tracing::warn!(
+                                target: "flown::tools::bash",
+                                timeout_secs = %secs,
+                                "bash: command timed out"
+                            );
+                        });
                         return Err(AgentToolError::new(format!(
                             "Command timed out after {secs} seconds"
                         )));
                     }
-                    Err(error) => return Err(tool_error(error)),
+                    Err(error) => {
+                        span.in_scope(|| {
+                            tracing::warn!(
+                                target: "flown::tools::bash",
+                                code = ?error.code,
+                                "bash: exec failed"
+                            );
+                        });
+                        return Err(tool_error(error));
+                    }
                 };
                 let output = result.output;
+                let raw_bytes = output.len();
+                let raw_lines = if output.is_empty() {
+                    0
+                } else {
+                    output.lines().count()
+                };
                 let formatted = format_bash_output(&output, "(no output)")?;
+                let truncation_meta = &formatted.truncation;
+                let truncated = truncation_meta
+                    .get("truncated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let truncated_by = truncation_meta
+                    .get("truncatedBy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none");
+                let output_lines = truncation_meta
+                    .get("outputLines")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let output_bytes = truncation_meta
+                    .get("outputBytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                span.record("exit_code", result.exit_code);
+                span.record("raw_bytes", raw_bytes);
+                span.record("raw_lines", raw_lines);
+                span.record("truncated", truncated);
+                span.record("truncated_by", truncated_by);
+                span.record("output_lines", output_lines);
+                span.record("output_bytes", output_bytes);
                 if result.exit_code != 0 {
+                    span.in_scope(|| {
+                        tracing::warn!(
+                            target: "flown::tools::bash",
+                            exit_code = result.exit_code,
+                            raw_bytes,
+                            raw_lines,
+                            "bash: non-zero exit"
+                        );
+                    });
                     return Err(AgentToolError::new(append_status(
                         &formatted.text,
                         &format!("Command exited with code {}", result.exit_code),
                     )));
                 }
+
+                span.in_scope(|| {
+                    tracing::info!(
+                        target: "flown::tools::bash",
+                        exit_code = result.exit_code,
+                        raw_bytes,
+                        raw_lines,
+                        truncated,
+                        truncated_by,
+                        output_bytes,
+                        output_lines,
+                        "bash: exec done"
+                    );
+                });
 
                 Ok(text_result(
                     formatted.text,

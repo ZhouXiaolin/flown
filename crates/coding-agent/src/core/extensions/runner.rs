@@ -87,7 +87,22 @@ impl ToolSide {
             return;
         }
         let all = self.all_tools();
-        let _ = self.harness.set_tools(all, None).await;
+        // Activate every currently-registered tool, while preserving any prior
+        // active choice that still applies (e.g. a tool the user had not
+        // deactivated). Passing `None` would have kept the pre-reconcile
+        // active list, so an MCP server connecting at runtime — or a tool
+        // added later via `ToolHandle::add` — would never reach the LLM.
+        let previous_active = self.harness.active_tool_names();
+        let mut next_active: Vec<String> = previous_active
+            .into_iter()
+            .filter(|name| all.iter().any(|t| t.name == *name))
+            .collect();
+        for tool in &all {
+            if !next_active.contains(&tool.name) {
+                next_active.push(tool.name.clone());
+            }
+        }
+        let _ = self.harness.set_tools(all, Some(next_active)).await;
     }
 
     /// Drive reconcile in response to tool edits, instead of on a timer.

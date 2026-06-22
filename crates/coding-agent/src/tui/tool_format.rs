@@ -16,7 +16,14 @@ pub fn format_tool_call(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Read {path}")
+            let offset = args.get("offset").and_then(|v| v.as_u64());
+            let limit = args.get("limit").and_then(|v| v.as_u64());
+            match (offset, limit) {
+                (Some(o), Some(l)) => format!("Read {path} (offset: {o}, limit: {l})"),
+                (Some(o), None) => format!("Read {path} (offset: {o})"),
+                (None, Some(l)) => format!("Read {path} (limit: {l})"),
+                (None, None) => format!("Read {path}"),
+            }
         }
         "write" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
