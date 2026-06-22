@@ -1,12 +1,15 @@
-//! `OverlayStack` — tracks the single active floating overlay (0 or 1).
+//! `OverlayStack` — the stack of active floating overlays (0..N).
 //!
-//! Provided via iodilos context. App renders the main layout plus, when an
-//! overlay is active, a top-level `OverlayBox` over it. Pushing replaces any
-//! active overlay (we support depth 1 in v1); popping runs the overlay's
-//! optional `on_close` teardown first.
+//! Provided via iodilos context. App renders the main layout plus, when one or
+//! more overlays are active, a nested stack of `OverlayBox`es over it — each
+//! later overlay paints above the previous, so a smaller picker can float over
+//! a larger one (e.g. the thinking-intensity picker over the `/model` picker).
+//! Pushing appends a new top layer; popping runs that layer's optional
+//! `on_close` teardown first. `pop_all` clears the whole stack (used when a
+//! nested flow confirms and wants to return straight to the original view).
 //!
-//! The overlay carries a **content factory** (`Fn() -> Node`), not a pre-built
-//! node. App's `OverlayLayer` builds the content ONCE — under the mount owner,
+//! The overlay carries a **content factory** (`Fn() -> View`), not a pre-built
+//! view. App's overlay host builds the content under the mount owner,
 //! wrapped in a sub-`Owner` (mirroring iodilos's `Show`) — when the active
 //! overlay changes, and caches that owner so spurious effect re-runs do not
 //! re-build (which would stack a fresh `on_key` per redraw). Building in the
@@ -15,7 +18,7 @@
 
 use std::rc::Rc;
 
-use iodilos::OverlayGeometry;
+use crossterm::event::KeyEvent;
 use iodilos::prelude::*;
 
 /// One active overlay. `content` is a factory because the node must be built
@@ -29,64 +32,74 @@ pub struct ActiveOverlay {
     /// so the active fork receives typing; modal pickers leave it false so
     /// stray keys do not mutate the hidden main editor.
     pub route_app_keys: bool,
-    /// Builds the overlay's content Node. Invoked exactly once per overlay
-    /// (when App mounts it), under the mount owner.
-    pub content: Rc<dyn Fn() -> Node>,
+    /// Builds the overlay's content view.
+    pub content: Rc<dyn Fn() -> View>,
+    /// Optional overlay-local key handler. App root calls this before routing
+    /// unhandled keys to the active conversation.
+    pub on_key: Option<Rc<dyn Fn(KeyEvent) -> bool>>,
     /// Optional teardown (btw uses it to drop its forked harness; model doesn't).
     pub on_close: Option<Rc<dyn Fn()>>,
 }
 
 pub struct OverlayStack {
-    active: RwSignal<Option<Rc<ActiveOverlay>>>,
+    /// The active layers, bottom-first. The last element is the topmost layer.
+    layers: Signal<Vec<Rc<ActiveOverlay>>>,
 }
 
 impl OverlayStack {
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
-            active: create_rw_signal(None),
+            layers: create_signal(Vec::new()),
         })
     }
 
-    /// The current overlay, if any.
+    /// The topmost overlay, if any. This is the one that owns the keys.
     pub fn active(&self) -> Option<Rc<ActiveOverlay>> {
-        self.active.get()
+        self.layers.with(|l| l.last().cloned())
     }
 
-    /// Reactive read for effects: call inside an effect to re-run on change.
-    pub fn active_signal(&self) -> RwSignal<Option<Rc<ActiveOverlay>>> {
-        self.active
+    /// Reactive read of the full layer list, for the render effect. Reading
+    /// inside an effect makes it re-run on push/pop.
+    pub fn layers_signal(&self) -> Signal<Vec<Rc<ActiveOverlay>>> {
+        self.layers
     }
 
-    /// True when an overlay is open or being opened.
+    /// True when at least one overlay is open.
     pub fn is_active(&self) -> bool {
-        self.active.with(|o| o.is_some())
+        self.layers.with(|l| !l.is_empty())
     }
 
-    /// True when the active overlay intentionally lets unhandled keys fall
-    /// through to App's normal editor/router.
-    pub fn routes_app_keys(&self) -> bool {
-        self.active
-            .with(|o| o.as_ref().map(|o| o.route_app_keys).unwrap_or(false))
+    /// The number of layers currently stacked.
+    pub fn depth(&self) -> usize {
+        self.layers.with(|l| l.len())
     }
 
-    /// Push an overlay. Returns whether it took effect — rejected if another
-    /// overlay is already active (v1 supports depth 1).
+    /// Push an overlay onto the top of the stack. Unlike the earlier depth-1
+    /// model, a push always succeeds: layers nest, so a smaller picker can
+    /// float above an already-open one.
     pub fn push(&self, overlay: ActiveOverlay) -> bool {
-        if self.is_active() {
-            return false;
-        }
-        self.active.set(Some(Rc::new(overlay)));
+        self.layers.update(|l| l.push(Rc::new(overlay)));
         true
     }
 
-    /// Pop the active overlay, running its `on_close` first. No-op if none.
+    /// Pop the topmost overlay, running its `on_close` first. No-op if empty.
     pub fn pop(&self) {
-        if let Some(overlay) = self.active.get()
+        let removed = self.layers.update(|l| l.pop());
+        if let Some(overlay) = removed
             && let Some(on_close) = &overlay.on_close
         {
             on_close();
         }
-        self.active.set(None);
+    }
+
+    /// Pop every overlay (running each `on_close`), returning to the original
+    /// view. Used when a nested flow confirms and wants to skip the
+    /// intermediate layers — e.g. confirming a thinking level applies the model
+    /// and drops both the thinking and model overlays at once.
+    pub fn pop_all(&self) {
+        while self.is_active() {
+            self.pop();
+        }
     }
 }
 
@@ -99,14 +112,15 @@ mod tests {
             geometry: OverlayGeometry::Inset { ratio: 0.125 },
             dismissible: true,
             route_app_keys: false,
-            content: Rc::new(Node::new_text),
+            content: Rc::new(View::new),
+            on_key: None,
             on_close: None,
         }
     }
 
     #[test]
     fn push_and_pop_round_trip() {
-        let (_, owner) = create_root(|| {
+        let owner = create_root(|| {
             let stack = OverlayStack::new();
             assert!(!stack.is_active());
             assert!(stack.push(overlay()));
@@ -118,19 +132,30 @@ mod tests {
     }
 
     #[test]
-    fn push_is_rejected_when_already_active() {
-        let (_, owner) = create_root(|| {
+    fn push_nests_layers_instead_of_rejecting() {
+        let owner = create_root(|| {
             let stack = OverlayStack::new();
             assert!(stack.push(overlay()));
-            assert!(!stack.push(overlay()), "second push must be rejected");
+            // A second push now nests on top rather than being rejected.
+            assert!(stack.push(overlay()));
+            assert_eq!(stack.depth(), 2);
             assert!(stack.is_active());
+
+            // active() is the topmost layer.
+            assert!(stack.active().is_some());
+
+            // Popping unwraps one layer at a time.
+            stack.pop();
+            assert_eq!(stack.depth(), 1);
+            stack.pop();
+            assert!(!stack.is_active());
         });
         owner.dispose();
     }
 
     #[test]
     fn pop_runs_on_close() {
-        let (_, owner) = create_root(|| {
+        let owner = create_root(|| {
             let stack = OverlayStack::new();
             let fired = Rc::new(std::cell::Cell::new(false));
             let fired_for_close = Rc::clone(&fired);
@@ -138,7 +163,8 @@ mod tests {
                 geometry: OverlayGeometry::FullBleed,
                 dismissible: true,
                 route_app_keys: false,
-                content: Rc::new(Node::new_text),
+                content: Rc::new(View::new),
+                on_key: None,
                 on_close: Some(Rc::new(move || fired_for_close.set(true))),
             };
             stack.push(o);
@@ -150,10 +176,69 @@ mod tests {
 
     #[test]
     fn pop_is_noop_when_empty() {
-        let (_, owner) = create_root(|| {
+        let owner = create_root(|| {
             let stack = OverlayStack::new();
             stack.pop(); // must not panic
             assert!(!stack.is_active());
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn pop_all_clears_every_layer_running_each_on_close() {
+        let owner = create_root(|| {
+            let stack = OverlayStack::new();
+            let count = Rc::new(std::cell::Cell::new(0u32));
+            for _ in 0..3 {
+                let count_for_close = Rc::clone(&count);
+                stack.push(ActiveOverlay {
+                    geometry: OverlayGeometry::Inset { ratio: 0.125 },
+                    dismissible: true,
+                    route_app_keys: false,
+                    content: Rc::new(View::new),
+                    on_key: None,
+                    on_close: Some(Rc::new(move || {
+                        count_for_close.set(count_for_close.get() + 1)
+                    })),
+                });
+            }
+            assert_eq!(stack.depth(), 3);
+            stack.pop_all();
+            assert!(!stack.is_active());
+            assert_eq!(count.get(), 3, "every on_close should have run");
+        });
+        owner.dispose();
+    }
+
+    #[test]
+    fn active_returns_topmost_after_nested_push() {
+        let owner = create_root(|| {
+            let stack = OverlayStack::new();
+            let bottom = ActiveOverlay {
+                geometry: OverlayGeometry::FullBleed,
+                dismissible: true,
+                route_app_keys: false,
+                content: Rc::new(View::new),
+                on_key: None,
+                on_close: None,
+            };
+            stack.push(bottom);
+            let top = ActiveOverlay {
+                geometry: OverlayGeometry::Inset { ratio: 0.33 },
+                dismissible: true,
+                route_app_keys: false,
+                content: Rc::new(View::new),
+                on_key: None,
+                on_close: None,
+            };
+            stack.push(top);
+
+            let active = stack.active().expect("a top layer should be active");
+            assert_eq!(
+                active.geometry,
+                OverlayGeometry::Inset { ratio: 0.33 },
+                "active() should be the topmost layer"
+            );
         });
         owner.dispose();
     }

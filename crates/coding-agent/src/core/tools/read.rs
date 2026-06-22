@@ -93,9 +93,10 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         path,
                         DEFAULT_MAX_BYTES
                     );
-                    details = json!({ "truncation": truncation.to_value() });
+                    details = truncation.to_value();
                 } else if truncation.truncated {
-                    // Truncation occurred
+                    // Truncation occurred. Materialize the value before moving
+                    // `content` into `output_text` below.
                     let truncation_value = truncation.to_value();
                     let end_line_display = start_line_display + truncation.output_lines - 1;
                     let next_offset = end_line_display + 1;
@@ -113,7 +114,7 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             format_size(DEFAULT_MAX_BYTES), next_offset
                         ));
                     }
-                    details = json!({ "truncation": truncation_value });
+                    details = truncation_value;
                 } else if let Some(user_limit) = limit {
                     let end_line = start_line + user_limit;
                     if end_line < all_lines.len() {
@@ -290,4 +291,37 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_head_marks_first_line_exceeds_limit() {
+        let huge = "a".repeat(DEFAULT_MAX_BYTES + 1);
+        let result = truncate_head(&huge);
+        assert!(result.first_line_exceeds_limit);
+        assert!(result.truncated);
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn truncate_head_keeps_content_within_limits() {
+        let content = "line1\nline2\nline3";
+        let result = truncate_head(content);
+        assert!(!result.truncated);
+        assert_eq!(result.content, content);
+    }
+
+    #[test]
+    fn truncate_head_truncates_by_lines() {
+        let lines: Vec<String> = (0..DEFAULT_MAX_LINES + 5)
+            .map(|i| format!("line{i}"))
+            .collect();
+        let content = lines.join("\n");
+        let result = truncate_head(&content);
+        assert!(result.truncated);
+        assert_eq!(result.output_lines, DEFAULT_MAX_LINES);
+    }
 }

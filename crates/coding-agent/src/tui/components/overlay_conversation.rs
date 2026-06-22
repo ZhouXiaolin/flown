@@ -7,50 +7,32 @@ use iodilos::prelude::*;
 
 use crate::config::Config;
 use crate::tui::components::editor::input_editor_for_state;
-use crate::tui::components::status_line::status_line_for_state;
 use crate::tui::components::transcript::transcript_for_state;
 use crate::tui::editor::{self, EditorAction};
 use crate::tui::state::UiState;
 
 pub struct OverlayConversationProps {
     pub state: Rc<UiState>,
-    pub badge: Option<String>,
-    pub config: Config,
-    pub submit: Rc<dyn Fn(String)>,
-    pub close: Rc<dyn Fn()>,
+    /// Rightmost status-line marker for this overlay's prompt (e.g. "BTW").
+    /// Rendered at the tail slot, not as a left-side field.
+    pub tail_label: Option<String>,
 }
 
-pub fn overlay_conversation(props: OverlayConversationProps) -> Node {
-    let state_for_key = Rc::clone(&props.state);
-    let config_for_key = props.config.clone();
-    let submit = Rc::clone(&props.submit);
-    let close = Rc::clone(&props.close);
-
-    on_key(move |key: KeyEvent| -> bool {
-        handle_overlay_key(
-            key,
-            &state_for_key,
-            &config_for_key,
-            Rc::clone(&submit),
-            Rc::clone(&close),
-        )
-    });
-
-    let root = Node::new_view();
-    root.set_flex_direction(FlexDirection::Column);
-    root.set_width_percent(100.0);
-    root.set_height_percent(100.0);
-    root.set_background(Color::Reset);
-
-    root.set_children(vec![
-        transcript_for_state(Rc::clone(&props.state)),
-        status_line_for_state(Rc::clone(&props.state), props.badge),
-        input_editor_for_state(props.state),
-    ]);
-    root
+pub fn overlay_conversation(props: OverlayConversationProps) -> View {
+    View::from(
+        tags::div()
+            .flex_direction(FlexDirection::Column)
+            .width(Size::Percent(100.0))
+            .height(Size::Percent(100.0))
+            .background_color(Color::Reset)
+            .children((
+                transcript_for_state(Rc::clone(&props.state)),
+                input_editor_for_state(props.state, props.tail_label),
+            )),
+    )
 }
 
-fn handle_overlay_key(
+pub fn handle_overlay_key(
     key: KeyEvent,
     state: &Rc<UiState>,
     config: &Config,
@@ -83,8 +65,8 @@ fn handle_overlay_key(
         return true;
     }
 
-    let mut input = state.input.get();
-    let mut popup = state.slash_popup.get();
+    let mut input = state.input.get_clone();
+    let mut popup = state.slash_popup.get_clone();
     let commands = Vec::new();
     let action = editor::handle_key(&mut input, &mut popup, key, config, &commands, false);
     state.input.set(input);
@@ -92,8 +74,7 @@ fn handle_overlay_key(
 
     match action {
         EditorAction::Submit => {
-            let text = state.input.with(|es| es.text());
-            let text = text.trim().to_string();
+            let text = state.input.with(|es| es.text()).trim().to_string();
             if text.is_empty() {
                 return true;
             }

@@ -33,7 +33,8 @@ use iodilos::prelude::*;
 
 use crate::cli;
 use crate::config::Config;
-use crate::tui::components::app::{App, AppProps};
+use crate::tui::components::app::app;
+use crate::tui::editor::EditorState;
 use crate::tui::state::{BUSY_FRAMES, StatusInfo, UiState};
 use flown_agent::AgentHarnessEvent;
 
@@ -177,10 +178,6 @@ pub async fn run_tui(
         None => None,
     };
 
-    // Build the iodilos renderer. From here on the main thread is owned by
-    // iodilos's event loop until quit.
-    let mut renderer = Renderer::new()?;
-
     // Captures for the mount closure: the binding parts (harness, cmd sender,
     // event sender, unsubscribe), the event receiver (for the pump), the status
     // snapshot, and the extension command registry. `status` seeds the initial
@@ -197,107 +194,129 @@ pub async fn run_tui(
     let mount_cmd_tx = main_cmd_tx;
     let mount_event_rx = main_event_rx;
 
-    renderer.mount(move || {
-        // The shared reactive state, seeded with the initial status + busy flag.
-        let state = Rc::new(UiState::new(TextAreaState::default()));
-        state.status.update(|s| *s = mount_status.clone());
-        state.busy.set(mount_busy);
+    iodilos::render_async_with(
+        move || {
+            // The shared reactive state, seeded with the initial status + busy flag.
+            let state = Rc::new(UiState::new(EditorState::default()));
+            state.status.update(|s| *s = mount_status.clone());
+            state.busy.set(mount_busy);
 
-        // The main harness binding (channel + subscriber + driver) was created
-        // before mount in `bind_layer_driver`. Its event receiver feeds the main
-        // pump spawned below; its sender + unsubscribe ride on the main layer.
-        // Build the conversation stack. The main layer wraps the state, the
-        // main harness binding's sender + unsubscribe, and the driver's command
-        // sender; its senders stay alive for the app's lifetime (main is never
-        // popped). Overlap layers are pushed by RuntimeControl::open_overlap.
-        let main_layer = crate::tui::conversation::ConversationLayer {
-            kind: crate::tui::conversation::LayerKind::Main,
-            overlap: None,
-            state: Rc::clone(&state),
-            harness: mount_harness.clone(),
-            event_tx: mount_event_tx
-                .clone()
-                .expect("main event_tx present when harness exists; binding created before mount"),
-            unsubscribe: mount_unsubscribe.take(),
-            cmd_tx: mount_cmd_tx.clone(),
-        };
-        let stack = crate::tui::conversation::ConversationStack::new(
-            main_layer,
-            mount_overlap_factory.clone(),
-        );
+            // Reactive terminal size. Provided once here and mutated by App's
+            // `terminal_resize` handler. Components (transcript, prompt, thinking
+            // block) read it inside effects so they re-render at the right width
+            // after a resize — `crossterm::terminal::size()` is NOT reactive, so a
+            // one-shot read would leave them rendering at the stale pre-resize width.
+            let term_size = crate::tui::state::TerminalSize::new();
+            provide_context(term_size);
 
-        // RuntimeControl is the iodilos-side command interpreter behind the
-        // extension-facing RuntimeCommandProxy. Built here (not during
-        // register, which runs on tokio) because it holds the Rc<ConversationStack>
-        // and the OverlayStack (both !Send). The overlay stack is provided as
-        // context so App can render the active overlay on top of the main UI.
-        let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
-        let runtime_control = crate::tui::conversation::RuntimeControl::new(
-            Rc::clone(&stack),
-            Rc::clone(&overlay_stack),
-            mount_harness.clone(),
-            mount_config.clone(),
-        );
-        let (runtime_command_tx, runtime_command_rx) = flume::unbounded();
-        let runtime_proxy = Arc::new(crate::core::extensions::RuntimeCommandProxy::new(
-            runtime_command_tx,
-        ));
-        spawn_runtime_command_pump(Rc::clone(&runtime_control), runtime_command_rx);
-        provide_context(Rc::clone(&overlay_stack));
+            // The main harness binding (channel + subscriber + driver) was created
+            // before mount in `bind_layer_driver`. Its event receiver feeds the main
+            // pump spawned below; its sender + unsubscribe ride on the main layer.
+            // Build the conversation stack. The main layer wraps the state, the
+            // main harness binding's sender + unsubscribe, and the driver's command
+            // sender; its senders stay alive for the app's lifetime (main is never
+            // popped). Overlap layers are pushed by RuntimeControl::open_overlap.
+            let main_layer = crate::tui::conversation::ConversationLayer {
+                kind: crate::tui::conversation::LayerKind::Main,
+                overlap: None,
+                state: Rc::clone(&state),
+                harness: mount_harness.clone(),
+                event_tx: mount_event_tx.clone().unwrap_or_else(|| {
+                    let (tx, _rx) = flume::unbounded();
+                    tx
+                }),
+                unsubscribe: mount_unsubscribe.take(),
+                cmd_tx: mount_cmd_tx.clone(),
+            };
+            let stack = crate::tui::conversation::ConversationStack::new(
+                main_layer,
+                mount_overlap_factory.clone(),
+            );
 
-        // Bind the extension command table to the live stack, producing the
-        // dispatch-capable CommandSide. Commands receive an ExtensionContext
-        // backed by RuntimeCommandProxy, so UI/conversation actions target the
-        // active layer without exposing UiState to extensions.
-        let command_side: Option<Rc<crate::core::extensions::CommandSide>> = mount_command_table
-            .take()
-            .map(|table| Rc::new(table.bind(Arc::clone(&runtime_proxy))));
-        provide_context(command_side);
+            // RuntimeControl is the iodilos-side command interpreter behind the
+            // extension-facing RuntimeCommandProxy. Built here (not during
+            // register, which runs on tokio) because it holds the Rc<ConversationStack>
+            // and the OverlayStack (both !Send). The overlay stack is provided as
+            // context so App can render the active overlay on top of the main UI.
+            let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+            let runtime_control = crate::tui::conversation::RuntimeControl::new(
+                Rc::clone(&stack),
+                Rc::clone(&overlay_stack),
+                mount_harness.clone(),
+                mount_config.clone(),
+            );
+            let (runtime_command_tx, runtime_command_rx) = flume::unbounded();
+            let runtime_proxy = Arc::new(crate::core::extensions::RuntimeCommandProxy::new(
+                runtime_command_tx,
+            ));
+            spawn_runtime_command_pump(Rc::clone(&runtime_control), runtime_command_rx);
+            provide_context(Rc::clone(&overlay_stack));
 
-        // Provide the conversation stack (not a bare UiState) + handles. App
-        // and components read `stack.active().state`. The event pump captures
-        // the main state by move (it cannot use_context — no active owner).
-        provide_context(Rc::clone(&stack));
-        provide_context(mount_harness.clone());
-        provide_context(mount_config.clone());
+            // Bind the extension command table to the live stack, producing the
+            // dispatch-capable CommandSide. Commands receive an ExtensionContext
+            // backed by RuntimeCommandProxy, so UI/conversation actions target the
+            // active layer without exposing UiState to extensions.
+            let command_side: Option<Rc<crate::core::extensions::CommandSide>> =
+                mount_command_table
+                    .take()
+                    .map(|table| Rc::new(table.bind(Arc::clone(&runtime_proxy))));
+            provide_context(command_side);
 
-        // The event pump: drain the main channel and translate each event into
-        // main UiState mutations. Overlap layers spawn their own identical pump
-        // in RuntimeControl::open_overlap.
-        let pump_state = Rc::clone(&state);
-        // The main pump consumes the binding's event_rx (single-consumer). Only
-        // spawn it when a harness (and thus a receiver) exists; in session-only
-        // mode there are no events to pump.
-        if let Some(pump_rx) = mount_event_rx {
-            spawn_local(async move {
-                let mut accumulated_text = String::new();
-                let mut in_thinking = false;
-                while let Ok(event) = pump_rx.recv_async().await {
-                    translate_event(event, &pump_state, &mut accumulated_text, &mut in_thinking);
+            // Provide the conversation stack (not a bare UiState) + handles. App
+            // and components read `stack.active().state`. The event pump captures
+            // the main state by move (it cannot use_context — no active owner).
+            provide_context(Rc::clone(&stack));
+            provide_context(mount_harness.clone());
+            provide_context(mount_config.clone());
+
+            // The event pump: drain the main channel and translate each event into
+            // main UiState mutations. Overlap layers spawn their own identical pump
+            // in RuntimeControl::open_overlap.
+            let pump_state = Rc::clone(&state);
+            // The main pump consumes the binding's event_rx (single-consumer). Only
+            // spawn it when a harness (and thus a receiver) exists; in session-only
+            // mode there are no events to pump.
+            if let Some(pump_rx) = mount_event_rx {
+                use_future(async move {
+                    let mut accumulated_text = String::new();
+                    let mut in_thinking = false;
+                    while let Ok(event) = pump_rx.recv_async().await {
+                        translate_event(
+                            event,
+                            &pump_state,
+                            &mut accumulated_text,
+                            &mut in_thinking,
+                        );
+                    }
+                });
+            }
+
+            // Busy-spinner tick: advance the spinner frame while the active layer's
+            // agent is running. Registered once at mount; reads the stack so it
+            // tracks whichever view is visible.
+            let spinner_stack = Rc::clone(&stack);
+            use_future(async move {
+                loop {
+                    futures_timer::Delay::new(std::time::Duration::from_millis(500)).await;
+                    let active = spinner_stack.active();
+                    if active.state.busy.get() {
+                        active.state.status.update(|s| {
+                            s.frame = (s.frame + 1) % BUSY_FRAMES.len();
+                        });
+                    } else {
+                        active.state.status.update(|s| s.frame = 0);
+                    }
                 }
             });
-        }
 
-        // Busy-spinner tick: advance the spinner frame while the active layer's
-        // agent is running. Registered once at mount; reads the stack so it
-        // tracks whichever view is visible.
-        let spinner_stack = Rc::clone(&stack);
-        every(std::time::Duration::from_millis(500), move || {
-            let active = spinner_stack.active();
-            if active.state.busy.get() {
-                active.state.status.update(|s| {
-                    s.frame = (s.frame + 1) % BUSY_FRAMES.len();
-                });
-            } else {
-                // Reset the frame when idle so the spinner resumes from the top.
-                active.state.status.update(|s| s.frame = 0);
-            }
-        });
-
-        view! { App() }
-    });
-
-    renderer.run().await?;
+            app()
+        },
+        RenderConfig {
+            keyboard_enhancement: true,
+            quit: QuitPolicy::None,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -305,7 +324,7 @@ fn spawn_runtime_command_pump(
     runtime_control: Rc<crate::tui::conversation::RuntimeControl>,
     rx: flume::Receiver<crate::core::extensions::RuntimeCommand>,
 ) {
-    spawn_local(async move {
+    use_future(async move {
         while let Ok(command) = rx.recv_async().await {
             use crate::core::extensions::RuntimeCommand;
             match command {
@@ -363,7 +382,7 @@ pub(crate) fn translate_event(
         } => match assistant_message_event {
             AssistantMessageEvent::TextDelta { delta, .. } => {
                 if *in_thinking {
-                    state.push_thinking(std::mem::take(accumulated_text));
+                    accumulated_text.clear();
                     *in_thinking = false;
                 }
                 if !state.append_to_assistant(&delta) {
@@ -377,9 +396,18 @@ pub(crate) fn translate_event(
             }
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                 accumulated_text.push_str(&delta);
+                if !state.append_to_thinking(&delta) {
+                    state.push_thinking(delta);
+                }
             }
-            AssistantMessageEvent::ThinkingEnd { .. } => {
-                state.push_thinking(std::mem::take(accumulated_text));
+            AssistantMessageEvent::ThinkingEnd { content, .. } => {
+                if accumulated_text.is_empty()
+                    && !content.is_empty()
+                    && !state.append_to_thinking(&content)
+                {
+                    state.push_thinking(content);
+                }
+                accumulated_text.clear();
                 *in_thinking = false;
             }
             AssistantMessageEvent::Done { message, .. }
@@ -509,12 +537,13 @@ fn assistant_is_waiting_for_tool(message: &flown_ai::AssistantMessage) -> bool {
 mod tests {
     use super::*;
 
+    use crate::tui::editor::EditorState;
+    use crate::tui::state::EntryKind;
     use flown_agent::AgentMessage;
     use flown_ai::{
         Api, AssistantContent, AssistantMessage, AssistantMessageEvent, KnownApi, KnownProvider,
         Provider, StopReason, TextContent, ToolCall, Usage,
     };
-    use iodilos::prelude::TextAreaState;
 
     fn assistant(content: Vec<AssistantContent>, stop_reason: StopReason) -> AssistantMessage {
         AssistantMessage {
@@ -538,82 +567,27 @@ mod tests {
     }
 
     fn busy_state() -> UiState {
-        let state = UiState::new(TextAreaState::default());
+        let state = UiState::new(EditorState::default());
         state.busy.set(true);
         state.status.update(|status| status.busy = true);
         state
     }
 
+    fn with_root(f: impl FnOnce()) {
+        let owner = create_root(f);
+        owner.dispose();
+    }
+
     #[test]
     fn assistant_message_end_clears_busy_for_final_text() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
 
-        translate_event(
-            AgentHarnessEvent::MessageEnd {
-                message: assistant_message(
-                    vec![AssistantContent::Text(TextContent {
-                        content_type: "text".to_string(),
-                        text: "done".to_string(),
-                        text_signature: None,
-                    })],
-                    StopReason::Stop,
-                ),
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
-
-        assert!(!state.busy.get());
-        assert!(!state.status.get().busy);
-        assert!(accumulated_text.is_empty());
-        assert!(!in_thinking);
-    }
-
-    #[test]
-    fn assistant_message_end_keeps_busy_for_tool_call() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
-
-        translate_event(
-            AgentHarnessEvent::MessageEnd {
-                message: assistant_message(
-                    vec![AssistantContent::ToolCall(ToolCall {
-                        content_type: "toolCall".to_string(),
-                        id: "call-1".to_string(),
-                        name: "bash".to_string(),
-                        arguments: serde_json::json!({}),
-                        thought_signature: None,
-                    })],
-                    StopReason::ToolUse,
-                ),
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
-
-        assert!(state.busy.get());
-        assert!(state.status.get().busy);
-        assert_eq!(accumulated_text, "partial");
-        assert!(in_thinking);
-    }
-
-    #[test]
-    fn assistant_done_clears_busy_for_final_text() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
-
-        translate_event(
-            AgentHarnessEvent::MessageUpdate {
-                message: assistant_message(Vec::new(), StopReason::Stop),
-                assistant_message_event: AssistantMessageEvent::Done {
-                    reason: StopReason::Stop,
-                    message: assistant(
+            translate_event(
+                AgentHarnessEvent::MessageEnd {
+                    message: assistant_message(
                         vec![AssistantContent::Text(TextContent {
                             content_type: "text".to_string(),
                             text: "done".to_string(),
@@ -622,30 +596,28 @@ mod tests {
                         StopReason::Stop,
                     ),
                 },
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
 
-        assert!(!state.busy.get());
-        assert!(!state.status.get().busy);
-        assert!(accumulated_text.is_empty());
-        assert!(!in_thinking);
+            assert!(!state.busy.get());
+            assert!(!state.status.get_clone().busy);
+            assert!(accumulated_text.is_empty());
+            assert!(!in_thinking);
+        });
     }
 
     #[test]
-    fn assistant_done_keeps_busy_for_tool_call() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
+    fn assistant_message_end_keeps_busy_for_tool_call() {
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
 
-        translate_event(
-            AgentHarnessEvent::MessageUpdate {
-                message: assistant_message(Vec::new(), StopReason::ToolUse),
-                assistant_message_event: AssistantMessageEvent::Done {
-                    reason: StopReason::ToolUse,
-                    message: assistant(
+            translate_event(
+                AgentHarnessEvent::MessageEnd {
+                    message: assistant_message(
                         vec![AssistantContent::ToolCall(ToolCall {
                             content_type: "toolCall".to_string(),
                             id: "call-1".to_string(),
@@ -656,135 +628,285 @@ mod tests {
                         StopReason::ToolUse,
                     ),
                 },
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
 
-        assert!(state.busy.get());
-        assert!(state.status.get().busy);
-        assert_eq!(accumulated_text, "partial");
-        assert!(in_thinking);
+            assert!(state.busy.get());
+            assert!(state.status.get_clone().busy);
+            assert_eq!(accumulated_text, "partial");
+            assert!(in_thinking);
+        });
+    }
+
+    #[test]
+    fn assistant_done_clears_busy_for_final_text() {
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
+
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: assistant_message(Vec::new(), StopReason::Stop),
+                    assistant_message_event: AssistantMessageEvent::Done {
+                        reason: StopReason::Stop,
+                        message: assistant(
+                            vec![AssistantContent::Text(TextContent {
+                                content_type: "text".to_string(),
+                                text: "done".to_string(),
+                                text_signature: None,
+                            })],
+                            StopReason::Stop,
+                        ),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+
+            assert!(!state.busy.get());
+            assert!(!state.status.get_clone().busy);
+            assert!(accumulated_text.is_empty());
+            assert!(!in_thinking);
+        });
+    }
+
+    #[test]
+    fn assistant_done_keeps_busy_for_tool_call() {
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
+
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: assistant_message(Vec::new(), StopReason::ToolUse),
+                    assistant_message_event: AssistantMessageEvent::Done {
+                        reason: StopReason::ToolUse,
+                        message: assistant(
+                            vec![AssistantContent::ToolCall(ToolCall {
+                                content_type: "toolCall".to_string(),
+                                id: "call-1".to_string(),
+                                name: "bash".to_string(),
+                                arguments: serde_json::json!({}),
+                                thought_signature: None,
+                            })],
+                            StopReason::ToolUse,
+                        ),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+
+            assert!(state.busy.get());
+            assert!(state.status.get_clone().busy);
+            assert_eq!(accumulated_text, "partial");
+            assert!(in_thinking);
+        });
+    }
+
+    #[test]
+    fn thinking_stream_updates_one_transcript_entry() {
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut accumulated_text = String::new();
+            let mut in_thinking = false;
+            let message = || assistant_message(Vec::new(), StopReason::Stop);
+            let partial = || assistant(Vec::new(), StopReason::Stop);
+
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                        content_index: 0,
+                        partial: partial(),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                        content_index: 0,
+                        delta: "plan".to_string(),
+                        partial: partial(),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                        content_index: 0,
+                        delta: " next".to_string(),
+                        partial: partial(),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+            translate_event(
+                AgentHarnessEvent::MessageUpdate {
+                    message: message(),
+                    assistant_message_event: AssistantMessageEvent::ThinkingEnd {
+                        content_index: 0,
+                        content: "plan next".to_string(),
+                        partial: partial(),
+                    },
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
+
+            let entries = state.entries.get_clone();
+            assert_eq!(entries.len(), 1);
+            let EntryKind::Thinking(body) = &entries[0].kind else {
+                panic!("expected thinking entry");
+            };
+            assert_eq!(body, "plan next");
+            assert!(accumulated_text.is_empty());
+            assert!(!in_thinking);
+        });
     }
 
     #[test]
     fn assistant_message_end_stop_reason_decides_finality() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
 
-        translate_event(
-            AgentHarnessEvent::MessageEnd {
-                message: assistant_message(
-                    vec![
-                        AssistantContent::Text(TextContent {
-                            content_type: "text".to_string(),
-                            text: "done".to_string(),
-                            text_signature: None,
-                        }),
-                        AssistantContent::ToolCall(ToolCall {
-                            content_type: "toolCall".to_string(),
-                            id: "call-1".to_string(),
-                            name: "bash".to_string(),
-                            arguments: serde_json::json!({}),
-                            thought_signature: None,
-                        }),
-                    ],
-                    StopReason::Stop,
-                ),
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
+            translate_event(
+                AgentHarnessEvent::MessageEnd {
+                    message: assistant_message(
+                        vec![
+                            AssistantContent::Text(TextContent {
+                                content_type: "text".to_string(),
+                                text: "done".to_string(),
+                                text_signature: None,
+                            }),
+                            AssistantContent::ToolCall(ToolCall {
+                                content_type: "toolCall".to_string(),
+                                id: "call-1".to_string(),
+                                name: "bash".to_string(),
+                                arguments: serde_json::json!({}),
+                                thought_signature: None,
+                            }),
+                        ],
+                        StopReason::Stop,
+                    ),
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
 
-        assert!(!state.busy.get());
-        assert!(!state.status.get().busy);
-        assert!(accumulated_text.is_empty());
-        assert!(!in_thinking);
+            assert!(!state.busy.get());
+            assert!(!state.status.get_clone().busy);
+            assert!(accumulated_text.is_empty());
+            assert!(!in_thinking);
+        });
     }
 
     #[test]
     fn final_turn_end_clears_busy() {
-        let state = busy_state();
-        let mut accumulated_text = "partial".to_string();
-        let mut in_thinking = true;
+        with_root(|| {
+            let state = busy_state();
+            let mut accumulated_text = "partial".to_string();
+            let mut in_thinking = true;
 
-        translate_event(
-            AgentHarnessEvent::TurnEnd {
-                message: assistant_message(
-                    vec![AssistantContent::Text(TextContent {
-                        content_type: "text".to_string(),
-                        text: "done".to_string(),
-                        text_signature: None,
-                    })],
-                    StopReason::Stop,
-                ),
-                tool_results: Vec::new(),
-            },
-            &state,
-            &mut accumulated_text,
-            &mut in_thinking,
-        );
+            translate_event(
+                AgentHarnessEvent::TurnEnd {
+                    message: assistant_message(
+                        vec![AssistantContent::Text(TextContent {
+                            content_type: "text".to_string(),
+                            text: "done".to_string(),
+                            text_signature: None,
+                        })],
+                        StopReason::Stop,
+                    ),
+                    tool_results: Vec::new(),
+                },
+                &state,
+                &mut accumulated_text,
+                &mut in_thinking,
+            );
 
-        assert!(!state.busy.get());
-        assert!(!state.status.get().busy);
-        assert!(accumulated_text.is_empty());
-        assert!(!in_thinking);
+            assert!(!state.busy.get());
+            assert!(!state.status.get_clone().busy);
+            assert!(accumulated_text.is_empty());
+            assert!(!in_thinking);
+        });
     }
 
     #[test]
     fn model_update_syncs_status_model_and_provider() {
-        // After a ModelUpdate event, the status snapshot's `model` carries the
-        // model id and `provider` is set from the model's provider. Today this
-        // is discarded by the `_ => {}` fallthrough in translate_event.
-        let state = UiState::new(TextAreaState::default());
-        let mut acc = String::new();
-        let mut thinking = false;
-        let model: flown_ai::Model = serde_json::from_str(
-            r#"{"id":"glm-5.1","name":"GLM 5.1","api":"openai-completions","provider":"openrouter","baseUrl":"","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1,"maxTokens":1}"#,
-        )
-        .expect("minimal Model JSON parses");
-        translate_event(
-            AgentHarnessEvent::ModelUpdate {
-                model: model.clone(),
-                previous_model: None,
-                source: flown_agent::ModelUpdateSource::Set,
-            },
-            &state,
-            &mut acc,
-            &mut thinking,
-        );
-        let snap = state.status.get();
-        assert!(
-            snap.model.contains("glm-5.1"),
-            "status.model should contain the model id, got {}",
-            snap.model
-        );
-        // Provider::Display for Known(OpenRouter) is lowercase "openrouter".
-        assert_eq!(snap.provider, "openrouter");
+        with_root(|| {
+            // After a ModelUpdate event, the status snapshot's `model` carries the
+            // model id and `provider` is set from the model's provider. Today this
+            // is discarded by the `_ => {}` fallthrough in translate_event.
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            let model: flown_ai::Model = serde_json::from_str(
+                r#"{"id":"glm-5.1","name":"GLM 5.1","api":"openai-completions","provider":"openrouter","baseUrl":"","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":1,"maxTokens":1}"#,
+            )
+            .expect("minimal Model JSON parses");
+            translate_event(
+                AgentHarnessEvent::ModelUpdate {
+                    model: model.clone(),
+                    previous_model: None,
+                    source: flown_agent::ModelUpdateSource::Set,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+            let snap = state.status.get_clone();
+            assert!(
+                snap.model.contains("glm-5.1"),
+                "status.model should contain the model id, got {}",
+                snap.model
+            );
+            // Provider::Display for Known(OpenRouter) is lowercase "openrouter".
+            assert_eq!(snap.provider, "openrouter");
+        });
     }
 
     #[test]
     fn thinking_level_update_syncs_status_thinking_level() {
-        let state = UiState::new(TextAreaState::default());
-        let mut acc = String::new();
-        let mut thinking = false;
-        translate_event(
-            AgentHarnessEvent::ThinkingLevelUpdate {
-                level: flown_ai::ThinkingLevel::High,
-                previous_level: flown_ai::ThinkingLevel::Off,
-            },
-            &state,
-            &mut acc,
-            &mut thinking,
-        );
-        let snap = state.status.get();
-        assert!(
-            snap.thinking_level.contains("high"),
-            "status.thinking_level should reflect the new level, got {}",
-            snap.thinking_level
-        );
+        with_root(|| {
+            let state = UiState::new(EditorState::default());
+            let mut acc = String::new();
+            let mut thinking = false;
+            translate_event(
+                AgentHarnessEvent::ThinkingLevelUpdate {
+                    level: flown_ai::ThinkingLevel::High,
+                    previous_level: flown_ai::ThinkingLevel::Off,
+                },
+                &state,
+                &mut acc,
+                &mut thinking,
+            );
+            let snap = state.status.get_clone();
+            assert!(
+                snap.thinking_level.contains("high"),
+                "status.thinking_level should reflect the new level, got {}",
+                snap.thinking_level
+            );
+        });
     }
 }

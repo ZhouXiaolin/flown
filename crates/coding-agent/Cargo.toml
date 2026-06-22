@@ -14,12 +14,15 @@ path = "src/main.rs"
 flown-ai = { path = "../ai" }
 flown-agent = { path = "../agent" }
 
-# TUI framework (SolidJS-inspired reactive TUI; git submodule at vendor/iodilos)
-iodilos = { path = "../../vendor/iodilos/crates/iodilos" }
+# TUI framework (Sycamore-inspired reactive TUI; git submodule at vendor/iodilos)
+iodilos = { path = "../../vendor/iodilos/packages/iodilos" }
+iodilos-md = { path = "../../vendor/iodilos/packages/iodilos-md" }
+iodilos-prompt = { path = "../../vendor/iodilos/packages/iodilos-prompt" }
 
 # Async runtime
 tokio.workspace = true
 futures.workspace = true
+futures-timer.workspace = true
 flume.workspace = true
 
 # Serialization
@@ -30,6 +33,7 @@ serde_json.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+unicode-normalization.workspace = true
 
 # Error handling
 anyhow.workspace = true

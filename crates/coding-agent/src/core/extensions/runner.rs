@@ -167,7 +167,7 @@ impl CommandSide {
     /// runtime proxy. No-op when the active layer is Main.
     pub fn close_active_overlap(&self) {
         let ctx = self.ctx.clone();
-        iodilos::prelude::spawn_local(async move {
+        iodilos::prelude::use_future(async move {
             let _ = ctx.conversation.close_active_overlap().await;
         });
     }
@@ -198,7 +198,7 @@ impl CommandSide {
         };
         let ctx = self.ctx.clone();
         let handler = cmd.handler.clone();
-        iodilos::prelude::spawn_local(async move {
+        iodilos::prelude::use_future(async move {
             if let Err(error) = handler(invocation, ctx.clone()).await {
                 ctx.ui
                     .notify_error(format!("Extension command failed: {error}"));

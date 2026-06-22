@@ -1,7 +1,8 @@
-//! Agent editor glue: slash completion on top of iodilos `TextAreaState`.
+//! Agent editor glue: slash completion on top of `iodilos-prompt`.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use iodilos::prelude::{CompletionItem, TextAreaAction, TextAreaState, TextAreaSubmitMode};
+use iodilos::prelude::CompletionItem;
+use iodilos_prompt::PromptModel;
 
 use crate::config::Config;
 // CommandEntry / SubcommandEntry live in slash_commands so they can be shared
@@ -9,6 +10,74 @@ use crate::config::Config;
 // metadata owner; editor re-uses its types). `static_command_entries` and
 // `SLASH_COMMANDS` are pulled in only by tests, so they're imported there.
 use crate::tui::slash_commands::{CommandEntry, list_installed_skills};
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EditorState {
+    model: PromptModel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptAction {
+    None,
+    Submit,
+}
+
+impl EditorState {
+    pub fn text(&self) -> String {
+        self.model.buffer().to_string()
+    }
+
+    pub fn cursor_char(&self) -> usize {
+        self.model.cursor_char()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.model.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.model.submit();
+    }
+
+    pub fn set_text(&mut self, text: &str) {
+        self.model = PromptModel::new();
+        self.model.insert_str(text);
+    }
+
+    fn first_line(&self) -> Option<&str> {
+        self.model.buffer().lines().next()
+    }
+
+    fn cursor_row(&self) -> usize {
+        self.model
+            .buffer()
+            .chars()
+            .take(self.model.cursor_char())
+            .filter(|ch| *ch == '\n')
+            .count()
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> PromptAction {
+        if key.code == KeyCode::Enter && !is_newline_modifier(key.modifiers) {
+            return PromptAction::Submit;
+        }
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.model.newline();
+            return PromptAction::None;
+        }
+        match key.code {
+            KeyCode::Enter => self.model.newline(),
+            KeyCode::Backspace => self.model.backspace(),
+            KeyCode::Left => self.model.move_left(),
+            KeyCode::Right => self.model.move_right(),
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.model.insert_char(ch);
+            }
+            _ => {}
+        }
+        PromptAction::None
+    }
+}
 
 /// One selectable entry in the top-level (`/`) completion popup.
 ///
@@ -70,7 +139,7 @@ enum AcceptOutcome {
 }
 
 pub fn handle_key(
-    input: &mut TextAreaState,
+    input: &mut EditorState,
     slash_popup: &mut Option<SlashPopup>,
     key: KeyEvent,
     config: &Config,
@@ -79,9 +148,9 @@ pub fn handle_key(
 ) -> EditorAction {
     if !slash_commands_enabled {
         *slash_popup = None;
-        return match input.handle_key(key, TextAreaSubmitMode::SubmitOnEnter) {
-            TextAreaAction::Submit => EditorAction::Submit,
-            TextAreaAction::None => EditorAction::None,
+        return match input.handle_key(key) {
+            PromptAction::Submit => EditorAction::Submit,
+            PromptAction::None => EditorAction::None,
         };
     }
 
@@ -90,10 +159,10 @@ pub fn handle_key(
     }
 
     let before = input.text();
-    let action = input.handle_key(key, TextAreaSubmitMode::SubmitOnEnter);
+    let action = input.handle_key(key);
     match action {
-        TextAreaAction::Submit => EditorAction::Submit,
-        TextAreaAction::None => {
+        PromptAction::Submit => EditorAction::Submit,
+        PromptAction::None => {
             if input.text() != before {
                 try_open_slash_popup(input, slash_popup, config, commands);
             } else if closes_popup(key) {
@@ -142,17 +211,17 @@ pub fn completion_items(popup: Option<&SlashPopup>) -> Vec<CompletionItem> {
 }
 
 fn try_open_slash_popup(
-    input: &TextAreaState,
+    input: &EditorState,
     slash_popup: &mut Option<SlashPopup>,
     config: &Config,
     commands: &[CommandEntry],
 ) {
-    if input.cursor_row != 0 {
+    if input.cursor_row() != 0 {
         *slash_popup = None;
         return;
     }
 
-    let Some(line) = input.lines.first() else {
+    let Some(line) = input.first_line() else {
         *slash_popup = None;
         return;
     };
@@ -243,7 +312,7 @@ fn try_open_slash_popup(
 }
 
 fn handle_slash_popup_key(
-    input: &mut TextAreaState,
+    input: &mut EditorState,
     slash_popup: &mut Option<SlashPopup>,
     key: KeyEvent,
     config: &Config,
@@ -251,12 +320,12 @@ fn handle_slash_popup_key(
 ) -> EditorAction {
     if key.code == KeyCode::Enter && is_newline_modifier(key.modifiers) {
         *slash_popup = None;
-        input.handle_key(key, TextAreaSubmitMode::SubmitOnEnter);
+        input.handle_key(key);
         return EditorAction::None;
     }
     if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
         *slash_popup = None;
-        input.handle_key(key, TextAreaSubmitMode::SubmitOnEnter);
+        input.handle_key(key);
         return EditorAction::None;
     }
 
@@ -299,7 +368,7 @@ fn handle_slash_popup_key(
 }
 
 fn accept_slash_popup(
-    input: &mut TextAreaState,
+    input: &mut EditorState,
     slash_popup: &mut Option<SlashPopup>,
 ) -> AcceptOutcome {
     let Some(popup) = slash_popup.take() else {
@@ -322,11 +391,12 @@ fn accept_slash_popup(
                 }
                 PopupItem::Command(cmd_idx) => {
                     let cmd = &popup.commands[cmd_idx];
-                    input.set_text(&format!("{} ", cmd.name));
 
                     if !cmd.has_subcommands() {
+                        input.set_text(&cmd.name);
                         AcceptOutcome::CompletedCommand
                     } else {
+                        input.set_text(&format!("{} ", cmd.name));
                         *slash_popup = Some(SlashPopup {
                             items: (0..cmd.subcommands.len()).map(PopupItem::Command).collect(),
                             selected: 0,
@@ -409,7 +479,7 @@ mod tests {
     fn type_and_submit() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         handle_key(
             &mut input,
@@ -445,7 +515,7 @@ mod tests {
     fn slash_popup_opens_then_navigates() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         handle_key(
             &mut input,
@@ -473,7 +543,7 @@ mod tests {
     fn slash_disabled_treats_slash_as_plain_input() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
 
         handle_key(
@@ -493,7 +563,7 @@ mod tests {
     fn tab_accepts_slash_completion() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         handle_key(
             &mut input,
@@ -511,15 +581,57 @@ mod tests {
             &commands,
             true,
         );
-        assert!(input.text().ends_with(' '));
         assert!(input.text().starts_with('/'));
+        assert!(popup.is_none() || input.text().ends_with(' '));
+    }
+
+    #[test]
+    fn tab_completes_model_command_without_submitting_or_trailing_space() {
+        let cfg = empty_config();
+        let mut commands = static_command_entries();
+        commands.push(CommandEntry {
+            name: "/model".into(),
+            description: "Select a model or thinking level".into(),
+            subcommands: Vec::new(),
+        });
+        let mut input = EditorState::default();
+        let mut popup = None;
+
+        for ch in "/mod".chars() {
+            let action = handle_key(
+                &mut input,
+                &mut popup,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &cfg,
+                &commands,
+                true,
+            );
+            assert_eq!(action, EditorAction::None);
+        }
+        let popup_before_tab = popup
+            .as_ref()
+            .expect("/mod should show the extension command popup");
+        assert_eq!(popup_before_tab.items.len(), 1);
+
+        let action = handle_key(
+            &mut input,
+            &mut popup,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &cfg,
+            &commands,
+            true,
+        );
+
+        assert_eq!(action, EditorAction::None);
+        assert_eq!(input.text(), "/model");
+        assert!(popup.is_none());
     }
 
     #[test]
     fn accepting_command_with_subcommands_enters_subcommand_popup() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         input.set_text("/mc");
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -543,7 +655,7 @@ mod tests {
     fn enter_on_command_with_subcommands_does_not_submit() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         input.set_text("/mc");
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -569,7 +681,7 @@ mod tests {
     fn ctrl_enter_in_slash_popup_inserts_newline() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         handle_key(
             &mut input,
@@ -588,8 +700,8 @@ mod tests {
             &commands,
             true,
         );
-        assert_eq!(input.lines.len(), 2);
-        assert_eq!(input.cursor_row, 1);
+        assert_eq!(input.text(), "/\n");
+        assert_eq!(input.cursor_row(), 1);
         assert!(popup.is_none());
     }
 
@@ -600,7 +712,7 @@ mod tests {
     fn top_level_popup_has_static_commands_without_skills() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         input.set_text("/");
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -623,7 +735,7 @@ mod tests {
     fn skills_command_still_matches_after_skill_family_added() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         input.set_text("/skills");
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -646,7 +758,7 @@ mod tests {
     fn skill_colon_with_no_skills_closes_popup() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         let mut popup = None;
         input.set_text("/skill:");
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -661,7 +773,7 @@ mod tests {
     fn extension_command_appears_in_top_level_popup() {
         let cfg = empty_config();
         let commands = test_commands();
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         input.set_text("/m");
         let mut popup = None;
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);
@@ -686,7 +798,7 @@ mod tests {
             subcommands: Vec::new(),
         });
 
-        let mut input = TextAreaState::default();
+        let mut input = EditorState::default();
         input.set_text("/model");
         let mut popup = None;
         try_open_slash_popup(&input, &mut popup, &cfg, &commands);

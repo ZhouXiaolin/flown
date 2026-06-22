@@ -30,7 +30,13 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             let env = env.clone();
             Box::pin(async move {
                 let command = required_string(&args, "command")?;
-                let timeout = optional_u64(&args, "timeout")?;
+                // The tool schema advertises `timeout` in *seconds* (friendly to
+                // the model), but `ExecOptions::timeout` is consumed as
+                // *milliseconds* by `NativeExecutionEnv::exec`
+                // (`Duration::from_millis`). Convert here so a model sending
+                // `timeout: 30` gets a 30s deadline, not a 30ms one.
+                let timeout_secs = optional_u64(&args, "timeout")?;
+                let timeout = secs_to_millis(timeout_secs);
                 let options = ExecOptions {
                     cwd: optional_string(&args, "cwd")?,
                     env: None,
@@ -40,7 +46,7 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 let result = match env.exec(&command, options).await {
                     Ok(result) => result,
                     Err(error) if error.code == ExecutionErrorCode::Timeout => {
-                        let secs = timeout
+                        let secs = timeout_secs
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "?".to_string());
                         return Err(AgentToolError::new(format!(
@@ -49,20 +55,7 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     }
                     Err(error) => return Err(tool_error(error)),
                 };
-                let output = format!("{}{}", result.stdout, result.stderr);
-                if output.is_empty() {
-                    return Ok(text_result(
-                        String::new(),
-                        json!({
-                            "command": command,
-                            "exit_code": result.exit_code,
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                            "truncation": Value::Null,
-                            "fullOutputPath": Value::Null,
-                        }),
-                    ));
-                }
+                let output = result.output;
                 let formatted = format_bash_output(&output, "(no output)")?;
                 if result.exit_code != 0 {
                     return Err(AgentToolError::new(append_status(
@@ -74,10 +67,6 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 Ok(text_result(
                     formatted.text,
                     json!({
-                        "command": command,
-                        "exit_code": result.exit_code,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
                         "truncation": formatted.truncation,
                         "fullOutputPath": formatted.full_output_path,
                     }),
@@ -265,4 +254,99 @@ fn truncate_string_to_bytes_from_end(text: &str, max_bytes: usize) -> String {
         start += 1;
     }
     text[start..].to_string()
+}
+
+/// Convert a timeout given in *seconds* (the unit the tool advertises to the
+/// model) into the *milliseconds* `ExecOptions::timeout` consumes
+/// (`NativeExecutionEnv::exec` builds `Duration::from_millis` from it). `None`
+/// passes through (no deadline). Saturating so a pathologically large value
+/// can't overflow.
+fn secs_to_millis(secs: Option<u64>) -> Option<u64> {
+    secs.map(|s| s.saturating_mul(1000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secs_to_millis_converts_and_passes_none() {
+        assert_eq!(secs_to_millis(None), None);
+        assert_eq!(secs_to_millis(Some(0)), Some(0));
+        assert_eq!(secs_to_millis(Some(1)), Some(1000));
+        assert_eq!(secs_to_millis(Some(30)), Some(30_000));
+        // Saturates instead of overflowing on huge values.
+        assert_eq!(secs_to_millis(Some(u64::MAX)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn schema_advertises_seconds() {
+        let env: Arc<dyn ExecutionEnv> = Arc::new(crate::native_env::NativeExecutionEnv::new());
+        let tool = tool(env);
+        let desc = tool
+            .parameters
+            .get("properties")
+            .and_then(|p| p.get("timeout"));
+        let unit = desc
+            .and_then(|t| t.get("description"))
+            .and_then(|d| d.as_str());
+        assert!(
+            unit.unwrap_or_default().contains("seconds"),
+            "schema must advertise seconds so models send the right unit: {unit:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_interleaves_stdout_and_stderr() {
+        // A command that alternates stdout/stderr: the interleaved output
+        // should contain all four lines (order may vary by scheduler, but
+        // crucially must NOT be "all stdout then all stderr").
+        let env: Arc<dyn ExecutionEnv> = Arc::new(crate::native_env::NativeExecutionEnv::new());
+        let options = ExecOptions::default();
+        let result = env
+            .exec(
+                "echo out1; echo err1 >&2; echo out2; echo err2 >&2",
+                options,
+            )
+            .await
+            .expect("exec should succeed");
+        assert_eq!(result.exit_code, 0);
+        let lines: Vec<&str> = result.output.trim_end().split('\n').collect();
+        // All four lines must be present.
+        assert!(lines.contains(&"out1"), "missing out1 in {lines:?}");
+        assert!(lines.contains(&"err1"), "missing err1 in {lines:?}");
+        assert!(lines.contains(&"out2"), "missing out2 in {lines:?}");
+        assert!(lines.contains(&"err2"), "missing err2 in {lines:?}");
+        // out1 must come before out2 (order within the same stream preserved).
+        let out1 = lines.iter().position(|l| *l == "out1").unwrap();
+        let out2 = lines.iter().position(|l| *l == "out2").unwrap();
+        assert!(out1 < out2, "out1 should precede out2: {lines:?}");
+        let err1 = lines.iter().position(|l| *l == "err1").unwrap();
+        let err2 = lines.iter().position(|l| *l == "err2").unwrap();
+        assert!(err1 < err2, "err1 should precede err2: {lines:?}");
+    }
+
+    #[tokio::test]
+    async fn exec_returns_interleaved_output_in_single_field() {
+        let env: Arc<dyn ExecutionEnv> = Arc::new(crate::native_env::NativeExecutionEnv::new());
+        let result = env
+            .exec("echo hello >&2; echo world", ExecOptions::default())
+            .await
+            .expect("exec should succeed");
+        assert_eq!(result.exit_code, 0);
+        // Both streams merged into a single `output` field (not separated).
+        assert!(result.output.contains("hello"));
+        assert!(result.output.contains("world"));
+    }
+
+    #[tokio::test]
+    async fn exec_empty_command_produces_empty_output() {
+        let env: Arc<dyn ExecutionEnv> = Arc::new(crate::native_env::NativeExecutionEnv::new());
+        let result = env
+            .exec("true", ExecOptions::default())
+            .await
+            .expect("exec should succeed");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.output.is_empty());
+    }
 }

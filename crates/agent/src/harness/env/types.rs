@@ -148,15 +148,15 @@ pub struct FileInfo {
 /// Shell execution options.
 ///
 /// Maps to pi-mono `ExecutionEnvExecOptions`. Rust uses `AbortSignal` for
-/// cancellation and fallible callbacks for stdout/stderr streaming updates.
+/// cancellation and a fallible callback for interleaved stdout/stderr streaming
+/// updates (both streams feed the same callback, preserving arrival order).
 #[derive(Clone, Default)]
 pub struct ExecOptions {
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub timeout: Option<u64>,
     pub abort_signal: Option<AbortSignal>,
-    pub on_stdout: Option<ShellOutputUpdateFn>,
-    pub on_stderr: Option<ShellOutputUpdateFn>,
+    pub on_output: Option<ShellOutputUpdateFn>,
 }
 
 impl fmt::Debug for ExecOptions {
@@ -166,8 +166,7 @@ impl fmt::Debug for ExecOptions {
             .field("env", &self.env)
             .field("timeout", &self.timeout)
             .field("abort_signal", &self.abort_signal)
-            .field("on_stdout", &self.on_stdout.as_ref().map(|_| "<callback>"))
-            .field("on_stderr", &self.on_stderr.as_ref().map(|_| "<callback>"))
+            .field("on_output", &self.on_output.as_ref().map(|_| "<callback>"))
             .finish()
     }
 }
@@ -175,8 +174,8 @@ impl fmt::Debug for ExecOptions {
 /// Shell execution result
 #[derive(Debug, Clone)]
 pub struct ExecResult {
-    pub stdout: String,
-    pub stderr: String,
+    /// Interleaved stdout+stderr output, in arrival order.
+    pub output: String,
     pub exit_code: i32,
 }
 

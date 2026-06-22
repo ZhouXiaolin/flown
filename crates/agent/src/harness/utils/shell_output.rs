@@ -72,8 +72,7 @@ pub async fn execute_shell_with_capture(
         env: options.env.clone(),
         timeout: options.timeout,
         abort_signal: options.abort_signal.clone(),
-        on_stdout: Some(on_chunk.clone()),
-        on_stderr: Some(on_chunk),
+        on_output: Some(on_chunk),
     };
 
     let exec_result = env.exec(command, exec_options).await;

@@ -1,161 +1,136 @@
-//! App — the root component.
-//!
-//! Owns the vertical layout (transcript / status line / editor / hint bar) and
-//! the global `on_key` router. Reads the shared [`UiState`] plus the agent
-//! handle, event sender, and persistence sender from iodilos context.
-//!
-//! Key handling: the editor's `handle_key` composes iodilos `TextAreaState`
-//! with agent-specific slash completion, then App reacts to `Submit`.
+//! App root and global key router.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use iodilos::prelude::*;
 
 use crate::core::extensions::SlashCommandScope;
-use crate::tui::components::editor::InputEditor;
-use crate::tui::components::status_line::StatusLine;
-use crate::tui::components::transcript::Transcript;
-// The `view!` macro expands `Transcript()` into
-// `Transcript::new(TranscriptProps { … })`, so the generated prop structs must
-// be in scope at the call site.
-use crate::tui::components::editor::InputEditorProps;
-use crate::tui::components::status_line::StatusLineProps;
-use crate::tui::components::transcript::TranscriptProps;
+use crate::tui::components::editor::input_editor;
+use crate::tui::components::transcript::transcript;
 use crate::tui::editor::{self, EditorAction};
-use crate::tui::state::UiState;
 use flown_agent::AgentHarness;
 
-#[component]
-pub fn App() -> Node {
+/// Lines scrolled per mouse-wheel notch.
+const WHEEL_LINES: usize = 3;
+
+pub fn app() -> View {
     let stack = use_context::<Rc<crate::tui::conversation::ConversationStack>>();
     let agent = use_context::<Option<Arc<AgentHarness>>>();
     let config = use_context::<crate::config::Config>();
     let overlay_stack = use_context::<Rc<crate::tui::overlay_stack::OverlayStack>>();
+    let term_size = use_context::<crate::tui::state::TerminalSize>();
 
-    // The global key router. Runs under this component's owner (registered at
-    // mount); captures the handles by move.
     let key_stack = Rc::clone(&stack);
     let key_overlay = Rc::clone(&overlay_stack);
-    let key_agent = agent;
-    let key_config = config;
-    on_key(move |key: KeyEvent| -> bool {
-        handle_app_key(
-            key,
-            &key_stack,
-            &key_overlay,
-            key_agent.as_ref(),
-            &key_config,
-        )
-    });
-
-    view! {
-        View(
-            flex_direction: FlexDirection::Column,
-            width_percent: 100.0,
-            height_percent: 100.0,
-            background: Color::Reset,
-        ) {
-            Transcript()
-            StatusLine()
-            InputEditor()
-            OverlayLayer(overlay: overlay_stack)
-        }
-    }
-}
-
-/// Renders the active overlay (if any) on top of the main UI. Reads the
-/// OverlayStack's active signal so it re-runs when an overlay is pushed/popped.
-/// Built as a `#[component]` child of the root View so it participates in the
-/// layout tree as the last (topmost) sibling.
-#[component]
-fn OverlayLayer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> Node {
-    // Track the active overlay reactively. `active_signal` is an RwSignal; reading
-    // it inside an effect registers the dependency.
-    //
-    // The content is built ONCE per overlay, inside `create_root` (mirroring
-    // iodilos's `Show`), and its sub-owner is cached. This matters for two
-    // reasons:
-    //   1. Building here (in the mount-owner render effect, not in the
-    //      `spawn_local` task that called `push`) lets the content's
-    //      `use_context` / `on_key` / `create_effect` resolve against the
-    //      correct owner — without this, /btw's overlay rendered blank and
-    //      /model's `on_key` never fired.
-    //   2. Caching the owner means a spurious effect re-run (e.g. from the
-    //      content's own signal writes) does NOT rebuild, which would stack a
-    //      fresh `on_key` handler on every redraw (the duplicate-overlay +
-    //      immediate-exit bug). We rebuild only when the active overlay identity
-    //      changes (a push or pop).
-    let active = overlay.active_signal();
-    let host = Node::new_view();
-    host.set_position_absolute(());
-    host.set_inset_top(0.0);
-    host.set_inset_bottom(0.0);
-    host.set_inset_left(0.0);
-    host.set_inset_right(0.0);
-    host.set_width_percent(100.0);
-    host.set_height_percent(100.0);
-    let host_for_effect = host.clone();
-    // (mounted_overlay, owner): the overlay currently rendered + its sub-owner.
-    let mounted: Rc<RefCell<Option<(Rc<crate::tui::overlay_stack::ActiveOverlay>, Owner)>>> =
-        Rc::new(RefCell::new(None));
-    let mounted_for_effect = Rc::clone(&mounted);
-    let mounted_for_cleanup = Rc::clone(&mounted);
-    create_effect(move || {
-        let current = active.get();
-        // Only (re)build when the overlay identity actually changed. Comparing
-        // the `Rc` pointer is correct: push/pop swap the `Rc`; a spurious re-run
-        // sees the same pointer and skips the rebuild.
-        let same = mounted_for_effect
-            .borrow()
-            .as_ref()
-            .map(|(prev, _)| Rc::ptr_eq(prev, &current.clone().unwrap_or_else(|| prev.clone())))
-            .unwrap_or(false)
-            && current.is_some();
-        if same {
-            return;
-        }
-        // Dispose the previously mounted branch (runs its on_cleanup / drops its
-        // on_key registration).
-        if let Some((_, owner)) = mounted_for_effect.borrow_mut().take() {
-            owner.dispose();
-        }
-        match current {
-            Some(o) => {
-                let geometry = o.geometry;
-                let content_factory = Rc::clone(&o.content);
-                // Build the content under a fresh sub-owner so its effects/on_key
-                // are reclaimed on the next push/pop.
-                let (content, owner) = create_root(move || content_factory());
-                *mounted_for_effect.borrow_mut() = Some((o, owner));
-                let props = iodilos::OverlayBoxProps {
-                    geometry,
-                    background: Color::Reset,
-                    border: Borders::ALL,
-                    border_style: iodilos::BorderStyle::Round,
-                    border_color: Color::Rgb(80, 80, 96),
-                    content,
+    let key_config = config.clone();
+    let resize_term_size = term_size;
+    let wheel_stack = Rc::clone(&stack);
+    let wheel_overlay = Rc::clone(&overlay_stack);
+    View::from(
+        tags::div()
+            .flex_direction(FlexDirection::Column)
+            .width(Size::Percent(100.0))
+            .height(Size::Percent(100.0))
+            .background_color(Color::Reset)
+            .tabindex("0")
+            .on(events::terminal_resize, move |event: Event| {
+                if let Some((cols, rows)) = event.resize() {
+                    resize_term_size.set(cols, rows);
+                }
+            })
+            .on(events::raw_key, move |event: Event| {
+                let Some(key) = event.key().copied() else {
+                    return;
                 };
-                host_for_effect.set_children(vec![iodilos::OverlayBox::new(props)]);
-            }
-            None => {
-                host_for_effect.set_children(vec![]);
-            }
-        }
-    });
-    on_cleanup(move || {
-        if let Some((_, owner)) = mounted_for_cleanup.borrow_mut().take() {
-            owner.dispose();
-        }
-    });
-    host
+                if key.kind == KeyEventKind::Release {
+                    return;
+                }
+                handle_app_key(key, &key_stack, &key_overlay, agent.as_ref(), &key_config);
+                event.stop_propagation();
+            })
+            .on(events::raw_mouse, move |event: Event| {
+                let Some(mouse) = event.mouse().copied() else {
+                    return;
+                };
+                // When an overlay is active, let its own key handler own the
+                // mouse; otherwise the wheel scrolls the active transcript.
+                if wheel_overlay.active().is_some() {
+                    return;
+                }
+                let state = Rc::clone(&wheel_stack.active().state);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => state.scroll_up(WHEEL_LINES),
+                    MouseEventKind::ScrollDown => state.scroll_down(WHEEL_LINES),
+                    _ => {}
+                }
+            })
+            .children((transcript(), input_editor(), overlay_layer(overlay_stack))),
+    )
 }
 
-/// The global key router. Returns `true` if the key was consumed. Operates on
-/// the conversation stack's **active** layer, so all input/streaming targets
-/// whichever view is visible.
+fn overlay_layer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> View {
+    // Render every active overlay layer (or nothing) and rebuild only when the
+    // layer set changes — not on every keystroke/token.
+    //
+    // Two load-bearing details, both prescribed by the header doc on
+    // `crate::tui::overlay_stack::OverlayStack`:
+    //
+    // 1. Building the factories HERE, in this `from_dynamic` effect (a child of
+    //    the app scope). An overlay's content factory (e.g. btw's
+    //    `overlay_conversation`) calls `use_context`/`create_signal`/`on_key`,
+    //    which only resolve against the app's context tree when the factory
+    //    runs under the app's reactive scope — not in the `spawn_local` task
+    //    that pushed the overlay. That mismatch is why overlays previously
+    //    rendered blank.
+    //
+    // 2. `untrack` around the factory call. The content reads high-frequency
+    //    signals (entries, input, term_size) that change on every keystroke and
+    //    streaming token. Without `untrack`, those reads would become
+    //    dependencies of this effect, rebuilding the overlays and re-stacking
+    //    their `on_key` handlers on every keystroke. Each content's own nested
+    //    `Dynamic` nodes already react to those signals; this outer build must
+    //    not.
+    //
+    // Layers are emitted bottom-first: each is an absolutely-positioned box, and
+    // later siblings paint on top, so the topmost (smallest) layer floats above
+    // the ones beneath it — e.g. the thinking-intensity picker over the model
+    // picker.
+    View::from_dynamic(move || {
+        // Tracking this — and only this — makes the effect re-run on any
+        // push/pop.
+        let layers = overlay.layers_signal().get_clone();
+        if layers.is_empty() {
+            return View::new();
+        }
+        // `untrack` keeps each factory's signal reads from widening this
+        // effect's dependencies, so it re-runs only when the layer set changes.
+        let boxes: Vec<View> = untrack(|| {
+            layers
+                .iter()
+                .map(|layer| {
+                    let (border_style, border_color) = match layer.geometry {
+                        OverlayGeometry::FullBleed => (BorderStyle::None, Color::Reset),
+                        OverlayGeometry::Inset { .. } => (BorderStyle::Round, Color::Cyan),
+                    };
+                    overlay_box(OverlayBoxProps {
+                        geometry: layer.geometry,
+                        background: Color::Reset,
+                        border_style,
+                        border_color,
+                        content: (layer.content)(),
+                    })
+                })
+                .collect()
+        });
+        // Flatten the sibling overlay boxes into one view: each box is an
+        // absolutely-positioned node, emitted bottom-first so later (topmost)
+        // layers paint above the earlier ones.
+        View::from(boxes)
+    })
+}
+
 fn handle_app_key(
     key: KeyEvent,
     stack: &Rc<crate::tui::conversation::ConversationStack>,
@@ -163,20 +138,31 @@ fn handle_app_key(
     _agent: Option<&Arc<AgentHarness>>,
     config: &crate::config::Config,
 ) -> bool {
+    if let Some(overlay) = overlay_stack.active() {
+        if let Some(on_key) = &overlay.on_key
+            && on_key(key)
+        {
+            return true;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if overlay.dismissible {
+                overlay_stack.pop();
+            }
+            return true;
+        }
+        if !overlay.route_app_keys {
+            return true;
+        }
+    }
+
     let state = Rc::clone(&stack.active().state);
 
-    // Esc cancels the current transient state in priority order:
-    //   1. slash popup open  → close it, stay in input
-    //   2. input non-empty   → clear it
-    //   3. agent running     → abort the turn
-    //   4. idle + empty      → no-op (Esc never quits; use /quit or Ctrl-C)
     if key.code == KeyCode::Esc {
         if state.slash_popup.with(|p| p.is_some()) {
             state.slash_popup.set(None);
             return true;
         }
-        let has_input = state.input.with(|input| !input.is_empty());
-        if has_input {
+        if state.input.with(|input| !input.is_empty()) {
             state.input.update(|input| input.clear());
             return true;
         }
@@ -187,44 +173,29 @@ fn handle_app_key(
         }
         return true;
     }
-    // Ctrl-Q always quits.
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
         iodilos::quit();
         return true;
     }
-    // Ctrl-C: an open overlay (model picker / btw fork) is closed first. With
-    // empty input, close a dismissible/pending overlap. Otherwise clear
-    // non-empty input, or quit the app (main layer, empty input).
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if overlay_stack.is_active() {
-            tracing::info!(target: "flown::overlay", "Ctrl+C with active overlay, popping it");
-            overlay_stack.pop();
-            return true;
-        }
         let has_input = state.input.with(|input| !input.is_empty());
         let has_overlap = stack.overlap_is_active_or_pending();
-        tracing::info!(target: "flown::overlap", has_input, has_overlap, "Ctrl+C received");
         if has_input {
             state.input.update(|input| input.clear());
             state.slash_popup.set(None);
         } else if has_overlap {
-            // CommandSide holds the bound runtime command proxy; expose overlap
-            // close through it so App stays independent of extension-specific
-            // logic.
             let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
-            tracing::info!(target: "flown::overlap", has_side = command_side.is_some(), "Ctrl+C in overlap, dispatching close");
             if let Some(cs) = command_side.as_ref() {
                 cs.close_active_overlap();
             }
         } else {
-            tracing::info!(target: "flown::overlap", "Ctrl+C in main, quitting app");
             iodilos::quit();
         }
         return true;
     }
-    if overlay_stack.is_active() && !overlay_stack.routes_app_keys() {
-        return true;
-    }
+
     if key.code == KeyCode::PageUp {
         state.scroll_up(10);
         return true;
@@ -234,9 +205,15 @@ fn handle_app_key(
         return true;
     }
 
-    // Route everything else to the editor glue.
-    // Build the merged command view for autocomplete when the active surface
-    // participates in global slash commands.
+    route_editor_key(key, stack, config)
+}
+
+fn route_editor_key(
+    key: KeyEvent,
+    stack: &Rc<crate::tui::conversation::ConversationStack>,
+    config: &crate::config::Config,
+) -> bool {
+    let state = Rc::clone(&stack.active().state);
     let command_side = use_context::<Option<Rc<crate::core::extensions::CommandSide>>>();
     let slash_commands_enabled = stack.active_slash_command_scope() == SlashCommandScope::Global;
     let mut commands = Vec::new();
@@ -260,8 +237,9 @@ fn handle_app_key(
             }
         }
     }
-    let mut input = state.input.get();
-    let mut popup = state.slash_popup.get();
+
+    let mut input = state.input.get_clone();
+    let mut popup = state.slash_popup.get_clone();
     let action = editor::handle_key(
         &mut input,
         &mut popup,
@@ -274,169 +252,103 @@ fn handle_app_key(
     state.slash_popup.set(popup);
 
     match action {
-        EditorAction::Submit => {
-            let text = state.input.with(|es| es.text());
-            let text = text.trim().to_string();
-            if text.is_empty() {
-                return true;
-            }
-            state.input.update(|input| input.clear());
-            state.slash_popup.set(None);
-
-            let skill_invocation = slash_commands_enabled
-                .then(|| crate::tui::slash_commands::parse_skill_command(&text))
-                .flatten();
-            if let Some(inv) = skill_invocation {
-                // `/skill:<name> [<request>]` is a parameterized family handled
-                // up front: it needs the agent handle to trigger a turn, which
-                // the generic slash dispatcher lacks. The transcript shows the
-                // raw input line; the model receives the transformed prompt.
-                match crate::tui::slash_commands::validate_skill_name(&inv.skill_name, config) {
-                    Ok(()) => {
-                        if state.busy.get() {
-                            return true;
-                        }
-                        state.push_user(&text);
-                        let prompt = crate::tui::slash_commands::build_skill_prompt(&inv);
-                        // Route through the MAIN layer's driver (skills run on
-                        // the main agent, not whatever overlap is active).
-                        let main_layer = stack.main_layer();
-                        match main_layer.submit_prompt(prompt) {
-                            crate::tui::conversation::SubmitOutcome::Queued => {
-                                state.busy.set(true);
-                                state.status.update(|s| s.busy = true);
-                            }
-                            crate::tui::conversation::SubmitOutcome::NoAgent => {
-                                state.push_error("No LLM agent available. Check your config.");
-                            }
-                            crate::tui::conversation::SubmitOutcome::DriverGone => {
-                                state.push_error("Layer driver exited. Cannot send prompt.");
-                            }
-                            crate::tui::conversation::SubmitOutcome::ChannelFull => {
-                                state.push_error("Layer driver busy (command queue full).");
-                            }
-                        }
-                    }
-                    Err(available) => {
-                        if available.is_empty() {
-                            state.push_error(format!(
-                                "Skill '{}' not found. No skills are installed. Use /skills for help.",
-                                inv.skill_name
-                            ));
-                        } else {
-                            state.push_error(format!(
-                                "Skill '{}' not found. Available: {}",
-                                inv.skill_name,
-                                available.join(", ")
-                            ));
-                        }
-                    }
-                }
-            } else if slash_commands_enabled && text.starts_with('/') {
-                // Extension commands get first crack at dispatch. CommandSide
-                // runs async handlers with an ExtensionContext backed by the
-                // runtime command proxy.
-                if let Some(cs) = command_side.as_ref()
-                    && cs.dispatch(&text)
-                {
-                    return true;
-                }
-                let mut handle: Rc<UiState> = Rc::clone(&state);
-                let should_quit = crate::tui::slash_commands::handle_slash_command(
-                    &text,
-                    &mut handle,
-                    config,
-                    &commands,
-                );
-                if should_quit {
-                    iodilos::quit();
-                }
-            } else {
-                // Guard against a second submit while an agent turn is running.
-                // The harness enforces single-flight via phase==Idle (assert_idle),
-                // so a concurrent prompt() would return HarnessError::Busy silently.
-                if state.busy.get() {
-                    return true;
-                }
-                state.push_user(&text);
-                // Submit through the ACTIVE layer's driver command channel.
-                // The driver (a per-layer tokio task) awaits prompt() inline —
-                // no per-prompt tokio::spawn. try_send is non-blocking, so this
-                // is safe to call from the iodilos on_key thread.
-                let active_layer = stack.active();
-                let active_kind = active_layer.kind;
-                tracing::info!(
-                    target: "flown::prompt",
-                    layer = ?active_kind,
-                    text_len = text.len(),
-                    "ui prompt submitted"
-                );
-                match active_layer.submit_prompt(text) {
-                    crate::tui::conversation::SubmitOutcome::Queued => {
-                        state.busy.set(true);
-                        state.status.update(|s| s.busy = true);
-                    }
-                    crate::tui::conversation::SubmitOutcome::NoAgent => {
-                        state.push_error("No LLM agent available. Check your config.");
-                    }
-                    crate::tui::conversation::SubmitOutcome::DriverGone => {
-                        state.push_error("Layer driver exited. Cannot send prompt.");
-                    }
-                    crate::tui::conversation::SubmitOutcome::ChannelFull => {
-                        state.push_error("Layer driver busy (command queue full).");
-                    }
-                }
-            }
-            true
-        }
+        EditorAction::Submit => submit_editor_text(
+            state,
+            stack,
+            config,
+            slash_commands_enabled,
+            command_side,
+            commands,
+        ),
         EditorAction::None => true,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::conversation::{ConversationLayer, ConversationStack, LayerKind};
-
-    fn test_stack() -> (Rc<ConversationStack>, Rc<UiState>) {
-        let (tx, _rx) = flume::unbounded();
-        let state = Rc::new(UiState::new(TextAreaState::default()));
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::clone(&state),
-            harness: None,
-            event_tx: tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        (ConversationStack::new(main, None), state)
+fn submit_editor_text(
+    state: Rc<crate::tui::state::UiState>,
+    stack: &Rc<crate::tui::conversation::ConversationStack>,
+    config: &crate::config::Config,
+    slash_commands_enabled: bool,
+    command_side: Option<Rc<crate::core::extensions::CommandSide>>,
+    commands: Vec<crate::tui::slash_commands::CommandEntry>,
+) -> bool {
+    let text = state.input.with(|es| es.text()).trim().to_string();
+    if text.is_empty() {
+        return true;
     }
+    state.input.update(|input| input.clear());
+    state.slash_popup.set(None);
 
-    #[test]
-    fn modal_overlay_blocks_unhandled_keys_from_main_editor() {
-        let (_, owner) = create_root(|| {
-            let (stack, state) = test_stack();
-            let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
-            overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
-                geometry: iodilos::OverlayGeometry::Inset { ratio: 0.125 },
-                dismissible: true,
-                route_app_keys: false,
-                content: Rc::new(Node::new_text),
-                on_close: None,
-            });
+    let skill_invocation = slash_commands_enabled
+        .then(|| crate::tui::slash_commands::parse_skill_command(&text))
+        .flatten();
+    if let Some(inv) = skill_invocation {
+        match crate::tui::slash_commands::validate_skill_name(&inv.skill_name, config) {
+            Ok(()) => {
+                if state.busy.get() {
+                    return true;
+                }
+                state.push_user(&text);
+                let prompt = crate::tui::slash_commands::build_skill_prompt(&inv);
+                submit_to_layer(&stack.main_layer(), prompt);
+            }
+            Err(available) => {
+                if available.is_empty() {
+                    state.push_error(format!(
+                        "Skill '{}' not found. No skills are installed. Use /skills for help.",
+                        inv.skill_name
+                    ));
+                } else {
+                    state.push_error(format!(
+                        "Skill '{}' not found. Available: {}",
+                        inv.skill_name,
+                        available.join(", ")
+                    ));
+                }
+            }
+        }
+    } else if slash_commands_enabled && text.starts_with('/') {
+        if let Some(cs) = command_side.as_ref()
+            && cs.dispatch(&text)
+        {
+            return true;
+        }
+        let mut handle: Rc<crate::tui::state::UiState> = Rc::clone(&state);
+        let should_quit =
+            crate::tui::slash_commands::handle_slash_command(&text, &mut handle, config, &commands);
+        if should_quit {
+            iodilos::quit();
+        }
+    } else {
+        if state.busy.get() {
+            return true;
+        }
+        state.push_user(&text);
+        submit_to_layer(&stack.active(), text);
+    }
+    true
+}
 
-            let consumed = handle_app_key(
-                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-                &stack,
-                &overlay_stack,
-                None,
-                &crate::config::Config::default(),
-            );
-
-            assert!(consumed);
-            assert_eq!(state.input.get().text(), "");
-        });
-        owner.dispose();
+fn submit_to_layer(layer: &Rc<crate::tui::conversation::ConversationLayer>, text: String) {
+    match layer.submit_prompt(text) {
+        crate::tui::conversation::SubmitOutcome::Queued => {
+            layer.state.busy.set(true);
+            layer.state.status.update(|s| s.busy = true);
+        }
+        crate::tui::conversation::SubmitOutcome::NoAgent => {
+            layer
+                .state
+                .push_error("No LLM agent available. Check your config.");
+        }
+        crate::tui::conversation::SubmitOutcome::DriverGone => {
+            layer
+                .state
+                .push_error("Layer driver exited. Cannot send prompt.");
+        }
+        crate::tui::conversation::SubmitOutcome::ChannelFull => {
+            layer
+                .state
+                .push_error("Layer driver busy (command queue full).");
+        }
     }
 }

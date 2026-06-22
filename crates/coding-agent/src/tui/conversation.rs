@@ -26,6 +26,7 @@ use iodilos::prelude::*;
 use super::state::UiState;
 use crate::config::Config;
 use crate::core::extensions::{OverlapOptions, SlashCommandScope};
+use crate::tui::editor::EditorState;
 
 /// Which kind of conversation a layer holds. Determines exit/discard semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -341,16 +342,16 @@ async fn recv_shutdown(
 /// The overlap factory is held as `Arc` (not `Rc`) because it must cross into a
 /// `tokio::spawn` to build the harness; everything else is iodilos-local `Rc`.
 pub struct ConversationStack {
-    layers: RwSignal<Vec<Rc<ConversationLayer>>>,
-    active_index: RwSignal<usize>,
+    layers: Signal<Vec<Rc<ConversationLayer>>>,
+    active_index: Signal<usize>,
     /// `Some(token)` while an overlap is either being built or already present.
     /// This closes the race where repeated extension commands can all pass the
     /// active-layer guard before the first async build pushes its layer.
-    overlap_slot: RwSignal<Option<OverlapSlot>>,
-    next_overlap_token: RwSignal<u64>,
+    overlap_slot: Signal<Option<OverlapSlot>>,
+    next_overlap_token: Signal<u64>,
     /// How to build an overlap harness; `None` in session-only mode. `Arc` so
     /// it can be moved into a tokio task inside `open_overlap`.
-    overlap_factory: RwSignal<Option<Arc<AgentOverlapFactory>>>,
+    overlap_factory: Signal<Option<Arc<AgentOverlapFactory>>>,
 }
 
 impl ConversationStack {
@@ -362,11 +363,11 @@ impl ConversationStack {
         overlap_factory: Option<Arc<AgentOverlapFactory>>,
     ) -> Rc<Self> {
         Rc::new(Self {
-            layers: create_rw_signal(vec![Rc::new(main)]),
-            active_index: create_rw_signal(0),
-            overlap_slot: create_rw_signal(None),
-            next_overlap_token: create_rw_signal(0),
-            overlap_factory: create_rw_signal(overlap_factory),
+            layers: create_signal(vec![Rc::new(main)]),
+            active_index: create_signal(0),
+            overlap_slot: create_signal(None),
+            next_overlap_token: create_signal(0),
+            overlap_factory: create_signal(overlap_factory),
         })
     }
 
@@ -390,7 +391,7 @@ impl ConversationStack {
     /// being built. Ctrl+C uses this so a pending overlap can be cancelled before
     /// its async build finishes.
     pub fn overlap_is_active_or_pending(&self) -> bool {
-        self.overlap_slot.get().is_some()
+        self.overlap_slot.get_clone().is_some()
             || self
                 .layers
                 .with(|ls| ls.iter().any(|layer| layer.kind == LayerKind::Overlap))
@@ -438,7 +439,7 @@ impl ConversationStack {
         if idx == 0 {
             return None;
         }
-        // RwSignal::update returns (), so capture the popped value via a Cell.
+        // Signal::update returns (), so capture the popped value via a Cell.
         let popped: Cell<Option<Rc<ConversationLayer>>> = Cell::new(None);
         let popped_ref = &popped;
         batch(|| {
@@ -468,7 +469,7 @@ impl ConversationStack {
 
     fn is_overlap_token_current(&self, token: u64) -> bool {
         self.overlap_slot
-            .get()
+            .get_clone()
             .map(|slot| slot.token == token)
             .unwrap_or(false)
     }
@@ -499,7 +500,7 @@ impl ConversationStack {
 
     /// The overlap factory, when present.
     pub fn overlap_factory(&self) -> Option<Arc<AgentOverlapFactory>> {
-        self.overlap_factory.get()
+        self.overlap_factory.get_clone()
     }
 
     /// The active-layer index signal. Components read this inside an effect to
@@ -507,7 +508,7 @@ impl ConversationStack {
     /// registers the dependency, so the effect re-runs when the active layer
     /// changes. Without this, a component fixes its `state` at mount and never
     /// reacts to push/pop.
-    pub fn active_index_signal(&self) -> RwSignal<usize> {
+    pub fn active_index_signal(&self) -> Signal<usize> {
         self.active_index
     }
 }
@@ -657,7 +658,7 @@ impl RuntimeControl {
         // fresh transcript and start its driver.
         let extension_id = options.extension_id.clone();
         let stack_for_bridge = stack.clone();
-        spawn_local(async move {
+        use_future(async move {
             let build = match build_rx.recv_async().await {
                 Ok(b) => b,
                 Err(_) => {
@@ -682,8 +683,8 @@ impl RuntimeControl {
             // 3. New UiState for the overlap layer. Seed its status snapshot
             // from the main layer so the status line keeps showing
             // model/provider/cwd/git (only busy/spinner differs as the turn runs).
-            let overlap_state = Rc::new(UiState::new(TextAreaState::default()));
-            let main_status = stack_for_bridge.main_layer().state.status.get();
+            let overlap_state = Rc::new(UiState::new(EditorState::default()));
+            let main_status = stack_for_bridge.main_layer().state.status.get_clone();
             overlap_state.status.set(main_status);
 
             // Bind harness → transcript atomically (channel + subscriber + driver
@@ -728,7 +729,7 @@ impl RuntimeControl {
             };
             let pump_state = Rc::clone(&overlap_state);
             let pump_extension_id = extension_id.clone();
-            spawn_local(async move {
+            use_future(async move {
                 let mut accumulated_text = String::new();
                 let mut in_thinking = false;
                 while let Ok(event) = event_rx.recv_async().await {
@@ -826,7 +827,7 @@ impl RuntimeControl {
 
         // 2. Iodilos bridge: await the harness, bind it, and push the overlay.
         let prompt_for_bridge = initial_prompt.clone();
-        spawn_local(async move {
+        use_future(async move {
             let build = match build_rx.recv_async().await {
                 Ok(b) => b,
                 Err(_) => {
@@ -853,8 +854,8 @@ impl RuntimeControl {
 
             // Fresh UiState for the fork; seed status from the main layer so the
             // status line keeps showing model/provider/cwd/git.
-            let fork_state = Rc::new(UiState::new(TextAreaState::default()));
-            let main_status = stack.main_layer().state.status.get();
+            let fork_state = Rc::new(UiState::new(EditorState::default()));
+            let main_status = stack.main_layer().state.status.get_clone();
             fork_state.status.set(main_status);
             if let Some(prompt) = &prompt_for_bridge {
                 fork_state.push_user(prompt);
@@ -871,7 +872,7 @@ impl RuntimeControl {
                 unsubscribe,
             } = binding;
             let pump_state = Rc::clone(&fork_state);
-            spawn_local(async move {
+            use_future(async move {
                 let mut accumulated_text = String::new();
                 let mut in_thinking = false;
                 while let Ok(event) = event_rx.recv_async().await {
@@ -944,9 +945,6 @@ impl RuntimeControl {
                 move || teardown_overlap_layers(vec![Rc::clone(&layer)])
             });
             let content_state = Rc::clone(&fork_state);
-            let content_config = config.clone();
-            let content_submit = Rc::clone(&submit);
-            let content_close = Rc::clone(&close);
             let overlay = crate::tui::overlay_stack::ActiveOverlay {
                 geometry: iodilos::OverlayGeometry::FullBleed,
                 dismissible: true,
@@ -955,13 +953,25 @@ impl RuntimeControl {
                     crate::tui::components::overlay_conversation::overlay_conversation(
                         crate::tui::components::overlay_conversation::OverlayConversationProps {
                             state: Rc::clone(&content_state),
-                            badge: Some("BTW".to_string()),
-                            config: content_config.clone(),
-                            submit: Rc::clone(&content_submit),
-                            close: Rc::clone(&content_close),
+                            tail_label: Some("btw".to_string()),
                         },
                     )
                 }),
+                on_key: Some(Rc::new({
+                    let state = Rc::clone(&fork_state);
+                    let config = config.clone();
+                    let submit = Rc::clone(&submit);
+                    let close = Rc::clone(&close);
+                    move |key| {
+                        crate::tui::components::overlay_conversation::handle_overlay_key(
+                            key,
+                            &state,
+                            &config,
+                            Rc::clone(&submit),
+                            Rc::clone(&close),
+                        )
+                    }
+                })),
                 on_close: Some(Rc::clone(&teardown) as Rc<dyn Fn()>),
             };
 
@@ -978,11 +988,13 @@ impl RuntimeControl {
         });
     }
 
-    /// Open the `/model` overlay. `content_factory` builds the ModelOverlay
-    /// node; it is invoked exactly once by App's OverlayLayer (under the mount
-    /// owner), not here — so the overlay's `on_key`/effect register against the
-    /// correct owner and are not rebuilt on spurious re-runs.
-    pub fn open_model_overlay(&self, content_factory: std::rc::Rc<dyn Fn() -> Node>) {
+    /// Open the `/model` overlay. The view content and key handler share one
+    /// picker state so navigation is local to the overlay.
+    pub fn open_model_overlay(
+        &self,
+        content_factory: std::rc::Rc<dyn Fn() -> View>,
+        on_key: std::rc::Rc<dyn Fn(crossterm::event::KeyEvent) -> bool>,
+    ) {
         if self.overlay_stack.is_active() {
             self.stack
                 .active()
@@ -995,6 +1007,7 @@ impl RuntimeControl {
             dismissible: true,
             route_app_keys: false,
             content: content_factory,
+            on_key: Some(on_key),
             on_close: None,
         };
         self.overlay_stack.push(overlay);
@@ -1009,16 +1022,12 @@ impl RuntimeControl {
         reply: tokio::sync::oneshot::Sender<crate::core::extensions::types::CommandResult>,
     ) {
         let overlay_stack = Rc::clone(&self.overlay_stack);
-        let content_factory: std::rc::Rc<dyn Fn() -> Node> = match &self.harness {
+        let config = self.config.clone();
+        let parts = match &self.harness {
             Some(h) => {
                 let h = Arc::clone(h);
                 let stack = Rc::clone(&overlay_stack);
-                std::rc::Rc::new(move || {
-                    crate::tui::components::model_overlay::model_overlay(
-                        Arc::clone(&h),
-                        Rc::clone(&stack),
-                    )
-                })
+                crate::tui::components::model_overlay::model_overlay_parts(h, stack, config)
             }
             None => {
                 self.stack.active().state.push_error(
@@ -1028,7 +1037,7 @@ impl RuntimeControl {
                 return;
             }
         };
-        self.open_model_overlay(content_factory);
+        self.open_model_overlay(parts.content, parts.on_key);
         let _ = reply.send(Ok(()));
     }
 
@@ -1356,7 +1365,7 @@ fn log_overlap_state(
     accumulated_len: usize,
     in_thinking: bool,
 ) {
-    let status = state.status.get();
+    let status = state.status.get_clone();
     tracing::info!(
         target: "flown::overlap",
         extension = %extension_id,
@@ -1377,7 +1386,7 @@ fn log_overlap_state_after_translate(
     accumulated_len: usize,
     in_thinking: bool,
 ) {
-    let status = state.status.get();
+    let status = state.status.get_clone();
     tracing::info!(
         target: "flown::overlap",
         extension = %extension_id,
@@ -1405,214 +1414,234 @@ mod tests {
         }
     }
 
+    fn with_root(f: impl FnOnce()) {
+        let owner = create_root(f);
+        owner.dispose();
+    }
+
     /// A main-only stack reports depth 1 and active == main.
     #[test]
     fn stack_starts_with_main_only() {
-        let (tx, _rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-        assert_eq!(stack.depth(), 1);
-        assert!(!stack.active_is_overlap());
-        assert_eq!(stack.active().kind, LayerKind::Main);
+        with_root(|| {
+            let (tx, _rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            assert_eq!(stack.depth(), 1);
+            assert!(!stack.active_is_overlap());
+            assert_eq!(stack.active().kind, LayerKind::Main);
+        });
     }
 
     /// pop_active on a main-only stack is a no-op (Main is never popped).
     #[test]
     fn cannot_pop_main() {
-        let (tx, _rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-        assert!(stack.pop_active().is_none());
-        assert_eq!(stack.depth(), 1);
+        with_root(|| {
+            let (tx, _rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            assert!(stack.pop_active().is_none());
+            assert_eq!(stack.depth(), 1);
+        });
     }
 
     /// Popping an overlap layer must not expose an intermediate invalid state where
     /// `active_index` still points past the shortened layer stack.
     #[test]
     fn pop_active_switches_index_and_layers_atomically() {
-        let (main_tx, _main_rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: main_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
+        with_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
 
-        let (overlap_tx, _overlap_rx) = flume::unbounded();
-        stack.push(ConversationLayer {
-            kind: LayerKind::Overlap,
-            overlap: Some(test_overlap_meta()),
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: overlap_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        });
-
-        let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let observed_for_effect = Rc::clone(&observed);
-        let stack_for_effect = Rc::clone(&stack);
-        create_effect(move || {
-            stack_for_effect.active_index_signal().get();
-            observed_for_effect
-                .borrow_mut()
-                .push(stack_for_effect.active().kind);
-        });
-
-        let popped = stack.pop_active().expect("overlap layer popped");
-
-        assert_eq!(popped.kind, LayerKind::Overlap);
-        assert_eq!(stack.depth(), 1);
-        assert_eq!(stack.active().kind, LayerKind::Main);
-        let observed = observed.borrow();
-        assert_eq!(observed.first(), Some(&LayerKind::Overlap));
-        assert_eq!(observed.last(), Some(&LayerKind::Main));
-        assert!(observed[1..].iter().all(|kind| *kind == LayerKind::Main));
-    }
-
-    #[test]
-    fn reserve_overlap_rejects_repeated_enter_while_pending() {
-        let (main_tx, _main_rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: main_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-
-        let token = stack
-            .reserve_overlap(Some("test".to_string()))
-            .expect("first overlap reserves slot");
-
-        assert!(stack.overlap_is_active_or_pending());
-        assert!(stack.reserve_overlap(Some("test".to_string())).is_none());
-        assert!(stack.is_overlap_token_current(token));
-    }
-
-    #[test]
-    fn close_cancels_pending_overlap_before_layer_push() {
-        let (main_tx, _main_rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: main_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-        let token = stack
-            .reserve_overlap(Some("test".to_string()))
-            .expect("pending overlap reserved");
-
-        let popped = stack.pop_all_overlap_layers();
-
-        assert!(popped.is_empty());
-        assert_eq!(stack.depth(), 1);
-        assert!(!stack.overlap_is_active_or_pending());
-        assert!(!stack.is_overlap_token_current(token));
-    }
-
-    #[test]
-    fn pop_all_overlap_layers_returns_to_clean_main_stack() {
-        let (main_tx, _main_rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: main_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-        stack
-            .reserve_overlap(Some("test".to_string()))
-            .expect("overlap reserved");
-
-        for _ in 0..2 {
             let (overlap_tx, _overlap_rx) = flume::unbounded();
             stack.push(ConversationLayer {
                 kind: LayerKind::Overlap,
                 overlap: Some(test_overlap_meta()),
-                state: Rc::new(UiState::new(TextAreaState::default())),
+                state: Rc::new(UiState::new(EditorState::default())),
                 harness: None,
                 event_tx: overlap_tx,
                 unsubscribe: None,
                 cmd_tx: None,
             });
-        }
 
-        let popped = stack.pop_all_overlap_layers();
+            let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed_for_effect = Rc::clone(&observed);
+            let stack_for_effect = Rc::clone(&stack);
+            create_effect(move || {
+                stack_for_effect.active_index_signal().get();
+                observed_for_effect
+                    .borrow_mut()
+                    .push(stack_for_effect.active().kind);
+            });
 
-        assert_eq!(popped.len(), 2);
-        assert_eq!(stack.depth(), 1);
-        assert_eq!(stack.active().kind, LayerKind::Main);
-        assert!(!stack.overlap_is_active_or_pending());
+            let popped = stack.pop_active().expect("overlap layer popped");
+
+            assert_eq!(popped.kind, LayerKind::Overlap);
+            assert_eq!(stack.depth(), 1);
+            assert_eq!(stack.active().kind, LayerKind::Main);
+            let observed = observed.borrow();
+            assert_eq!(observed.first(), Some(&LayerKind::Overlap));
+            assert_eq!(observed.last(), Some(&LayerKind::Main));
+            assert!(observed[1..].iter().all(|kind| *kind == LayerKind::Main));
+        });
+    }
+
+    #[test]
+    fn reserve_overlap_rejects_repeated_enter_while_pending() {
+        with_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+
+            let token = stack
+                .reserve_overlap(Some("test".to_string()))
+                .expect("first overlap reserves slot");
+
+            assert!(stack.overlap_is_active_or_pending());
+            assert!(stack.reserve_overlap(Some("test".to_string())).is_none());
+            assert!(stack.is_overlap_token_current(token));
+        });
+    }
+
+    #[test]
+    fn close_cancels_pending_overlap_before_layer_push() {
+        with_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            let token = stack
+                .reserve_overlap(Some("test".to_string()))
+                .expect("pending overlap reserved");
+
+            let popped = stack.pop_all_overlap_layers();
+
+            assert!(popped.is_empty());
+            assert_eq!(stack.depth(), 1);
+            assert!(!stack.overlap_is_active_or_pending());
+            assert!(!stack.is_overlap_token_current(token));
+        });
+    }
+
+    #[test]
+    fn pop_all_overlap_layers_returns_to_clean_main_stack() {
+        with_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            stack
+                .reserve_overlap(Some("test".to_string()))
+                .expect("overlap reserved");
+
+            for _ in 0..2 {
+                let (overlap_tx, _overlap_rx) = flume::unbounded();
+                stack.push(ConversationLayer {
+                    kind: LayerKind::Overlap,
+                    overlap: Some(test_overlap_meta()),
+                    state: Rc::new(UiState::new(EditorState::default())),
+                    harness: None,
+                    event_tx: overlap_tx,
+                    unsubscribe: None,
+                    cmd_tx: None,
+                });
+            }
+
+            let popped = stack.pop_all_overlap_layers();
+
+            assert_eq!(popped.len(), 2);
+            assert_eq!(stack.depth(), 1);
+            assert_eq!(stack.active().kind, LayerKind::Main);
+            assert!(!stack.overlap_is_active_or_pending());
+        });
     }
 
     #[test]
     fn full_bleed_overlay_close_runs_overlay_teardown_without_switching_stack() {
-        let (main_tx, _main_rx) = flume::unbounded();
-        let main = ConversationLayer {
-            kind: LayerKind::Main,
-            overlap: None,
-            state: Rc::new(UiState::new(TextAreaState::default())),
-            harness: None,
-            event_tx: main_tx,
-            unsubscribe: None,
-            cmd_tx: None,
-        };
-        let stack = ConversationStack::new(main, None);
-        let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
-        let closed = Rc::new(std::cell::Cell::new(false));
-        let closed_for_overlay = Rc::clone(&closed);
-        overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
-            geometry: iodilos::OverlayGeometry::FullBleed,
-            dismissible: true,
-            route_app_keys: false,
-            content: Rc::new(Node::new_text),
-            on_close: Some(Rc::new(move || closed_for_overlay.set(true))),
+        with_root(|| {
+            let (main_tx, _main_rx) = flume::unbounded();
+            let main = ConversationLayer {
+                kind: LayerKind::Main,
+                overlap: None,
+                state: Rc::new(UiState::new(EditorState::default())),
+                harness: None,
+                event_tx: main_tx,
+                unsubscribe: None,
+                cmd_tx: None,
+            };
+            let stack = ConversationStack::new(main, None);
+            let overlay_stack = crate::tui::overlay_stack::OverlayStack::new();
+            let closed = Rc::new(std::cell::Cell::new(false));
+            let closed_for_overlay = Rc::clone(&closed);
+            overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
+                geometry: iodilos::OverlayGeometry::FullBleed,
+                dismissible: true,
+                route_app_keys: false,
+                content: Rc::new(View::new),
+                on_key: None,
+                on_close: Some(Rc::new(move || closed_for_overlay.set(true))),
+            });
+
+            overlay_stack.pop();
+
+            assert!(closed.get());
+            assert_eq!(stack.depth(), 1);
+            assert_eq!(stack.active().kind, LayerKind::Main);
+            assert!(!overlay_stack.is_active());
         });
-
-        overlay_stack.pop();
-
-        assert!(closed.get());
-        assert_eq!(stack.depth(), 1);
-        assert_eq!(stack.active().kind, LayerKind::Main);
-        assert!(!overlay_stack.is_active());
     }
 
     #[test]
     fn model_overlay_command_does_not_read_harness_from_context() {
-        let (_, owner) = create_root(|| {
+        let owner = create_root(|| {
             let (main_tx, _main_rx) = flume::unbounded();
-            let main_state = Rc::new(UiState::new(TextAreaState::default()));
+            let main_state = Rc::new(UiState::new(EditorState::default()));
             let main = ConversationLayer {
                 kind: LayerKind::Main,
                 overlap: None,
@@ -1634,7 +1663,7 @@ mod tests {
                 .try_recv()
                 .expect("model overlay command should reply synchronously");
             assert!(reply.is_ok());
-            assert!(!stack.active().state.entries.get().is_empty());
+            assert!(!stack.active().state.entries.get_clone().is_empty());
         });
         owner.dispose();
     }

@@ -133,8 +133,7 @@ impl flown_agent::Shell for TestExecutionEnv {
         _options: ExecOptions,
     ) -> Result<ExecResult, flown_agent::ExecutionError> {
         Ok(ExecResult {
-            stdout: String::new(),
-            stderr: String::new(),
+            output: String::new(),
             exit_code: 0,
         })
     }

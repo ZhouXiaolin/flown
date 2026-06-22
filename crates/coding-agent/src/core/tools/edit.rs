@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use flown_agent::ExecutionEnv;
-use flown_agent::{AgentTool, AgentToolError, AgentToolResult, ToolExecutionMode};
+use flown_agent::{AgentTool, AgentToolError, AgentToolResult, FileErrorCode, ToolExecutionMode};
 use serde_json::{Value, json};
 
 use super::common::*;
@@ -39,6 +39,17 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 let resolved_path = env.absolute_path(&path).map_err(tool_error)?;
                 let edits = required_edits(&args)?;
 
+                // Pre-check readability before attempting to read, so a missing
+                // or unreadable file reports a clear "Could not edit file"
+                // error instead of an opaque read failure. Mirrors pi-mono's
+                // `access(R_OK | W_OK)` guard.
+                if let Err(error) = env.file_info(&resolved_path).await {
+                    return Err(AgentToolError::new(format!(
+                        "Could not edit file: {path}. Error code: {}.",
+                        error_code_name(&error)
+                    )));
+                }
+
                 let content = env
                     .read_text_file(&resolved_path)
                     .await
@@ -52,10 +63,9 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 env.write_file(&resolved_path, final_content.as_bytes())
                     .await
                     .map_err(tool_error)?;
-                let diff = simple_diff(&applied.base_content, &applied.new_content);
+                let diff_result = generate_diff_string(&applied.base_content, &applied.new_content);
                 let patch = generate_unified_patch(&path, &applied.base_content, &applied.new_content);
-                let first_changed_line =
-                    first_changed_line(&applied.base_content, &applied.new_content);
+                let first_changed_line = diff_result.first_changed_line;
 
                 Ok(AgentToolResult {
                     content: vec![text_block(format!(
@@ -63,7 +73,7 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         edits.len()
                     ))],
                     details: json!({
-                        "diff": diff,
+                        "diff": diff_result.diff,
                         "patch": patch,
                         "firstChangedLine": first_changed_line,
                     }),
@@ -80,6 +90,22 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 struct Edit {
     old_text: String,
     new_text: String,
+}
+
+/// Map a file error code to the Node.js-style `error.code` string that
+/// pi-mono surfaces via `access()`. Used so edit's pre-check failure message
+/// reads `Could not edit file: {path}. Error code: ENOENT.` etc.
+fn error_code_name(error: &flown_agent::FileError) -> &'static str {
+    match error.code {
+        FileErrorCode::NotFound => "ENOENT",
+        FileErrorCode::PermissionDenied => "EACCES",
+        FileErrorCode::IsDirectory => "EISDIR",
+        FileErrorCode::NotDirectory => "ENOTDIR",
+        FileErrorCode::Invalid => "EINVAL",
+        FileErrorCode::NotSupported => "ENOTSUP",
+        FileErrorCode::Aborted => "EABORT",
+        FileErrorCode::Unknown => "UNKNOWN",
+    }
 }
 
 #[derive(Debug)]
@@ -243,7 +269,14 @@ fn restore_line_endings(text: &str, ending: LineEnding) -> String {
 }
 
 fn normalize_for_fuzzy_match(text: &str) -> String {
-    text.split('\n')
+    use unicode_normalization::UnicodeNormalization;
+
+    // NFKC first (compatibility decomposition + canonical composition), so
+    // ligatures (ﬁ→fi), fullwidth Latin, superscripts (²→2) etc. collapse to
+    // their ASCII equivalents — mirrors JS `String.prototype.normalize("NFKC")`.
+    text.nfkc()
+        .collect::<String>()
+        .split('\n')
         .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
@@ -264,20 +297,260 @@ fn normalize_for_fuzzy_match(text: &str) -> String {
         )
 }
 
+/// Generate a standard unified patch with 4 lines of context.
+///
+/// Mirrors pi-mono's `generateUnifiedPatch`, which calls
+/// `Diff.createTwoFilesPatch(path, path, old, new, ..., { context: 4,
+/// headerOptions: FILE_HEADERS_ONLY })`.
 fn generate_unified_patch(path: &str, old: &str, new: &str) -> String {
-    format!("--- {path}\n+++ {path}\n@@\n-{old}\n+{new}")
+    similar::udiff::unified_diff(
+        similar::Algorithm::default(),
+        old,
+        new,
+        4,
+        Some((path, path)),
+    )
 }
 
-fn first_changed_line(old: &str, new: &str) -> Option<usize> {
-    old.split('\n')
-        .zip(new.split('\n'))
-        .position(|(old, new)| old != new)
-        .map(|index| index + 1)
-        .or_else(|| {
-            let old_count = old.split('\n').count();
-            let new_count = new.split('\n').count();
-            (old_count != new_count).then_some(old_count.min(new_count) + 1)
-        })
+const DIFF_CONTEXT_LINES: usize = 4;
+
+/// Result of a display-oriented diff: the formatted string and the line number
+/// of the first changed line in the new file (1-indexed).
+struct DiffResult {
+    diff: String,
+    first_changed_line: Option<usize>,
+}
+
+/// Generate a display-oriented diff string with line numbers and folded context.
+///
+/// Mirrors pi-mono's `generateDiffString`: walks the line-level diff ops,
+/// prefixes added/removed lines with their new/old line numbers, and shows only
+/// `DIFF_CONTEXT_LINES` of surrounding equal text around each change (folding
+/// the rest into `...`). Equal runs that are not adjacent to a change are
+/// dropped entirely.
+fn generate_diff_string(old_content: &str, new_content: &str) -> DiffResult {
+    let old_lines: Vec<&str> = old_content.split('\n').collect();
+    let new_lines: Vec<&str> = new_content.split('\n').collect();
+    let max_line_num = old_lines.len().max(new_lines.len());
+    let line_num_width = max_line_num.to_string().len();
+
+    // Build a part list analogous to jsdiff's diffLines output: each part is
+    // (is_added, is_removed, raw_lines). Replace ops are split into a removed
+    // part immediately followed by an added part, matching jsdiff ordering.
+    let diff = similar::TextDiff::from_lines(old_content, new_content);
+    struct Part {
+        added: bool,
+        removed: bool,
+        lines: Vec<String>,
+    }
+    let mut parts: Vec<Part> = Vec::new();
+    for op in diff.ops() {
+        match op {
+            similar::DiffOp::Equal { .. } => {
+                let range = op.old_range();
+                let lines = old_lines[range.start..range.end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                parts.push(Part {
+                    added: false,
+                    removed: false,
+                    lines,
+                });
+            }
+            similar::DiffOp::Insert { .. } => {
+                let range = op.new_range();
+                let lines = new_lines[range.start..range.end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                parts.push(Part {
+                    added: true,
+                    removed: false,
+                    lines,
+                });
+            }
+            similar::DiffOp::Delete { .. } => {
+                let range = op.old_range();
+                let lines = old_lines[range.start..range.end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                parts.push(Part {
+                    added: false,
+                    removed: true,
+                    lines,
+                });
+            }
+            similar::DiffOp::Replace { .. } => {
+                let old_range = op.old_range();
+                let new_range = op.new_range();
+                let removed_lines = old_lines[old_range.start..old_range.end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                parts.push(Part {
+                    added: false,
+                    removed: true,
+                    lines: removed_lines,
+                });
+                let added_lines = new_lines[new_range.start..new_range.end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                parts.push(Part {
+                    added: true,
+                    removed: false,
+                    lines: added_lines,
+                });
+            }
+        }
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut old_line_num = 1usize;
+    let mut new_line_num = 1usize;
+    let mut last_was_change = false;
+    let mut first_changed_line: Option<usize> = None;
+
+    for (i, part) in parts.iter().enumerate() {
+        let is_change = part.added || part.removed;
+        if is_change && first_changed_line.is_none() {
+            first_changed_line = Some(new_line_num);
+        }
+
+        if is_change {
+            for line in &part.lines {
+                let num_str = if part.added {
+                    let n = new_line_num;
+                    new_line_num += 1;
+                    n
+                } else {
+                    let n = old_line_num;
+                    old_line_num += 1;
+                    n
+                };
+                let sign = if part.added { '+' } else { '-' };
+                output.push(format!(
+                    "{sign}{num:>line_num_width$} {line}",
+                    num = num_str,
+                    line = line,
+                    line_num_width = line_num_width,
+                ));
+            }
+            last_was_change = true;
+        } else {
+            let next_is_change =
+                i + 1 < parts.len() && (parts[i + 1].added || parts[i + 1].removed);
+            let has_leading = last_was_change;
+            let has_trailing = next_is_change;
+            let raw = &part.lines;
+            let raw_len = raw.len();
+
+            if has_leading && has_trailing {
+                if raw_len <= DIFF_CONTEXT_LINES * 2 {
+                    for line in raw {
+                        let num = old_line_num;
+                        output.push(format!(
+                            " {num:>line_num_width$} {line}",
+                            num = num,
+                            line = line,
+                            line_num_width = line_num_width,
+                        ));
+                        old_line_num += 1;
+                        new_line_num += 1;
+                    }
+                } else {
+                    let leading = &raw[..DIFF_CONTEXT_LINES];
+                    let trailing = &raw[raw_len - DIFF_CONTEXT_LINES..];
+                    let skipped = raw_len - leading.len() - trailing.len();
+                    for line in leading {
+                        let num = old_line_num;
+                        output.push(format!(
+                            " {num:>line_num_width$} {line}",
+                            num = num,
+                            line = line,
+                            line_num_width = line_num_width,
+                        ));
+                        old_line_num += 1;
+                        new_line_num += 1;
+                    }
+                    output.push(format!(
+                        " {:>line_num_width$} ...",
+                        "",
+                        line_num_width = line_num_width,
+                    ));
+                    old_line_num += skipped;
+                    new_line_num += skipped;
+                    for line in trailing {
+                        let num = old_line_num;
+                        output.push(format!(
+                            " {num:>line_num_width$} {line}",
+                            num = num,
+                            line = line,
+                            line_num_width = line_num_width,
+                        ));
+                        old_line_num += 1;
+                        new_line_num += 1;
+                    }
+                }
+            } else if has_leading {
+                let shown = &raw[..raw_len.min(DIFF_CONTEXT_LINES)];
+                let skipped = raw_len - shown.len();
+                for line in shown {
+                    let num = old_line_num;
+                    output.push(format!(
+                        " {num:>line_num_width$} {line}",
+                        num = num,
+                        line = line,
+                        line_num_width = line_num_width,
+                    ));
+                    old_line_num += 1;
+                    new_line_num += 1;
+                }
+                if skipped > 0 {
+                    output.push(format!(
+                        " {:>line_num_width$} ...",
+                        "",
+                        line_num_width = line_num_width,
+                    ));
+                    old_line_num += skipped;
+                    new_line_num += skipped;
+                }
+            } else if has_trailing {
+                let skipped = raw_len.saturating_sub(DIFF_CONTEXT_LINES);
+                if skipped > 0 {
+                    output.push(format!(
+                        " {:>line_num_width$} ...",
+                        "",
+                        line_num_width = line_num_width,
+                    ));
+                    old_line_num += skipped;
+                    new_line_num += skipped;
+                }
+                for line in &raw[skipped..] {
+                    let num = old_line_num;
+                    output.push(format!(
+                        " {num:>line_num_width$} {line}",
+                        num = num,
+                        line = line,
+                        line_num_width = line_num_width,
+                    ));
+                    old_line_num += 1;
+                    new_line_num += 1;
+                }
+            } else {
+                old_line_num += raw_len;
+                new_line_num += raw_len;
+            }
+            last_was_change = false;
+        }
+    }
+
+    DiffResult {
+        diff: output.join("\n"),
+        first_changed_line,
+    }
 }
 
 fn prepare_edit_arguments(input: Value) -> Value {
@@ -316,6 +589,69 @@ fn prepare_edit_arguments(input: Value) -> Value {
     }
 }
 
-fn simple_diff(old: &str, new: &str) -> String {
-    format!("--- original\n+++ modified\n@@\n-{old}\n+{new}")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_diff_string_marks_added_and_removed_lines() {
+        let result = generate_diff_string("a\nb\nc", "a\nB\nc");
+        // b → B is a replace: removed line 2 then added line 2.
+        assert!(result.diff.contains("-2 b"));
+        assert!(result.diff.contains("+2 B"));
+        // First change is on new-file line 2.
+        assert_eq!(result.first_changed_line, Some(2));
+    }
+
+    #[test]
+    fn generate_diff_string_folds_context_between_changes() {
+        // Two changes separated by >2*DIFF_CONTEXT_LINES equal lines.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 1..=20 {
+            old.push_str(&format!("line{i}\n"));
+            new.push_str(&format!("line{i}\n"));
+        }
+        // Change at line 1 and line 20.
+        let old = format!("OLD1\n{}", &old[6..]);
+        let new = format!("NEW1\n{}", &new[6..]);
+        let old = format!("{old}{}", old.replace("line20", "OLD20"));
+        let new = format!("{new}{}", new.replace("line20", "NEW20"));
+
+        let result = generate_diff_string(&old, &new);
+        assert!(
+            result.diff.contains("..."),
+            "folded context should appear: {}",
+            result.diff
+        );
+    }
+
+    #[test]
+    fn generate_unified_patch_has_standard_headers() {
+        let patch = generate_unified_patch("file.txt", "a\nb", "a\nB");
+        assert!(patch.starts_with("--- file.txt\n+++ file.txt\n"));
+        assert!(patch.contains("@@"));
+    }
+
+    #[test]
+    fn normalize_for_fuzzy_match_applies_nfkc_to_ligatures() {
+        // U+FB01 LATIN SMALL LIGATURE FI should collapse to "fi" under NFKC.
+        assert_eq!(normalize_for_fuzzy_match("eﬀect"), "effect");
+    }
+
+    #[test]
+    fn normalize_for_fuzzy_match_strips_trailing_whitespace() {
+        // split('\n').map(trimEnd).join('\n') keeps a trailing empty element as
+        // a trailing newline, matching pi-mono exactly.
+        assert_eq!(normalize_for_fuzzy_match("a   \nb \n"), "a\nb\n");
+        assert_eq!(normalize_for_fuzzy_match("a   \nb "), "a\nb");
+    }
+
+    #[test]
+    fn error_code_name_maps_not_found_to_enoent() {
+        let err = flown_agent::FileError::new(FileErrorCode::NotFound, "/x");
+        assert_eq!(error_code_name(&err), "ENOENT");
+        let err = flown_agent::FileError::new(FileErrorCode::PermissionDenied, "/x");
+        assert_eq!(error_code_name(&err), "EACCES");
+    }
 }

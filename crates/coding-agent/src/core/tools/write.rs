@@ -39,7 +39,9 @@ pub fn tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     .map_err(tool_error)?;
 
                 Ok(text_result(
-                    format!("Successfully wrote {} bytes to {path}", content.len()),
+                    // Count characters (UTF-8 code points) rather than bytes,
+                    // matching pi-mono's `content.length`.
+                    format!("Successfully wrote {} characters to {path}", content.chars().count()),
                     Value::Null,
                 ))
             })

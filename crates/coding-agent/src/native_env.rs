@@ -6,6 +6,7 @@ use flown_agent::{
     FileErrorCode, FileInfo, FileKind, FileSystem, Shell,
 };
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// Native execution environment using std::fs and std::process
@@ -290,7 +291,7 @@ impl Shell for NativeExecutionEnv {
             }
         }
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             ExecutionError::with_source(
                 ExecutionErrorCode::SpawnError,
                 format!("failed to spawn shell command: {command}"),
@@ -298,17 +299,107 @@ impl Shell for NativeExecutionEnv {
             )
         })?;
 
-        let output = if let Some(timeout) = options.timeout {
+        // Take stdout/stderr pipes and read them concurrently with
+        // `tokio::select!`, interleaving into a single buffer in arrival order
+        // (mirrors pi-mono's single `onData` callback wired to both streams).
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ExecutionError::new(
+                ExecutionErrorCode::SpawnError,
+                "shell command produced no stdout pipe",
+            )
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ExecutionError::new(
+                ExecutionErrorCode::SpawnError,
+                "shell command produced no stderr pipe",
+            )
+        })?;
+
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+        let mut output = String::new();
+
+        // Helper: push a line and fire the streaming callback. Reconstructs the
+        // trailing newline that `next_line` strips, so `output` matches what
+        // `wait_with_output` would have produced.
+        fn emit_line(
+            line: &str,
+            output: &mut String,
+            on_output: &Option<flown_agent::ShellOutputUpdateFn>,
+        ) {
+            output.push_str(line);
+            output.push('\n');
+            if let Some(on_output) = on_output {
+                let _ = on_output(&format!("{line}\n"));
+            }
+        }
+
+        let on_output = &options.on_output;
+
+        // Drain both streams to EOF, interleaving lines into `output` in
+        // arrival order. Both futures are polled in a single task, so tokio's
+        // scheduler gives each a chance as data arrives on its pipe. When a
+        // stream hits EOF we mark it done; the loop exits once both are drained,
+        // after which `child.wait()` completes immediately (pipes are closed).
+        let run = async {
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            while !(stdout_eof && stderr_eof) {
+                tokio::select! {
+                    // Biased so neither stream can starve the other under load.
+                    biased;
+
+                    line = async {
+                        if stdout_eof { std::future::pending::<std::io::Result<Option<String>>>().await }
+                        else { stdout_lines.next_line().await }
+                    } => {
+                        match line {
+                            Ok(Some(line)) => emit_line(&line, &mut output, on_output),
+                            Ok(None) => stdout_eof = true,
+                            Err(e) => {
+                                return Err(ExecutionError::with_source(
+                                    ExecutionErrorCode::Unknown,
+                                    format!("failed to read shell stdout: {command}"),
+                                    e,
+                                ));
+                            }
+                        }
+                    }
+                    line = async {
+                        if stderr_eof { std::future::pending::<std::io::Result<Option<String>>>().await }
+                        else { stderr_lines.next_line().await }
+                    } => {
+                        match line {
+                            Ok(Some(line)) => emit_line(&line, &mut output, on_output),
+                            Ok(None) => stderr_eof = true,
+                            Err(e) => {
+                                return Err(ExecutionError::with_source(
+                                    ExecutionErrorCode::Unknown,
+                                    format!("failed to read shell stderr: {command}"),
+                                    e,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let status = child.wait().await.map_err(|e| {
+                ExecutionError::with_source(
+                    ExecutionErrorCode::SpawnError,
+                    format!("failed to wait for shell command: {command}"),
+                    e,
+                )
+            })?;
+            Ok::<_, ExecutionError>((output, status.code().unwrap_or(-1)))
+        };
+
+        let (output, exit_code) = if let Some(timeout) = options.timeout {
             let timeout = std::time::Duration::from_millis(timeout);
-            match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                Ok(result) => result.map_err(|e| {
-                    ExecutionError::with_source(
-                        ExecutionErrorCode::SpawnError,
-                        format!("failed to wait for shell command: {command}"),
-                        e,
-                    )
-                })?,
+            match tokio::time::timeout(timeout, run).await {
+                Ok(result) => result?,
                 Err(_) => {
+                    // Try to kill the child so it doesn't linger after timeout.
+                    let _ = child.kill().await;
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::Timeout,
                         format!("shell command timed out: {command}"),
@@ -316,24 +407,10 @@ impl Shell for NativeExecutionEnv {
                 }
             }
         } else {
-            child.wait_with_output().await.map_err(|e| {
-                ExecutionError::with_source(
-                    ExecutionErrorCode::SpawnError,
-                    format!("failed to wait for shell command: {command}"),
-                    e,
-                )
-            })?
+            run.await?
         };
 
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        Ok(ExecResult {
-            exit_code,
-            stdout,
-            stderr,
-        })
+        Ok(ExecResult { output, exit_code })
     }
 
     async fn cleanup(&self) -> Result<(), ExecutionError> {

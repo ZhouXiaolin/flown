@@ -1,6 +1,6 @@
 //! Reactive state model for the iodilos-based TUI.
 //!
-//! All UI state lives in iodilos `RwSignal`s held by [`UiState`], which is
+//! All UI state lives in iodilos `Signal`s held by [`UiState`], which is
 //! provided via context at the mount root and read by the components. The
 //! cross-runtime event pump in `runtime.rs` mutates these signals as
 //! `AgentEvent`s arrive from the tokio side; signal writes flip iodilos's dirty
@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use iodilos::prelude::*;
 
-use super::editor::SlashPopup;
+use super::editor::{EditorState, SlashPopup};
 use super::tool_format::format_tool_call;
 
 // ── Conversation model ────────────────────────────────────────────────
@@ -76,48 +76,91 @@ pub struct StatusInfo {
 /// Animated spinner glyphs for the busy state (mirrors the old StatusLine).
 pub const BUSY_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
 
+// ── Terminal-size signal ─────────────────────────────────────────────
+
+/// A reactive view of the terminal size in `(cols, rows)`. Provided once at
+/// mount via iodilos context and updated by App's `terminal_resize` handler.
+///
+/// Components read `cols.get()` / `rows.get()` inside an effect so they
+/// re-render when the terminal is resized. Without this, components that call
+/// `crossterm::terminal::size()` once at build time render at a stale width
+/// after a resize — the thinking block's border, for instance, would wrap as
+/// if the terminal were still the old width.
+#[derive(Clone, Copy)]
+pub struct TerminalSize {
+    pub cols: Signal<u16>,
+    pub rows: Signal<u16>,
+}
+
+impl TerminalSize {
+    /// Build a fresh signal pair seeded from the current terminal size (or
+    /// 80×24 as a fallback when there is no tty, e.g. tests).
+    pub fn new() -> Self {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        Self {
+            cols: create_signal(cols),
+            rows: create_signal(rows),
+        }
+    }
+
+    /// Update both signals from a resize event.
+    pub fn set(&self, cols: u16, rows: u16) {
+        self.cols.set(cols);
+        self.rows.set(rows);
+    }
+}
+
+impl std::fmt::Debug for TerminalSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalSize")
+            .field("cols", &self.cols.get())
+            .field("rows", &self.rows.get())
+            .finish()
+    }
+}
+
 // ── UiState ───────────────────────────────────────────────────────────
 
 /// The shared reactive state, wrapped in `Rc` so it can be provided via iodilos
 /// context and cheaply cloned into every component.
 ///
-/// Every field is a `Copy` signal handle (`RwSignal`), so handlers and effects
+/// Every field is a `Copy` signal handle (`Signal`), so handlers and effects
 /// capture them by copy without borrow-checker friction — the iodilos idiom.
 pub struct UiState {
     /// The full conversation, oldest first. Drives the transcript `<For>`.
-    pub entries: RwSignal<Vec<ConversationEntry>>,
+    pub entries: Signal<Vec<ConversationEntry>>,
     /// `true` while an agent prompt is streaming.
-    pub busy: RwSignal<bool>,
+    pub busy: Signal<bool>,
     /// Status-line snapshot.
-    pub status: RwSignal<StatusInfo>,
+    pub status: Signal<StatusInfo>,
     /// The editor buffer (text, cursor, slash popup).
-    pub input: RwSignal<TextAreaState>,
+    pub input: Signal<EditorState>,
     /// Slash-completion popup state for the editor.
-    pub slash_popup: RwSignal<Option<SlashPopup>>,
+    pub slash_popup: Signal<Option<SlashPopup>>,
     /// Scroll offset in lines from the bottom; `usize::MAX` means "stuck to
     /// bottom" (auto-follow). The transcript component resolves this against
     /// the viewport height to pick the visible window.
-    pub scroll_offset: RwSignal<usize>,
-    /// Accumulator for `ThinkingDelta` until `ThinkingEnd` flushes it as a
-    /// single entry (mirrors the old `accumulated_text` / `in_thinking` pair).
-    pub thinking_acc: RwSignal<String>,
+    pub scroll_offset: Signal<usize>,
+    /// Accumulator for the active `ThinkingDelta` stream. The rendered
+    /// transcript entry is updated as deltas arrive.
+    pub thinking_acc: Signal<String>,
     /// `true` between `ThinkingStart` and `ThinkingEnd`.
-    pub in_thinking: RwSignal<bool>,
+    pub in_thinking: Signal<bool>,
 }
 
 impl UiState {
     /// Build a fresh state with empty signals. `editor` is the initial editor
-    /// state (usually `TextAreaState::default()`).
-    pub fn new(editor: TextAreaState) -> Self {
+    /// state (usually `EditorState::default()`).
+    pub fn new(editor: EditorState) -> Self {
         Self {
-            entries: create_rw_signal(Vec::new()),
-            busy: create_rw_signal(false),
-            status: create_rw_signal(StatusInfo::default()),
-            input: create_rw_signal(editor),
-            slash_popup: create_rw_signal(None),
-            scroll_offset: create_rw_signal(usize::MAX),
-            thinking_acc: create_rw_signal(String::new()),
-            in_thinking: create_rw_signal(false),
+            entries: create_signal(Vec::new()),
+            busy: create_signal(false),
+            status: create_signal(StatusInfo::default()),
+            input: create_signal(editor),
+            slash_popup: create_signal(None),
+            scroll_offset: create_signal(usize::MAX),
+            thinking_acc: create_signal(String::new()),
+            in_thinking: create_signal(false),
         }
     }
 
@@ -163,7 +206,7 @@ impl UiState {
     /// appended (the last entry was an assistant entry). Mirrors the old
     /// `Transcript::append_to_assistant`.
     ///
-    /// `RwSignal::update` returns `()`, so we capture the result via a
+    /// `Signal::update` returns `()`, so we capture the result via a
     /// `Cell<Option<bool>>` shared into the closure.
     pub fn append_to_assistant(&self, text: &str) -> bool {
         use std::cell::Cell;
@@ -173,6 +216,27 @@ impl UiState {
         self.entries.update(|e| {
             if let Some(last) = e.last_mut()
                 && let EntryKind::Assistant(body) = &mut last.kind
+            {
+                body.push_str(text);
+                result_ref.set(true);
+            }
+        });
+        if result.get() && was_following_bottom {
+            self.stick_to_bottom();
+        }
+        result.get()
+    }
+
+    /// Append `text` to the last thinking entry. Returns `true` if it was
+    /// appended (the last entry was a thinking entry).
+    pub fn append_to_thinking(&self, text: &str) -> bool {
+        use std::cell::Cell;
+        let was_following_bottom = self.scroll_offset.get() == usize::MAX;
+        let result = Cell::new(false);
+        let result_ref = &result;
+        self.entries.update(|e| {
+            if let Some(last) = e.last_mut()
+                && let EntryKind::Thinking(body) = &mut last.kind
             {
                 body.push_str(text);
                 result_ref.set(true);
@@ -263,32 +327,55 @@ mod tests {
 
     #[test]
     fn assistant_stream_keeps_manual_scroll_position() {
-        let (offset, owner) = create_root(|| {
-            let state = UiState::new(TextAreaState::default());
+        let offset = std::cell::Cell::new(0usize);
+        let owner = create_root(|| {
+            let state = UiState::new(EditorState::default());
             state.push_assistant("first");
             state.scroll_up(4);
 
             assert!(state.append_to_assistant(" second"));
 
-            state.scroll_offset.get()
+            offset.set(state.scroll_offset.get());
         });
 
-        assert_eq!(offset, 4);
+        assert_eq!(offset.get(), 4);
         owner.dispose();
     }
 
     #[test]
     fn assistant_stream_follows_when_stuck_to_bottom() {
-        let (offset, owner) = create_root(|| {
-            let state = UiState::new(TextAreaState::default());
+        let offset = std::cell::Cell::new(0usize);
+        let owner = create_root(|| {
+            let state = UiState::new(EditorState::default());
             state.push_assistant("first");
 
             assert!(state.append_to_assistant(" second"));
 
-            state.scroll_offset.get()
+            offset.set(state.scroll_offset.get());
         });
 
-        assert_eq!(offset, usize::MAX);
+        assert_eq!(offset.get(), usize::MAX);
+        owner.dispose();
+    }
+
+    #[test]
+    fn thinking_stream_appends_to_last_thinking_entry() {
+        let text = std::cell::RefCell::new(String::new());
+        let owner = create_root(|| {
+            let state = UiState::new(EditorState::default());
+            state.push_thinking("alpha");
+
+            assert!(state.append_to_thinking(" beta"));
+
+            state.entries.with(|entries| {
+                let EntryKind::Thinking(body) = &entries[0].kind else {
+                    panic!("expected thinking entry");
+                };
+                text.replace(body.clone());
+            });
+        });
+
+        assert_eq!(text.into_inner(), "alpha beta");
         owner.dispose();
     }
 }

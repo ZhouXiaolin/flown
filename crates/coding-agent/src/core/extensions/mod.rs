@@ -29,7 +29,9 @@ use flown_agent::{AgentHarness, AgentTool};
 use crate::config::Config;
 
 pub use runner::{CommandSide, CommandTable, ToolSide, build};
-pub use types::{Extension, OverlapOptions, RuntimeCommand, RuntimeCommandProxy, SlashCommandScope};
+pub use types::{
+    Extension, OverlapOptions, RuntimeCommand, RuntimeCommandProxy, SlashCommandScope,
+};
 
 /// Run every extension's `register` on the tokio side and split the result.
 ///

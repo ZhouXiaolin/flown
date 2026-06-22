@@ -1,233 +1,606 @@
-//! `ModelOverlay` — the `/model` picker: a sectioned TableView listing models
-//! (grouped by provider) and supported thinking levels, with arrow navigation,
-//! Enter to apply, and Esc to dismiss.
+//! `ModelOverlay` — the `/model` picker and its thinking-intensity follow-up.
 //!
-//! Cursor↔row mapping is kept stable by ordering the row keys once (a
-//! `Vec<String>`) rather than relying on `HashMap` iteration order; the flat
-//! cursor index always addresses the same `key`.
+//! The model picker is a sectioned list of models from the configured
+//! providers, grouped by provider, with a search input that filters by
+//! id/name/provider. Selecting a non-reasoning model applies it directly.
+//! Selecting a reasoning model pushes a second, narrower overlay (the
+//! thinking-intensity picker) above the model picker: `Esc` on it returns to
+//! the model picker; confirming a level applies both the model and the level
+//! and drops the whole overlay stack back to the original view. The harness
+//! emits `ModelUpdate`/`ThinkingLevelUpdate` so the prompt-box status line
+//! updates.
+//!
+//! Both pickers are real `OverlayStack` layers, so the thinking picker floats
+//! centered above the still-visible model picker (≈1/3 side margins vs the
+//! model picker's 1/8).
+//!
+//! Pure helpers are split out so the filtering/sectioning logic is
+//! unit-testable without a TUI.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flown_agent::AgentHarness;
-use flown_ai::{ThinkingLevel, get_models, get_supported_thinking_levels, models_are_equal};
+use flown_ai::{ThinkingLevel, get_models, get_supported_thinking_levels};
 use iodilos::prelude::*;
 
+use crate::config::Config;
 use crate::tui::overlay_stack::OverlayStack;
 
-/// A single selectable row in the model overlay: either a model (with the
-/// provider it belongs to) or a thinking level.
+/// One selectable row in the model list: a model (with its provider). Thinking
+/// intensity is chosen via a nested sub-popup after a model is picked, so it is
+/// not a top-level row here.
 #[derive(Clone)]
-enum PickerRow {
-    Model {
-        provider: String,
-        model: flown_ai::Model,
-    },
-    Thinking(ThinkingLevel),
+pub(crate) struct PickerRow {
+    model: flown_ai::Model,
 }
 
-/// Build the ordered flat list of rows and their keys.
-fn build_rows(models: &[flown_ai::Model], thinking: &[ThinkingLevel]) -> Vec<PickerRow> {
-    let mut rows: Vec<PickerRow> = Vec::new();
-    for m in models {
-        rows.push(PickerRow::Model {
-            provider: m.provider.to_string(),
-            model: m.clone(),
-        });
+impl PickerRow {
+    fn provider(&self) -> String {
+        self.model.provider.to_string()
     }
-    for t in thinking {
-        rows.push(PickerRow::Thinking(t.clone()));
+    /// Lowercased haystack used for case-insensitive filtering: the full
+    /// `provider/id` plus the human name, so a search hits any of the three.
+    fn haystack(&self) -> String {
+        format!("{}/{} {}", self.provider(), self.model.id, self.model.name).to_lowercase()
     }
+    fn label(&self) -> String {
+        self.model.id.clone()
+    }
+}
+
+/// Build the flat, ordered list of every model across every provider, sorted
+/// (provider asc, then id asc) so the section order and row order are stable
+/// across filter changes.
+#[cfg(test)]
+pub(crate) fn build_all_rows() -> Vec<PickerRow> {
+    build_rows_for_providers(flown_ai::get_providers())
+}
+
+pub(crate) fn build_configured_rows(config: &Config) -> Vec<PickerRow> {
+    build_rows_for_providers(config.providers.keys().cloned())
+}
+
+fn build_rows_for_providers(providers: impl IntoIterator<Item = String>) -> Vec<PickerRow> {
+    let mut rows = Vec::new();
+    for provider in providers {
+        for model in get_models(&provider) {
+            rows.push(PickerRow { model });
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.provider()
+            .cmp(&b.provider())
+            .then_with(|| a.model.id.cmp(&b.model.id))
+    });
     rows
 }
 
-fn row_label(row: &PickerRow) -> String {
-    match row {
-        PickerRow::Model { model, .. } => format!("{}/{}", model.provider, model.id),
-        PickerRow::Thinking(t) => format!("thinking::{:?}", t).to_lowercase(),
+/// Filter `rows` by a case-insensitive query against each row's haystack,
+/// returning owned clones of the matching rows. Owned (not borrowed) so the
+/// filtered snapshot can live in a signal without lifetime gymnastics.
+pub(crate) fn filter_rows(rows: &[PickerRow], query: &str) -> Vec<PickerRow> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        rows.to_vec()
+    } else {
+        rows.iter()
+            .filter(|r| r.haystack().contains(&q))
+            .cloned()
+            .collect()
     }
 }
 
-/// Render the model overlay. `on_close` is invoked after a selection is applied
-/// (Enter) or on Esc.
-pub fn model_overlay(harness: Arc<AgentHarness>, overlay_stack: Rc<OverlayStack>) -> Node {
-    // Snapshot the candidate models + thinking levels ONCE at mount. The set is
-    // derived from the current model's provider's catalog; if there's no current
-    // model, fall back to an empty list (the overlay still opens, just empty).
-    // Both accessors are async; block_on at mount is acceptable (the overlay
-    // opens in response to a user keystroke, not on the hot render path).
+/// Group filtered rows into `TableSection`s keyed by provider, preserving the
+/// sorted order from `build_all_rows`. Each row's key is `provider/id` so the
+/// cell factory can map a selected key back to its model.
+pub(crate) fn build_sections(filtered: &[PickerRow]) -> Vec<TableSection> {
+    let mut sections: Vec<TableSection> = Vec::new();
+    let mut current_provider: Option<String> = None;
+    for row in filtered {
+        let provider = row.provider();
+        if Some(&provider) != current_provider.as_ref() {
+            sections.push(TableSection {
+                title: Some(provider.clone()),
+                rows: Vec::new(),
+            });
+            current_provider = Some(provider);
+        }
+        let section = sections.last_mut().expect("section just pushed");
+        // Only the model id is shown — the human name was previously appended as
+        // a dim description, but that cluttered each row. The name still feeds
+        // the search haystack so it remains findable by typing.
+        section.rows.push(TableRow::new(
+            format!("{}/{}", row.provider(), row.model.id),
+            row.label(),
+        ));
+    }
+    sections
+}
+
+pub struct ModelOverlayParts {
+    pub content: Rc<dyn Fn() -> View>,
+    pub on_key: Rc<dyn Fn(KeyEvent) -> bool>,
+}
+
+/// Build the `/model` overlay content and key handler.
+///
+/// State is created here (in the command-pump task that pushes the overlay) but
+/// the content is only *rendered* later, under App's mount owner — so reading
+/// the signals inside the view re-runs the view, not the build.
+pub fn model_overlay_parts(
+    harness: Arc<AgentHarness>,
+    overlay_stack: Rc<OverlayStack>,
+    config: Config,
+) -> ModelOverlayParts {
     let initial_model = futures::executor::block_on(harness.model());
-    let initial_thinking = futures::executor::block_on(harness.thinking_level());
-    let models = get_models(&initial_model.provider.to_string());
-    let thinking = get_supported_thinking_levels(&initial_model);
-    let rows = build_rows(&models, &thinking);
-    let rows_rc = Rc::new(rows.clone());
+    let _initial_thinking = futures::executor::block_on(harness.thinking_level());
+    let rows = Rc::new(build_configured_rows(&config));
 
-    // Stable ordered keys. The cursor indexes into this Vec — never a HashMap.
-    let keys: Vec<String> = rows.iter().map(row_label).collect();
-    let total = keys.len();
-    let selected = create_rw_signal(0usize);
+    let query = create_signal(String::new());
+    let selected = create_signal(0usize);
 
-    // ONE key handler, registered at mount (not per-render). It mutates the
-    // `selected` signal; the TableView effect re-renders on change.
-    let selected_for_key = selected;
-    let harness_for_key = Arc::clone(&harness);
-    let overlay_for_key = Rc::clone(&overlay_stack);
-    let rows_for_key = Rc::clone(&rows_rc);
-    on_key(move |key: KeyEvent| -> bool {
-        let max = total.saturating_sub(1);
-        match key.code {
-            KeyCode::Down => {
-                selected_for_key.set((selected_for_key.get() + 1).min(max));
-                true
+    // Filtered view of `rows`, memoized over the query. Reading it inside the
+    // view re-renders only when the query changes.
+    let rows_rc = Rc::clone(&rows);
+    let query_for_filter = query;
+    let filtered = create_memo(move || {
+        let q = query_for_filter.get_clone();
+        filter_rows(&rows_rc, &q)
+    });
+
+    let on_key: Rc<dyn Fn(KeyEvent) -> bool> = Rc::new({
+        let harness = Arc::clone(&harness);
+        let overlay_stack = Rc::clone(&overlay_stack);
+        move |key: KeyEvent| -> bool {
+            let ctrl_c =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+            if ctrl_c {
+                overlay_stack.pop();
+                return true;
             }
-            KeyCode::Up => {
-                selected_for_key.set(selected_for_key.get().saturating_sub(1));
-                true
+
+            // Printable / editing keys drive the search query.
+            if let Some(ch) = printable_char(&key) {
+                query.update(|q| q.push(ch));
+                selected.set(0);
+                return true;
             }
-            KeyCode::Esc => {
-                overlay_for_key.pop();
-                true
-            }
-            KeyCode::Enter => {
-                let idx = selected_for_key.get().min(max);
-                let row = &rows_for_key[idx];
-                apply_row(&harness_for_key, &overlay_for_key, row);
-                true
-            }
-            _ => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    overlay_for_key.pop();
+            match key.code {
+                KeyCode::Backspace => {
+                    query.update(|q| {
+                        q.pop();
+                    });
+                    selected.set(0);
                     true
-                } else {
-                    false
                 }
+                KeyCode::Down => {
+                    let max = filtered.get_clone().len().saturating_sub(1);
+                    selected.set((selected.get() + 1).min(max));
+                    true
+                }
+                KeyCode::Up => {
+                    selected.set(selected.get().saturating_sub(1));
+                    true
+                }
+                KeyCode::Esc => {
+                    // Close this model picker, returning to the original view.
+                    overlay_stack.pop();
+                    true
+                }
+                KeyCode::Enter => {
+                    let filtered = filtered.get_clone();
+                    let idx = selected.get();
+                    let Some(row) = filtered.get(idx) else {
+                        return true;
+                    };
+                    let levels = get_supported_thinking_levels(&row.model);
+                    if levels.len() <= 1 {
+                        // Non-reasoning (or only Off): apply immediately and
+                        // drop the picker back to the original view.
+                        apply_model(
+                            &harness,
+                            &overlay_stack,
+                            &row.model,
+                            levels.first().cloned(),
+                        );
+                    } else {
+                        // Reasoning: push a thinking-intensity overlay above
+                        // this one. Esc on it returns here; Enter applies the
+                        // model + level and drops both overlays.
+                        push_thinking_overlay(
+                            Arc::clone(&harness),
+                            Rc::clone(&overlay_stack),
+                            row.model.clone(),
+                            levels,
+                        );
+                    }
+                    true
+                }
+                _ => false,
             }
         }
     });
 
-    // The overlay's root: a column with a title and the TableView. The
-    // OverlayBox wrapping + inset geometry is applied by the caller (the
-    // RuntimeControl method that pushes onto OverlayStack).
-    let root = Node::new_view();
-    root.set_flex_direction(iodilos::taffy::prelude::FlexDirection::Column);
-    root.set_flex_grow(1.0);
-    root.set_padding_all(1.0);
-
-    let title = Node::new_text();
-    title.set_content(" /model — select a model or thinking level ".to_string());
-    title.set_color(Color::Cyan);
-    root.add_child(title);
-
-    // Sections: models by provider, then thinking levels. Headers are styled
-    // Nodes; rows are PickerRows addressed by their key.
-    let mut sections: Vec<TableSection> = Vec::new();
-    let mut by_provider: std::collections::BTreeMap<String, Vec<flown_ai::Model>> =
-        std::collections::BTreeMap::new();
-    for m in &models {
-        by_provider
-            .entry(m.provider.to_string())
-            .or_default()
-            .push(m.clone());
-    }
-    for (provider, provider_models) in by_provider {
-        let header = Node::new_text();
-        header.set_content(format!(" {provider} "));
-        header.set_color(Color::DarkGray);
-        sections.push(TableSection {
-            header: Some(header),
-            rows: provider_models
-                .iter()
-                .map(|m| TableRow::new(format!("{provider}/{}", m.id)))
-                .collect(),
-        });
-    }
-    if !thinking.is_empty() {
-        let header = Node::new_text();
-        header.set_content(" thinking ".to_string());
-        header.set_color(Color::DarkGray);
-        sections.push(TableSection {
-            header: Some(header),
-            rows: thinking
-                .iter()
-                .map(|t| TableRow::new(format!("thinking::{:?}", t).to_lowercase()))
-                .collect(),
-        });
-    }
-    let sections_signal = Signal::derive(move || sections.clone());
-    let selected_read = Signal::derive({
-        let sel = selected;
-        move || sel.get()
+    let content: Rc<dyn Fn() -> View> = Rc::new({
+        let selected = *selected;
+        let query = *query;
+        let initial_model = initial_model.clone();
+        move || model_overlay_view(filtered, selected, query, initial_model.clone())
     });
 
-    let rows_for_cells = Rc::clone(&rows_rc);
-    let cell_factory: CellFactory = Rc::new(move |ctx: &CellContext| {
-        // The row key encodes provider/id or thinking::level; find the row.
-        let row = rows_for_cells
-            .iter()
-            .find(|r| row_label(r) == ctx.key)
-            .cloned();
-        // "Current" = this row is the model the harness had at overlay-open
-        // time. Compared by id/provider against the mount-time snapshot.
-        let current_key = format!("{}/{}", initial_model.provider, initial_model.id);
-        let is_current = match &row {
-            Some(PickerRow::Model { model, .. }) => {
-                models_are_equal(Some(model), Some(&initial_model))
-                    || format!("{}/{}", model.provider, model.id) == current_key
+    ModelOverlayParts { content, on_key }
+}
+
+/// Extract a printable char from a key event (letters/digits/punctuation,
+/// ignoring Ctrl/Alt/Shift-as-modifier combos). `None` for non-text keys.
+fn printable_char(key: &KeyEvent) -> Option<char> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(ch) => Some(ch),
+        _ => None,
+    }
+}
+
+/// Handle a key while the thinking-intensity sub-popup is open. The model was
+/// captured when the sub-popup opened; confirming a level applies both the
+/// model and the level, then closes the overlay.
+/// Apply a model (and, if given, a thinking level) then drop every overlay —
+/// confirming a selection returns straight to the original view, updating the
+/// status line via the harness's emitted events.
+fn apply_model(
+    harness: &Arc<AgentHarness>,
+    overlay_stack: &Rc<OverlayStack>,
+    model: &flown_ai::Model,
+    level: Option<ThinkingLevel>,
+) {
+    let h = Arc::clone(harness);
+    let model = model.clone();
+    tokio::spawn(async move {
+        h.set_model(model).await;
+        if let Some(level) = level {
+            h.set_thinking_level(level).await;
+        }
+    });
+    overlay_stack.pop_all();
+}
+
+/// Push a thinking-intensity overlay above the model picker. `Esc` on it pops
+/// just this layer (returning to the model picker); `Enter` applies the model
+/// and chosen level and pops the whole stack back to the original view.
+fn push_thinking_overlay(
+    harness: Arc<AgentHarness>,
+    overlay_stack: Rc<OverlayStack>,
+    model: flown_ai::Model,
+    levels: Vec<ThinkingLevel>,
+) {
+    let parts = thinking_overlay_parts(harness, Rc::clone(&overlay_stack), model, levels);
+    let overlay = crate::tui::overlay_stack::ActiveOverlay {
+        // Narrower than the model picker (1/3 inset each side) so it floats
+        // centered above it.
+        geometry: iodilos::OverlayGeometry::Inset { ratio: 0.33 },
+        dismissible: true,
+        route_app_keys: false,
+        content: parts.content,
+        on_key: Some(parts.on_key),
+        on_close: None,
+    };
+    overlay_stack.push(overlay);
+}
+
+/// Build the thinking-intensity overlay content and key handler.
+fn thinking_overlay_parts(
+    harness: Arc<AgentHarness>,
+    overlay_stack: Rc<OverlayStack>,
+    model: flown_ai::Model,
+    levels: Vec<ThinkingLevel>,
+) -> ModelOverlayParts {
+    let selected = create_signal(0usize);
+    let levels = Rc::new(levels);
+    let model = Rc::new(model);
+
+    let on_key: Rc<dyn Fn(KeyEvent) -> bool> = Rc::new({
+        let harness = Arc::clone(&harness);
+        let overlay_stack = Rc::clone(&overlay_stack);
+        let levels = Rc::clone(&levels);
+        let model = Rc::clone(&model);
+        move |key: KeyEvent| -> bool {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                overlay_stack.pop();
+                return true;
             }
-            Some(PickerRow::Thinking(t)) => *t == initial_thinking,
-            None => false,
-        };
-        let text = Node::new_text();
+            let max = levels.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Down => {
+                    selected.set((selected.get() + 1).min(max));
+                    true
+                }
+                KeyCode::Up => {
+                    selected.set(selected.get().saturating_sub(1));
+                    true
+                }
+                KeyCode::Esc => {
+                    // Drop just this layer; the model picker beneath is still
+                    // on the stack and takes back the keys.
+                    overlay_stack.pop();
+                    true
+                }
+                KeyCode::Enter => {
+                    let level = levels.get(selected.get()).cloned();
+                    apply_model(&harness, &overlay_stack, &model, level);
+                    true
+                }
+                _ => false,
+            }
+        }
+    });
+
+    let content: Rc<dyn Fn() -> View> = Rc::new({
+        let selected = *selected;
+        let levels = Rc::clone(&levels);
+        move || thinking_overlay_view(selected, &levels)
+    });
+
+    ModelOverlayParts { content, on_key }
+}
+
+fn model_overlay_view(
+    filtered: ReadSignal<Vec<PickerRow>>,
+    selected: ReadSignal<usize>,
+    query: ReadSignal<String>,
+    initial_model: flown_ai::Model,
+) -> View {
+    // The filtered rows, memoized over the query. Reading it inside the view
+    // re-renders only when the query changes.
+    let sections = create_memo(move || {
+        let filtered = filtered.get_clone();
+        build_sections(&filtered)
+    });
+
+    let cell_rows = filtered;
+    let initial_model_for_cell = initial_model.clone();
+    let cell_factory: CellFactory = Rc::new(move |ctx: &CellContext| {
+        // Resolve the selected key back to its model for the "current" marker.
+        let model = cell_rows.get_clone().iter().find_map(|r| {
+            (format!("{}/{}", r.provider(), r.model.id) == ctx.key).then(|| r.model.clone())
+        });
+        let is_current = model
+            .as_ref()
+            .map(|m| {
+                m.id == initial_model_for_cell.id && m.provider == initial_model_for_cell.provider
+            })
+            .unwrap_or(false);
+        // Selection marker shows for the highlighted (▶) row; the
+        // current/active model is marked with ◆ so it stays distinguishable
+        // even when it is also the selected row.
         let prefix = if ctx.selected {
             "▶ "
         } else if is_current {
-            "● "
+            "◆ "
         } else {
             "  "
         };
-        let label = match &row {
-            Some(r) => row_label(r),
-            None => ctx.key.to_string(),
-        };
-        text.set_content(format!("{prefix}{label}"));
-        text.set_color(if ctx.selected {
+        let color = if ctx.selected {
             Color::Yellow
         } else if is_current {
             Color::Green
         } else {
             Color::White
-        });
-        text
+        };
+        View::from(
+            tags::p()
+                .color(color)
+                .children(format!("{prefix}{}", ctx.label)),
+        )
     });
 
-    let mut props = TableViewProps::new(sections_signal, cell_factory, selected_read);
-    props.max_visible = 16;
-    let table = TableView::new(props);
-    root.add_child(table);
-    root
+    let search = View::from_dynamic(move || {
+        let query_display = query.get_clone();
+        // A single bordered input field: a one-cell magnifier glyph sits
+        // flush against the live query, with a trailing caret. No extra
+        // padding around the glyph keeps it one column wide. The field is
+        // pinned to one content row and the full overlay width so it reads
+        // as a search bar rather than a wrapped label.
+        tags::div()
+            .width(iodilos::Size::Percent(100.0))
+            // Border (1) + one text row (1) + border (1) = 3 rows: a single
+            // search bar line, full overlay width, that does not grow/shrink.
+            .height(iodilos::Size::Length(3))
+            .flex_shrink(0.0)
+            .border_style(BorderStyle::Round)
+            .border_color(Color::DarkGrey)
+            .flex_direction(FlexDirection::Row)
+            .children((
+                tags::span().color(Color::Cyan).children("🔍"),
+                tags::span()
+                    .color(Color::White)
+                    .children(format!(" {query_display}")),
+                tags::span().color(Color::DarkGrey).children("_"),
+            ))
+    });
+
+    let list = tags::div()
+        .flex_direction(FlexDirection::Column)
+        .flex_grow(1.0_f32)
+        .children(table_view(TableViewProps {
+            sections,
+            selected,
+            // The overlay is inset 1/8 (≈3/4 of the screen), so a tall
+            // terminal comfortably holds the full provider+model list.
+            // Anything beyond the window scrolls via Up/Down.
+            max_visible: 32,
+            cell_factory,
+        }));
+
+    View::from(
+        tags::div()
+            .flex_direction(FlexDirection::Column)
+            .flex_grow(1.0_f32)
+            .padding(1)
+            .children((search, list)),
+    )
 }
 
-/// Apply a selection: set the model/thinking level on the (tokio) harness, then
-/// close the overlay. The harness's async setter runs on tokio; we spawn it.
-fn apply_row(harness: &Arc<AgentHarness>, overlay: &Rc<OverlayStack>, row: &PickerRow) {
-    match row {
-        PickerRow::Model { model, .. } => {
-            let h = Arc::clone(harness);
-            let model = model.clone();
-            tokio::spawn(async move {
-                h.set_model(model).await;
-            });
-            overlay.pop();
+/// Render the thinking-intensity overlay body as a single-section table — the
+/// same vertical list component the model picker uses, so it looks and behaves
+/// identically (one level per row, ▶ arrow + color on the selected row, Up/Down
+/// to move). The levels come straight from the model's supported set (e.g.
+/// `off` … `xhigh`).
+fn thinking_overlay_view(selected: ReadSignal<usize>, levels: &[ThinkingLevel]) -> View {
+    let rows: Vec<TableRow> = levels
+        .iter()
+        .map(|level| {
+            TableRow::new(
+                format!("{:?}", level).to_lowercase(),
+                format!("{:?}", level).to_lowercase(),
+            )
+        })
+        .collect();
+    // A memo gives the `ReadSignal` `TableViewProps.sections` expects; the
+    // section list is static, so the memo never recomputes.
+    let sections = create_memo(move || {
+        vec![TableSection {
+            title: Some("thinking intensity".to_string()),
+            rows: rows.clone(),
+        }]
+    });
+
+    let cell_factory: CellFactory = Rc::new(move |ctx: &CellContext| {
+        let prefix = if ctx.selected { "▶ " } else { "  " };
+        let color = if ctx.selected {
+            Color::Yellow
+        } else {
+            Color::White
+        };
+        View::from(
+            tags::p()
+                .color(color)
+                .children(format!("{prefix}{}", ctx.label)),
+        )
+    });
+
+    View::from(
+        tags::div()
+            .flex_direction(FlexDirection::Column)
+            .flex_grow(1.0_f32)
+            .padding(1)
+            .children(table_view(TableViewProps {
+                sections,
+                selected,
+                max_visible: 16,
+                cell_factory,
+            })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_all_rows_is_grouped_and_sorted() {
+        let rows = build_all_rows();
+        // Every registry provider contributes at least one model in the test
+        // environment (the built-in generated table is non-empty).
+        assert!(!rows.is_empty());
+        // Sorted by (provider, id): adjacent same-provider rows are id-sorted.
+        for window in rows.windows(2) {
+            let a = &window[0];
+            let b = &window[1];
+            let ord = a
+                .provider()
+                .cmp(&b.provider())
+                .then_with(|| a.model.id.cmp(&b.model.id));
+            assert!(
+                ord != std::cmp::Ordering::Greater,
+                "rows not sorted: {} > {}",
+                a.provider(),
+                b.provider()
+            );
         }
-        PickerRow::Thinking(level) => {
-            let h = Arc::clone(harness);
-            let level = level.clone();
-            tokio::spawn(async move {
-                h.set_thinking_level(level).await;
-            });
-            overlay.pop();
+    }
+
+    #[test]
+    fn configured_rows_only_include_configured_providers() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "deepseek".to_string(),
+            crate::config::ProviderConfig {
+                provider_type: "deepseek".to_string(),
+                key: "test".to_string(),
+            },
+        );
+
+        let rows = build_configured_rows(&config);
+
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.provider() == "deepseek"));
+    }
+
+    #[test]
+    fn configured_rows_are_empty_without_configured_providers() {
+        let config = Config::default();
+
+        let rows = build_configured_rows(&config);
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn filter_rows_matches_id_name_or_provider() {
+        let rows = build_all_rows();
+        // Filter by a fragment that appears in some model id/name/provider.
+        let any_id = rows.first().map(|r| r.model.id.clone()).unwrap_or_default();
+        let lower = any_id.to_lowercase();
+        let filtered = filter_rows(&rows, &lower);
+        assert!(
+            filtered.iter().any(|r| r.model.id == any_id),
+            "filtering by an existing id should keep that row"
+        );
+    }
+
+    #[test]
+    fn empty_query_keeps_all_rows() {
+        let rows = build_all_rows();
+        assert_eq!(filter_rows(&rows, "").len(), rows.len());
+        assert_eq!(filter_rows(&rows, "   ").len(), rows.len());
+    }
+
+    #[test]
+    fn build_sections_groups_by_provider() {
+        let rows = build_all_rows();
+        let filtered: Vec<PickerRow> = rows.iter().take(5).cloned().collect();
+        let sections = build_sections(&filtered);
+        // Section titles are unique provider names, in first-seen order.
+        let mut titles = sections.iter().filter_map(|s| s.title.as_deref());
+        let first = titles.next();
+        assert!(first.is_some());
+        // No duplicate titles.
+        let mut seen = std::collections::HashSet::new();
+        for s in &sections {
+            if let Some(t) = &s.title {
+                assert!(seen.insert(t.clone()), "duplicate section title {t}");
+            }
         }
+    }
+
+    #[test]
+    fn printable_char_filters_out_control_combos() {
+        let mk = |code, mods| KeyEvent::new(code, mods);
+        assert_eq!(
+            printable_char(&mk(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        assert_eq!(
+            printable_char(&mk(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            printable_char(&mk(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
     }
 }
