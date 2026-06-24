@@ -1,9 +1,10 @@
 //! `OverlayStack` — the stack of active floating overlays (0..N).
 //!
 //! Provided via iodilos context. App renders the main layout plus, when one or
-//! more overlays are active, a nested stack of `OverlayBox`es over it — each
-//! later overlay paints above the previous, so a smaller picker can float over
-//! a larger one (e.g. the thinking-intensity picker over the `/model` picker).
+//! more overlays are active, a nested stack of absolutely-positioned boxes over
+//! it — each later overlay paints above the previous, so a smaller picker can
+//! float over a larger one (e.g. the thinking-intensity picker over the
+//! `/model` picker).
 //! Pushing appends a new top layer; popping runs that layer's optional
 //! `on_close` teardown first. `pop_all` clears the whole stack (used when a
 //! nested flow confirms and wants to return straight to the original view).
@@ -20,6 +21,42 @@ use std::rc::Rc;
 
 use crossterm::event::KeyEvent;
 use iodilos::prelude::*;
+
+/// How an overlay's absolutely-positioned box is inset from the screen edges.
+///
+/// `FullBleed` runs edge-to-edge; `Inset { ratio }` pulls each side in by
+/// `ratio` of the available dimension (clamped so opposite insets never
+/// overlap). This is an app-level concept — overlays are a flown concern, not
+/// an iodilos primitive — so the geometry lives here next to the stack that
+/// consumes it, not in the iodilos component tree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OverlayGeometry {
+    FullBleed,
+    Inset { ratio: f32 },
+}
+
+impl OverlayGeometry {
+    /// Translate this geometry into the uniform `Inset` applied to all four
+    /// sides of the absolutely-positioned overlay box.
+    pub fn inset(self) -> Inset {
+        match self {
+            OverlayGeometry::FullBleed => Inset::Length(0),
+            OverlayGeometry::Inset { ratio } => {
+                Inset::Percent((ratio * 100.0).clamp(0.0, 49.0))
+            }
+        }
+    }
+
+    /// The chrome this geometry wears: a full-bleed overlay has no border
+    /// (it fills the screen), an inset overlay gets a rounded cyan frame so
+    /// the floating region reads as a distinct surface.
+    pub fn border(self) -> (BorderStyle, Color) {
+        match self {
+            OverlayGeometry::FullBleed => (BorderStyle::None, Color::Reset),
+            OverlayGeometry::Inset { .. } => (BorderStyle::Round, Color::Cyan),
+        }
+    }
+}
 
 /// One active overlay. `content` is a factory because the node must be built
 /// inside App's render effect (the mount owner) — not in the `spawn_local`

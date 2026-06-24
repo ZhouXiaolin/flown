@@ -946,7 +946,7 @@ impl RuntimeControl {
             });
             let content_state = Rc::clone(&fork_state);
             let overlay = crate::tui::overlay_stack::ActiveOverlay {
-                geometry: iodilos::OverlayGeometry::FullBleed,
+                geometry: crate::tui::overlay_stack::OverlayGeometry::FullBleed,
                 dismissible: true,
                 route_app_keys: false,
                 content: Rc::new(move || {
@@ -1003,7 +1003,7 @@ impl RuntimeControl {
             return;
         }
         let overlay = crate::tui::overlay_stack::ActiveOverlay {
-            geometry: iodilos::OverlayGeometry::Inset { ratio: 0.125 },
+            geometry: crate::tui::overlay_stack::OverlayGeometry::Inset { ratio: 0.125 },
             dismissible: true,
             route_app_keys: false,
             content: content_factory,
@@ -1620,7 +1620,7 @@ mod tests {
             let closed = Rc::new(std::cell::Cell::new(false));
             let closed_for_overlay = Rc::clone(&closed);
             overlay_stack.push(crate::tui::overlay_stack::ActiveOverlay {
-                geometry: iodilos::OverlayGeometry::FullBleed,
+                geometry: crate::tui::overlay_stack::OverlayGeometry::FullBleed,
                 dismissible: true,
                 route_app_keys: false,
                 content: Rc::new(View::new),

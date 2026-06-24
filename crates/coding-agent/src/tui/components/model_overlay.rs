@@ -304,7 +304,7 @@ fn push_thinking_overlay(
     let overlay = crate::tui::overlay_stack::ActiveOverlay {
         // Narrower than the model picker (1/3 inset each side) so it floats
         // centered above it.
-        geometry: iodilos::OverlayGeometry::Inset { ratio: 0.33 },
+        geometry: crate::tui::overlay_stack::OverlayGeometry::Inset { ratio: 0.33 },
         dismissible: true,
         route_app_keys: false,
         content: parts.content,

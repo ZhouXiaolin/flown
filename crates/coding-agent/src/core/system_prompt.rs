@@ -224,6 +224,12 @@ fn format_guidelines(selected_tools: &[String], prompt_guidelines: &[String]) ->
 
     add("Be concise in your responses".to_string());
     add("Show file paths clearly when working with files".to_string());
+    add(
+        "For inline math use `$...$`; for display math use `$$...$$`. \
+         Never use raw LaTeX delimiters like `\\[...\\]` or `\\(...\\)` — \
+         the terminal renderer only recognizes the dollar form."
+            .to_string(),
+    );
 
     guidelines
         .into_iter()

@@ -62,7 +62,7 @@ pub fn parse_btw_args(args: &str) -> Option<String> {
 /// Runtime handler for `/btw`.
 ///
 /// All btw-specific policy lives here. The TUI runtime only sees a generic
-/// fork request: open an agent-backed overlay (full-bleed OverlayBox) that
+/// fork request: open an agent-backed full-bleed overlay that
 /// forks the current history, then submit the optional prompt to the fork.
 /// `fork_conversation` is single-instance (the OverlayStack rejects a second
 /// overlay while one is active).

@@ -110,17 +110,20 @@ fn overlay_layer(overlay: Rc<crate::tui::overlay_stack::OverlayStack>) -> View {
             layers
                 .iter()
                 .map(|layer| {
-                    let (border_style, border_color) = match layer.geometry {
-                        OverlayGeometry::FullBleed => (BorderStyle::None, Color::Reset),
-                        OverlayGeometry::Inset { .. } => (BorderStyle::Round, Color::Cyan),
-                    };
-                    overlay_box(OverlayBoxProps {
-                        geometry: layer.geometry,
-                        background: Color::Reset,
-                        border_style,
-                        border_color,
-                        content: (layer.content)(),
-                    })
+                    let inset = layer.geometry.inset();
+                    let (border_style, border_color) = layer.geometry.border();
+                    View::from(
+                        tags::div()
+                            .position(Position::Absolute)
+                            .top(inset)
+                            .right(inset)
+                            .bottom(inset)
+                            .left(inset)
+                            .background_color(Color::Reset)
+                            .border_style(border_style)
+                            .border_color(border_color)
+                            .children((layer.content)()),
+                    )
                 })
                 .collect()
         });
