@@ -1,11 +1,16 @@
 //! MessageBlock — renders a transcript entry into iodilos text rows.
 
-use iodilos::prelude::{Color, Modifier, TextRow, TextSegment};
+use iodilos::prelude::{Color, Modifier};
 use iodilos::text::SpanStyle;
 use iodilos_md::{MarkdownTheme, StreamingParser, markdown_surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::state::{ConversationEntry, EntryKind};
+
+/// One rendered terminal row: a list of `(text, style)` runs. This is the shape
+/// `iodilos::producer::Lines` consumes (each entry is one terminal row, the
+/// runs painted left-to-right).
+pub type Row = Vec<(String, SpanStyle)>;
 
 const THINKING_BLOCK_MAX_ROWS: usize = 5;
 const THINKING_BLOCK_MIN_WIDTH: usize = 8;
@@ -27,7 +32,7 @@ pub fn render_entry(
     entry: &ConversationEntry,
     render_width: usize,
     parser: Option<&mut StreamingParser>,
-) -> Vec<TextRow> {
+) -> Vec<Row> {
     let width = render_width.max(1);
     match &entry.kind {
         EntryKind::User(text) => render_plain(
@@ -39,18 +44,28 @@ pub fn render_entry(
             },
             text,
         ),
-        EntryKind::Assistant(text) => render_markdown(
-            "● ",
-            Color::Rgb {
-                r: 118,
-                g: 205,
-                b: 255,
-            },
-            text,
-            width,
-            parser,
-        ),
-        EntryKind::Thinking(text) => render_thinking_block(text, width),
+        EntryKind::Assistant(body) => {
+            // Snapshot the streaming body via the per-item Signal. The
+            // streaming-list path (forthcoming) reads this Signal inside its
+            // own reactive region, but the current cached-renderer path is
+            // synchronous and only needs the latest text.
+            let text = body.get_clone();
+            render_markdown(
+                "● ",
+                Color::Rgb {
+                    r: 118,
+                    g: 205,
+                    b: 255,
+                },
+                &text,
+                width,
+                parser,
+            )
+        }
+        EntryKind::Thinking(body) => {
+            let text = body.get_clone();
+            render_thinking_block(&text, width)
+        }
         EntryKind::Tool { name, text } => {
             render_tool(name, text, width, parser)
         }
@@ -83,7 +98,7 @@ fn render_tool(
     text: &str,
     render_width: usize,
     parser: Option<&mut StreamingParser>,
-) -> Vec<TextRow> {
+) -> Vec<Row> {
     match name {
         "write" => render_write_tool(text, render_width, parser),
         "edit" => render_edit_tool(text, render_width),
@@ -102,7 +117,7 @@ const BASH_RESULT_MAX_LINES: usize = 5;
 /// truncating with "..." when it overflows the available width. The command's
 /// own output arrives separately as a `ToolResult` entry and is rendered by
 /// `render_bash_result`.
-fn render_bash_command(text: &str, render_width: usize) -> Vec<TextRow> {
+fn render_bash_command(text: &str, render_width: usize) -> Vec<Row> {
     let (dot, color) = tool_dot("bash");
     let style = fg(color);
     let first_line = text.lines().next().unwrap_or(text);
@@ -110,16 +125,16 @@ fn render_bash_command(text: &str, render_width: usize) -> Vec<TextRow> {
     let dot_width = UnicodeWidthStr::width(dot);
     let budget = render_width.saturating_sub(dot_width).max(1);
     let truncated = truncate_with_ellipsis(first_line, budget);
-    vec![TextRow::from_segments(vec![
-        TextSegment::styled(dot, style),
-        TextSegment::styled(truncated, style),
-    ])]
+    vec![vec![
+        (dot.to_string(), style),
+        (truncated, style),
+    ]]
 }
 
 /// Render a bash result body: each line indented two spaces, italic, light
 /// grey, capped at [`BASH_RESULT_MAX_LINES`] lines with a trailing "..." row
 /// when truncated.
-fn render_bash_result(output: &str, render_width: usize) -> Vec<TextRow> {
+fn render_bash_result(output: &str, render_width: usize) -> Vec<Row> {
     let style = SpanStyle {
         fg: Some(Color::Rgb { r: 170, g: 170, b: 170 }),
         add_modifier: Modifier::ITALIC,
@@ -134,19 +149,19 @@ fn render_bash_result(output: &str, render_width: usize) -> Vec<TextRow> {
         match lines.next() {
             Some(line) => {
                 let truncated = truncate_with_ellipsis(line, budget);
-                rows.push(TextRow::from_segments(vec![
-                    TextSegment::styled(indent.to_string(), style),
-                    TextSegment::styled(truncated, style),
-                ]));
+                rows.push(vec![
+                    (indent.to_string(), style),
+                    (truncated, style),
+                ]);
             }
             None => return rows,
         }
     }
     if lines.next().is_some() {
-        rows.push(TextRow::from_segments(vec![
-            TextSegment::styled(indent.to_string(), style),
-            TextSegment::styled("...".to_string(), style),
-        ]));
+        rows.push(vec![
+            (indent.to_string(), style),
+            ("...".to_string(), style),
+        ]);
     }
     rows
 }
@@ -188,17 +203,17 @@ fn render_write_tool(
     text: &str,
     render_width: usize,
     parser: Option<&mut StreamingParser>,
-) -> Vec<TextRow> {
+) -> Vec<Row> {
     let (dot, color) = tool_dot("write");
     let style = fg(color);
     let mut rows = Vec::new();
 
     // First line: "● Write path"
     let first_line = text.lines().next().unwrap_or(text);
-    rows.push(TextRow::from_segments(vec![
-        TextSegment::styled(dot, style),
-        TextSegment::styled(first_line.to_string(), style),
-    ]));
+    rows.push(vec![
+        (dot.to_string(), style),
+        (first_line.to_string(), style),
+    ]);
 
     // Rest: render as markdown (the code content)
     let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
@@ -208,7 +223,7 @@ fn render_write_tool(
             Some(p) => p.feed_to_surface(&body, render_width, &theme),
             None => markdown_surface(&body, render_width, &theme),
         };
-        for row in surface.rows() {
+        for row in &surface.rows {
             rows.push(row.clone());
         }
     }
@@ -217,17 +232,17 @@ fn render_write_tool(
 }
 
 /// Render an edit tool call: colored dot + path, then diff view with line numbers
-fn render_edit_tool(text: &str, render_width: usize) -> Vec<TextRow> {
+fn render_edit_tool(text: &str, render_width: usize) -> Vec<Row> {
     let (dot, color) = tool_dot("edit");
     let style = fg(color);
     let mut rows = Vec::new();
 
     // First line: "● Edit path(+N -N)"
     let first_line = text.lines().next().unwrap_or(text);
-    rows.push(TextRow::from_segments(vec![
-        TextSegment::styled(dot, style),
-        TextSegment::styled(first_line.to_string(), style),
-    ]));
+    rows.push(vec![
+        (dot.to_string(), style),
+        (first_line.to_string(), style),
+    ]);
 
     // Parse and render diff content
     let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
@@ -239,7 +254,7 @@ fn render_edit_tool(text: &str, render_width: usize) -> Vec<TextRow> {
 }
 
 /// Render diff content with line numbers and colored additions/deletions
-fn render_diff_view(diff_text: &str, render_width: usize, rows: &mut Vec<TextRow>) {
+fn render_diff_view(diff_text: &str, render_width: usize, rows: &mut Vec<Row>) {
     let line_num_width = 4; // Width for line numbers
     let separator = " │ ";
     let separator_width = separator.len();
@@ -262,13 +277,13 @@ fn render_diff_view(diff_text: &str, render_width: usize, rows: &mut Vec<TextRow
             for (i, wrap_line) in wrapped.iter().enumerate() {
                 let old_str = if i == 0 { "   ".to_string() } else { "   ".to_string() };
                 let new_str = format!("{:>width$}", line_num_new, width = line_num_width);
-                rows.push(TextRow::from_segments(vec![
-                    TextSegment::styled(old_str, fg(LINE_NUM_COLOR)),
-                    TextSegment::styled(new_str, fg(DIFF_ADD_COLOR)),
-                    TextSegment::styled(separator, fg(DIFF_META_COLOR)),
-                    TextSegment::styled("+".to_string(), fg(DIFF_ADD_COLOR)),
-                    TextSegment::styled(wrap_line.clone(), fg(DIFF_ADD_COLOR)),
-                ]));
+                rows.push(vec![
+                    (old_str, fg(LINE_NUM_COLOR)),
+                    (new_str, fg(DIFF_ADD_COLOR)),
+                    (separator.to_string(), fg(DIFF_META_COLOR)),
+                    ("+".to_string(), fg(DIFF_ADD_COLOR)),
+                    (wrap_line.clone(), fg(DIFF_ADD_COLOR)),
+                ]);
             }
         } else if line.starts_with('-') {
             // Deletion
@@ -278,13 +293,13 @@ fn render_diff_view(diff_text: &str, render_width: usize, rows: &mut Vec<TextRow
             for (i, wrap_line) in wrapped.iter().enumerate() {
                 let old_str = format!("{:>width$}", line_num_old, width = line_num_width);
                 let new_str = if i == 0 { "   ".to_string() } else { "   ".to_string() };
-                rows.push(TextRow::from_segments(vec![
-                    TextSegment::styled(old_str, fg(DIFF_REMOVE_COLOR)),
-                    TextSegment::styled(new_str, fg(LINE_NUM_COLOR)),
-                    TextSegment::styled(separator, fg(DIFF_META_COLOR)),
-                    TextSegment::styled("-".to_string(), fg(DIFF_REMOVE_COLOR)),
-                    TextSegment::styled(wrap_line.clone(), fg(DIFF_REMOVE_COLOR)),
-                ]));
+                rows.push(vec![
+                    (old_str, fg(DIFF_REMOVE_COLOR)),
+                    (new_str, fg(LINE_NUM_COLOR)),
+                    (separator.to_string(), fg(DIFF_META_COLOR)),
+                    ("-".to_string(), fg(DIFF_REMOVE_COLOR)),
+                    (wrap_line.clone(), fg(DIFF_REMOVE_COLOR)),
+                ]);
             }
         } else if line.starts_with(' ') {
             // Context line
@@ -295,13 +310,13 @@ fn render_diff_view(diff_text: &str, render_width: usize, rows: &mut Vec<TextRow
             for wrap_line in wrapped {
                 let old_str = format!("{:>width$}", line_num_old, width = line_num_width);
                 let new_str = format!("{:>width$}", line_num_new, width = line_num_width);
-                rows.push(TextRow::from_segments(vec![
-                    TextSegment::styled(old_str, fg(LINE_NUM_COLOR)),
-                    TextSegment::styled(new_str, fg(LINE_NUM_COLOR)),
-                    TextSegment::styled(separator, fg(DIFF_META_COLOR)),
-                    TextSegment::styled(" ".to_string(), fg(Color::DarkGrey)),
-                    TextSegment::styled(wrap_line, fg(Color::DarkGrey)),
-                ]));
+                rows.push(vec![
+                    (old_str, fg(LINE_NUM_COLOR)),
+                    (new_str, fg(LINE_NUM_COLOR)),
+                    (separator.to_string(), fg(DIFF_META_COLOR)),
+                    (" ".to_string(), fg(Color::DarkGrey)),
+                    (wrap_line, fg(Color::DarkGrey)),
+                ]);
             }
         }
         // Skip other lines (like diff headers)
@@ -335,47 +350,47 @@ fn wrap_line(text: &str, width: usize) -> (Vec<String>, usize) {
 }
 
 /// Render a generic tool call (read, bash, etc.)
-fn render_generic_tool(name: &str, text: &str) -> Vec<TextRow> {
+fn render_generic_tool(name: &str, text: &str) -> Vec<Row> {
     let (dot, color) = tool_dot(name);
     let style = fg(color);
     let mut rows = Vec::new();
 
     for (i, line) in text.lines().enumerate() {
         if i == 0 {
-            rows.push(TextRow::from_segments(vec![
-                TextSegment::styled(dot, style),
-                TextSegment::styled(line.to_string(), style),
-            ]));
+            rows.push(vec![
+                (dot.to_string(), style),
+                (line.to_string(), style),
+            ]);
         } else {
-            rows.push(TextRow::from(TextSegment::styled(line.to_string(), style)));
+            rows.push(vec![(line.to_string(), style)]);
         }
     }
     if rows.is_empty() {
-        rows.push(TextRow::from(TextSegment::styled(dot, style)));
+        rows.push(vec![(dot.to_string(), style)]);
     }
     rows
 }
 
-fn render_plain(prefix: &'static str, color: Color, body: &str) -> Vec<TextRow> {
+fn render_plain(prefix: &'static str, color: Color, body: &str) -> Vec<Row> {
     let style = fg(color);
     let mut rows = Vec::new();
     for (i, line) in body.lines().enumerate() {
         if i == 0 {
-            rows.push(TextRow::from_segments(vec![
-                TextSegment::styled(prefix, style),
-                TextSegment::styled(line.to_string(), style),
-            ]));
+            rows.push(vec![
+                (prefix.to_string(), style),
+                (line.to_string(), style),
+            ]);
         } else {
-            rows.push(TextRow::from(TextSegment::styled(line.to_string(), style)));
+            rows.push(vec![(line.to_string(), style)]);
         }
     }
     if rows.is_empty() {
-        rows.push(TextRow::from(TextSegment::styled(prefix, style)));
+        rows.push(vec![(prefix.to_string(), style)]);
     }
     rows
 }
 
-fn render_thinking_block(body: &str, render_width: usize) -> Vec<TextRow> {
+fn render_thinking_block(body: &str, render_width: usize) -> Vec<Row> {
     if render_width < THINKING_BLOCK_MIN_WIDTH {
         return render_plain("thinking ", Color::DarkGrey, body);
     }
@@ -393,20 +408,20 @@ fn render_thinking_block(body: &str, render_width: usize) -> Vec<TextRow> {
     let mut rows = Vec::with_capacity(visible.len() + 2);
     rows.push(thinking_top_row(block_width, border, label));
     for line in visible {
-        rows.push(TextRow::from_segments(vec![
-            TextSegment::styled("│ ", border),
-            TextSegment::styled(pad_to_width(line, inner_width), text),
-            TextSegment::styled(" │", border),
-        ]));
+        rows.push(vec![
+            ("│ ".to_string(), border),
+            (pad_to_width(line, inner_width), text),
+            (" │".to_string(), border),
+        ]);
     }
-    rows.push(TextRow::from(TextSegment::styled(
+    rows.push(vec![(
         format!("╰{}╯", "─".repeat(block_width.saturating_sub(2))),
         border,
-    )));
+    )]);
     rows
 }
 
-fn thinking_top_row(width: usize, border: SpanStyle, label: SpanStyle) -> TextRow {
+fn thinking_top_row(width: usize, border: SpanStyle, label: SpanStyle) -> Row {
     let title = " thinking ";
     let prefix = "╭─";
     let suffix = "╮";
@@ -416,18 +431,18 @@ fn thinking_top_row(width: usize, border: SpanStyle, label: SpanStyle) -> TextRo
 
     if width >= prefix_width + title_width + suffix_width {
         let fill = width - prefix_width - title_width - suffix_width;
-        return TextRow::from_segments(vec![
-            TextSegment::styled(prefix, border),
-            TextSegment::styled(title, label),
-            TextSegment::styled("─".repeat(fill), border),
-            TextSegment::styled(suffix, border),
-        ]);
+        return vec![
+            (prefix.to_string(), border),
+            (title.to_string(), label),
+            ("─".repeat(fill), border),
+            (suffix.to_string(), border),
+        ];
     }
 
-    TextRow::from(TextSegment::styled(
+    vec![(
         format!("╭{}╮", "─".repeat(width.saturating_sub(2))),
         border,
-    ))
+    )]
 }
 
 fn wrap_plain_text(body: &str, width: usize) -> Vec<String> {
@@ -478,19 +493,17 @@ fn render_markdown(
     body: &str,
     render_width: usize,
     parser: Option<&mut StreamingParser>,
-) -> Vec<TextRow> {
+) -> Vec<Row> {
     let theme = MarkdownTheme::default();
     let surface = match parser {
         Some(parser) => parser.feed_to_surface(body, render_width, &theme),
         None => markdown_surface(body, render_width, &theme),
     };
-    let mut rows = surface.rows().to_vec();
+    let mut rows = surface.rows.clone();
     if rows.is_empty() {
-        return vec![TextRow::from(TextSegment::styled(prefix, fg(color)))];
+        return vec![vec![(prefix.to_string(), fg(color))]];
     }
-    rows[0]
-        .segments
-        .insert(0, TextSegment::styled(prefix, fg(color)));
+    rows[0].insert(0, (prefix.to_string(), fg(color)));
     rows
 }
 
@@ -513,57 +526,70 @@ fn bold(color: Color) -> SpanStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iodilos::reactive::{Signal, create_root, create_signal};
 
     fn entry(kind: EntryKind) -> ConversationEntry {
-        ConversationEntry { kind }
+        ConversationEntry { id: 0, kind }
     }
 
-    fn row_text(row: &TextRow) -> String {
-        row.segments
-            .iter()
-            .map(|segment| segment.content.as_ref())
-            .collect()
+    /// Wrap a String body in a `Signal<String>` for the streaming `Assistant`
+    /// / `Thinking` kinds. Must be called from inside a `create_root` scope.
+    fn signal_of(text: &str) -> Signal<String> {
+        create_signal(text.to_string())
+    }
+
+    fn row_text(row: &Row) -> String {
+        row.iter().map(|(content, _)| content.as_str()).collect()
     }
 
     #[test]
     fn thinking_entry_renders_as_bounded_block() {
-        let rows = render_entry(
-            &entry(EntryKind::Thinking(
-                "line 1\nline 2\nline 3\nline 4\nline 5\nline 6".to_string(),
-            )),
-            24,
-            None,
-        );
+        let owner = create_root(|| {
+            let rows = render_entry(
+                &entry(EntryKind::Thinking(signal_of(
+                    "line 1\nline 2\nline 3\nline 4\nline 5\nline 6",
+                ))),
+                24,
+                None,
+            );
 
-        assert_eq!(rows.len(), 5);
-        assert!(row_text(&rows[0]).starts_with("╭─ thinking "));
-        assert!(row_text(&rows[1]).contains("line 4"));
-        assert!(row_text(&rows[2]).contains("line 5"));
-        assert!(row_text(&rows[3]).contains("line 6"));
-        assert!(row_text(&rows[4]).starts_with("╰"));
+            assert_eq!(rows.len(), 5);
+            assert!(row_text(&rows[0]).starts_with("╭─ thinking "));
+            assert!(row_text(&rows[1]).contains("line 4"));
+            assert!(row_text(&rows[2]).contains("line 5"));
+            assert!(row_text(&rows[3]).contains("line 6"));
+            assert!(row_text(&rows[4]).starts_with("╰"));
+        });
+        owner.dispose();
     }
 
     #[test]
     fn thinking_entry_wraps_plain_text_without_markdown() {
-        let rows = render_entry(
-            &entry(EntryKind::Thinking("# heading is plain".to_string())),
-            14,
-            None,
-        );
+        let owner = create_root(|| {
+            let rows = render_entry(
+                &entry(EntryKind::Thinking(signal_of("# heading is plain"))),
+                14,
+                None,
+            );
 
-        let body = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
-        assert!(body.contains("# heading"));
-        assert!(rows.len() <= THINKING_BLOCK_MAX_ROWS);
+            let body = rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+            assert!(body.contains("# heading"));
+            assert!(rows.len() <= THINKING_BLOCK_MAX_ROWS);
+        });
+        owner.dispose();
     }
 
     #[test]
     fn assistant_entry_uses_dot_prefix() {
-        let rows = render_entry(
-            &entry(EntryKind::Assistant("hello".to_string())),
-            40,
-            None,
-        );
-        assert!(row_text(&rows[0]).starts_with("● "));
+        let owner = create_root(|| {
+            let rows = render_entry(
+                &entry(EntryKind::Assistant(signal_of("hello"))),
+                40,
+                None,
+            );
+            assert!(row_text(&rows[0]).starts_with("● "));
+        });
+        owner.dispose();
     }
 
     #[test]
@@ -701,8 +727,8 @@ mod tests {
         // The body rows carry the italic modifier on their styled segment.
         for row in &rows {
             assert!(
-                row.segments.iter().any(|seg| {
-                    seg.style.add_modifier.contains(Modifier::ITALIC)
+                row.iter().any(|(_, style)| {
+                    style.add_modifier.contains(Modifier::ITALIC)
                 }),
                 "result row must have an italic segment: {:?}",
                 row_text(row)

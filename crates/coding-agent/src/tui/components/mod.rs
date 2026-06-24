@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod editor;
+pub mod entry_view;
 pub mod message_block;
 pub mod model_overlay;
 pub mod overlay_conversation;

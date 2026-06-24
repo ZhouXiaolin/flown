@@ -3,10 +3,9 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use iodilos::node::TuiNode;
 use iodilos::prelude::*;
 use iodilos_prompt::{
-    PromptTheme, StatusField, StatusLine as PromptStatusLine, render_prompt_to_surface,
+    PromptTheme, PromptView, StatusField, StatusLine as PromptStatusLine,
 };
 
 use crate::tui::editor;
@@ -65,8 +64,15 @@ fn input_editor_content(
     let popup_items = create_memo(move || {
         slash_popup_for_items.with(|popup| editor::completion_items(popup.as_ref()))
     });
-    let popup_selected = create_memo(move || {
-        slash_popup_for_selected.with(|popup| popup.as_ref().map_or(0, |p| p.selected))
+    // `CompletionMenuProps.selected` is keyed by the candidate's label
+    // (`Option<String>`), not by a flat index, so the highlight stays glued to
+    // its item as the list filters. Translate the popup's flat `selected`
+    // index into the corresponding label here.
+    let popup_selected: ReadSignal<Option<String>> = create_memo(move || {
+        let items = popup_items.get_clone();
+        let idx = slash_popup_for_selected
+            .with(|popup| popup.as_ref().map_or(0, |p| p.selected));
+        items.get(idx).map(|item| item.label.clone())
     });
     let menu = completion_menu(CompletionMenuProps {
         items: popup_items,
@@ -84,19 +90,27 @@ fn prompt_view_for_state(
     term_size: TerminalSize,
 ) -> View {
     let theme = PromptTheme::default();
+    // Render the prompt via the iodilos-prompt `PromptView` producer — the same
+    // self-drawing leaf the `PromptBox` component uses internally. Unlike the
+    // framework border model (which can't place input on the rounded bottom
+    // edge — `Edges::BOTTOM` is exclusive), `PromptView` draws the whole frame
+    // itself: statusline on the top `╭─ … ─╮`, input text sitting directly on
+    // the rounded bottom `╰─ … ─╯`, with vertical `│ … │` sides per wrapped
+    // line. Input re-wraps at the layout width inside `measure`/`render`, so we
+    // still rebuild on a width change to let the producer re-measure.
     View::from_dynamic(move || {
-        let width = term_size.cols.get().max(20) as usize;
+        term_size.cols.get();
         let input = state.input.get_clone();
         let status = state.status.get_clone();
         let statusline = prompt_status_line(&status, tail_label.as_deref());
-        let surface = render_prompt_to_surface(
+        View::leaf(Box::new(PromptView::new(
+            &statusline,
             &input.text(),
             input.cursor_char(),
-            &statusline,
-            width,
+            // No blink wiring: the caret is always drawn.
+            true,
             &theme,
-        );
-        View::from_node(TuiNode::create_text_surface_node(surface, 0))
+        )))
     })
 }
 

@@ -826,7 +826,7 @@ mod tests {
             let EntryKind::Thinking(body) = &entries[0].kind else {
                 panic!("expected thinking entry");
             };
-            assert_eq!(body, "plan next");
+            assert_eq!(body.get_clone(), "plan next");
             assert!(accumulated_text.is_empty());
             assert!(!in_thinking);
         });

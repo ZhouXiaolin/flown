@@ -36,6 +36,15 @@ pub(crate) struct PickerRow {
     model: flown_ai::Model,
 }
 
+impl PartialEq for PickerRow {
+    /// Identity is the `provider/id` key — the only thing `Tabled`'s keyed
+    /// engine diffs on. `Model` itself has no `PartialEq`, but two rows with
+    /// the same key refer to the same model, so comparing keys is sufficient.
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
 impl PickerRow {
     fn provider(&self) -> String {
         self.model.provider.to_string()
@@ -47,6 +56,11 @@ impl PickerRow {
     }
     fn label(&self) -> String {
         self.model.id.clone()
+    }
+    /// Stable identity for this row across filter changes — the value `Tabled`
+    /// keys on and the value the `selected` signal carries.
+    fn key(&self) -> String {
+        format!("{}/{}", self.provider(), self.model.id)
     }
 }
 
@@ -93,28 +107,23 @@ pub(crate) fn filter_rows(rows: &[PickerRow], query: &str) -> Vec<PickerRow> {
 }
 
 /// Group filtered rows into `TableSection`s keyed by provider, preserving the
-/// sorted order from `build_all_rows`. Each row's key is `provider/id` so the
-/// cell factory can map a selected key back to its model.
-pub(crate) fn build_sections(filtered: &[PickerRow]) -> Vec<TableSection> {
-    let mut sections: Vec<TableSection> = Vec::new();
+/// sorted order from `build_all_rows`. Each row's identity (the `Tabled` key) is
+/// its `provider/id`, so a selected highlight stays glued to its model across
+/// filter changes.
+pub(crate) fn build_sections(filtered: &[PickerRow]) -> Vec<TableSection<PickerRow>> {
+    let mut sections: Vec<TableSection<PickerRow>> = Vec::new();
     let mut current_provider: Option<String> = None;
     for row in filtered {
         let provider = row.provider();
         if Some(&provider) != current_provider.as_ref() {
-            sections.push(TableSection {
-                title: Some(provider.clone()),
-                rows: Vec::new(),
-            });
+            sections.push(TableSection::new(Vec::new()).with_title(provider.clone()));
             current_provider = Some(provider);
         }
         let section = sections.last_mut().expect("section just pushed");
         // Only the model id is shown — the human name was previously appended as
         // a dim description, but that cluttered each row. The name still feeds
         // the search haystack so it remains findable by typing.
-        section.rows.push(TableRow::new(
-            format!("{}/{}", row.provider(), row.model.id),
-            row.label(),
-        ));
+        section.items.push(row.clone());
     }
     sections
 }
@@ -139,7 +148,11 @@ pub fn model_overlay_parts(
     let rows = Rc::new(build_configured_rows(&config));
 
     let query = create_signal(String::new());
-    let selected = create_signal(0usize);
+    // Navigation is index-based (Up/Down/Enter all reason about a flat index
+    // into the filtered list), so the internal selection state stays a `usize`.
+    // `Tabled` keys its selection by identity, though, so a derived memo
+    // (`selected_key`) resolves the index to its `provider/id` for the view.
+    let selected_idx = create_signal(0usize);
 
     // Filtered view of `rows`, memoized over the query. Reading it inside the
     // view re-renders only when the query changes.
@@ -148,6 +161,16 @@ pub fn model_overlay_parts(
     let filtered = create_memo(move || {
         let q = query_for_filter.get_clone();
         filter_rows(&rows_rc, &q)
+    });
+
+    // Resolve the flat selection index to the selected row's key, clamping to
+    // the (possibly just-shrunk) filtered list. `Tabled` consumes this.
+    let filtered_for_key = filtered;
+    let selected_idx_for_key = selected_idx;
+    let selected_key: ReadSignal<Option<String>> = create_memo(move || {
+        let rows = filtered_for_key.get_clone();
+        let idx = selected_idx_for_key.get();
+        rows.get(idx).map(|r| r.key())
     });
 
     let on_key: Rc<dyn Fn(KeyEvent) -> bool> = Rc::new({
@@ -164,7 +187,7 @@ pub fn model_overlay_parts(
             // Printable / editing keys drive the search query.
             if let Some(ch) = printable_char(&key) {
                 query.update(|q| q.push(ch));
-                selected.set(0);
+                selected_idx.set(0);
                 return true;
             }
             match key.code {
@@ -172,16 +195,16 @@ pub fn model_overlay_parts(
                     query.update(|q| {
                         q.pop();
                     });
-                    selected.set(0);
+                    selected_idx.set(0);
                     true
                 }
                 KeyCode::Down => {
                     let max = filtered.get_clone().len().saturating_sub(1);
-                    selected.set((selected.get() + 1).min(max));
+                    selected_idx.set((selected_idx.get() + 1).min(max));
                     true
                 }
                 KeyCode::Up => {
-                    selected.set(selected.get().saturating_sub(1));
+                    selected_idx.set(selected_idx.get().saturating_sub(1));
                     true
                 }
                 KeyCode::Esc => {
@@ -191,7 +214,7 @@ pub fn model_overlay_parts(
                 }
                 KeyCode::Enter => {
                     let filtered = filtered.get_clone();
-                    let idx = selected.get();
+                    let idx = selected_idx.get();
                     let Some(row) = filtered.get(idx) else {
                         return true;
                     };
@@ -224,7 +247,7 @@ pub fn model_overlay_parts(
     });
 
     let content: Rc<dyn Fn() -> View> = Rc::new({
-        let selected = *selected;
+        let selected = selected_key;
         let query = *query;
         let initial_model = initial_model.clone();
         move || model_overlay_view(filtered, selected, query, initial_model.clone())
@@ -298,9 +321,17 @@ fn thinking_overlay_parts(
     model: flown_ai::Model,
     levels: Vec<ThinkingLevel>,
 ) -> ModelOverlayParts {
-    let selected = create_signal(0usize);
+    // Navigation is index-based; the view receives a keyed selection memo.
+    let selected_idx = create_signal(0usize);
     let levels = Rc::new(levels);
     let model = Rc::new(model);
+
+    // Resolve the flat index to its `ThinkingLevel` so `Tabled` can key on it.
+    let levels_for_key = Rc::clone(&levels);
+    let selected_idx_for_key = selected_idx;
+    let selected_key: ReadSignal<Option<ThinkingLevel>> = create_memo(move || {
+        levels_for_key.get(selected_idx_for_key.get()).cloned()
+    });
 
     let on_key: Rc<dyn Fn(KeyEvent) -> bool> = Rc::new({
         let harness = Arc::clone(&harness);
@@ -315,11 +346,11 @@ fn thinking_overlay_parts(
             let max = levels.len().saturating_sub(1);
             match key.code {
                 KeyCode::Down => {
-                    selected.set((selected.get() + 1).min(max));
+                    selected_idx.set((selected_idx.get() + 1).min(max));
                     true
                 }
                 KeyCode::Up => {
-                    selected.set(selected.get().saturating_sub(1));
+                    selected_idx.set(selected_idx.get().saturating_sub(1));
                     true
                 }
                 KeyCode::Esc => {
@@ -329,7 +360,7 @@ fn thinking_overlay_parts(
                     true
                 }
                 KeyCode::Enter => {
-                    let level = levels.get(selected.get()).cloned();
+                    let level = levels.get(selected_idx.get()).cloned();
                     apply_model(&harness, &overlay_stack, &model, level);
                     true
                 }
@@ -339,7 +370,7 @@ fn thinking_overlay_parts(
     });
 
     let content: Rc<dyn Fn() -> View> = Rc::new({
-        let selected = *selected;
+        let selected = selected_key;
         let levels = Rc::clone(&levels);
         move || thinking_overlay_view(selected, &levels)
     });
@@ -349,7 +380,7 @@ fn thinking_overlay_parts(
 
 fn model_overlay_view(
     filtered: ReadSignal<Vec<PickerRow>>,
-    selected: ReadSignal<usize>,
+    selected: ReadSignal<Option<String>>,
     query: ReadSignal<String>,
     initial_model: flown_ai::Model,
 ) -> View {
@@ -360,42 +391,59 @@ fn model_overlay_view(
         build_sections(&filtered)
     });
 
-    let cell_rows = filtered;
+    // Each row's view: the selected (▶) and current/active (◆) markers.
+    // `is_selected` is a per-row memo from `Tabled`, so the highlight moves at
+    // attribute level when the selection changes. The current-model marker is
+    // static per row (derived from `initial_model`), so it is computed once.
     let initial_model_for_cell = initial_model.clone();
-    let cell_factory: CellFactory = Rc::new(move |ctx: &CellContext| {
-        // Resolve the selected key back to its model for the "current" marker.
-        let model = cell_rows.get_clone().iter().find_map(|r| {
-            (format!("{}/{}", r.provider(), r.model.id) == ctx.key).then(|| r.model.clone())
-        });
-        let is_current = model
-            .as_ref()
-            .map(|m| {
-                m.id == initial_model_for_cell.id && m.provider == initial_model_for_cell.provider
-            })
-            .unwrap_or(false);
-        // Selection marker shows for the highlighted (▶) row; the
-        // current/active model is marked with ◆ so it stays distinguishable
-        // even when it is also the selected row.
-        let prefix = if ctx.selected {
-            "▶ "
-        } else if is_current {
-            "◆ "
-        } else {
-            "  "
-        };
-        let color = if ctx.selected {
-            Color::Yellow
-        } else if is_current {
-            Color::Green
-        } else {
-            Color::White
-        };
-        View::from(
-            tags::p()
-                .color(color)
-                .children(format!("{prefix}{}", ctx.label)),
-        )
-    });
+    let list = view! {
+        div(flex_direction = FlexDirection::Column, flex_grow = 1.0_f32) {
+            Tabled(
+                sections = sections,
+                selected = selected,
+                // The overlay is inset 1/8 (≈3/4 of the screen), so a tall
+                // terminal comfortably holds the full provider+model list.
+                // Anything beyond the window scrolls via Up/Down.
+                max_visible = 32,
+                key = |row: &PickerRow| row.key(),
+                view = move |row: FlatRow<PickerRow, String>| match row {
+                    FlatRow::Header { title } => View::from(
+                        tags::p().color(Color::DarkGrey).children(format!(" {title}")),
+                    ),
+                    FlatRow::Body { item, is_selected, .. } => {
+                        let is_current = item.model.id == initial_model_for_cell.id
+                            && item.model.provider == initial_model_for_cell.provider;
+                        // Selection marker shows for the highlighted (▶) row; the
+                        // current/active model is marked with ◆ so it stays
+                        // distinguishable even when it is also the selected row.
+                        let prefix = if is_current { "◆ " } else { "  " };
+                        let label = item.label();
+                        View::from(
+                            tags::div()
+                                .background_color(move || if is_selected.get() {
+                                    Color::Yellow
+                                } else {
+                                    Color::Reset
+                                })
+                                .children(tags::p().color(move || if is_selected.get() {
+                                    Color::Black
+                                } else if is_current {
+                                    Color::Green
+                                } else {
+                                    Color::White
+                                }).children(move || {
+                                    if is_selected.get() {
+                                        format!("▶ {}", label)
+                                    } else {
+                                        format!("{prefix}{label}")
+                                    }
+                                })),
+                        )
+                    }
+                },
+            )
+        }
+    };
 
     let search = View::from_dynamic(move || {
         let query_display = query.get_clone();
@@ -422,19 +470,6 @@ fn model_overlay_view(
             ))
     });
 
-    let list = tags::div()
-        .flex_direction(FlexDirection::Column)
-        .flex_grow(1.0_f32)
-        .children(table_view(TableViewProps {
-            sections,
-            selected,
-            // The overlay is inset 1/8 (≈3/4 of the screen), so a tall
-            // terminal comfortably holds the full provider+model list.
-            // Anything beyond the window scrolls via Up/Down.
-            max_visible: 32,
-            cell_factory,
-        }));
-
     View::from(
         tags::div()
             .flex_direction(FlexDirection::Column)
@@ -449,37 +484,15 @@ fn model_overlay_view(
 /// identically (one level per row, ▶ arrow + color on the selected row, Up/Down
 /// to move). The levels come straight from the model's supported set (e.g.
 /// `off` … `xhigh`).
-fn thinking_overlay_view(selected: ReadSignal<usize>, levels: &[ThinkingLevel]) -> View {
-    let rows: Vec<TableRow> = levels
-        .iter()
-        .map(|level| {
-            TableRow::new(
-                format!("{:?}", level).to_lowercase(),
-                format!("{:?}", level).to_lowercase(),
-            )
-        })
-        .collect();
-    // A memo gives the `ReadSignal` `TableViewProps.sections` expects; the
-    // section list is static, so the memo never recomputes.
+fn thinking_overlay_view(
+    selected: ReadSignal<Option<ThinkingLevel>>,
+    levels: &[ThinkingLevel],
+) -> View {
+    // Capture the static level list by value so the memo is `'static`; the
+    // memo gives the `ReadSignal<Vec<TableSection<_>>>` `Tabled` expects.
+    let levels = levels.to_vec();
     let sections = create_memo(move || {
-        vec![TableSection {
-            title: Some("thinking intensity".to_string()),
-            rows: rows.clone(),
-        }]
-    });
-
-    let cell_factory: CellFactory = Rc::new(move |ctx: &CellContext| {
-        let prefix = if ctx.selected { "▶ " } else { "  " };
-        let color = if ctx.selected {
-            Color::Yellow
-        } else {
-            Color::White
-        };
-        View::from(
-            tags::p()
-                .color(color)
-                .children(format!("{prefix}{}", ctx.label)),
-        )
+        vec![TableSection::new(levels.clone()).with_title("thinking intensity")]
     });
 
     View::from(
@@ -487,12 +500,41 @@ fn thinking_overlay_view(selected: ReadSignal<usize>, levels: &[ThinkingLevel]) 
             .flex_direction(FlexDirection::Column)
             .flex_grow(1.0_f32)
             .padding(1)
-            .children(table_view(TableViewProps {
-                sections,
-                selected,
-                max_visible: 16,
-                cell_factory,
-            })),
+            .children(view! {
+                Tabled(
+                    sections = sections,
+                    selected = selected,
+                    max_visible = 16,
+                    key = |level: &ThinkingLevel| level.clone(),
+                    view = |row: FlatRow<ThinkingLevel, ThinkingLevel>| match row {
+                        FlatRow::Header { title } => View::from(
+                            tags::p().color(Color::DarkGrey).children(format!(" {title}")),
+                        ),
+                        FlatRow::Body { item, is_selected, .. } => {
+                            let label = format!("{item:?}").to_lowercase();
+                            View::from(
+                                tags::div()
+                                    .background_color(move || if is_selected.get() {
+                                        Color::Yellow
+                                    } else {
+                                        Color::Reset
+                                    })
+                                    .children(tags::p().color(move || if is_selected.get() {
+                                        Color::Black
+                                    } else {
+                                        Color::White
+                                    }).children(move || {
+                                        if is_selected.get() {
+                                            format!("▶ {label}")
+                                        } else {
+                                            format!("  {label}")
+                                        }
+                                    })),
+                            )
+                        }
+                    },
+                )
+            }),
     )
 }
 

@@ -20,18 +20,33 @@ use super::tool_format::format_tool_call;
 
 // ── Conversation model ────────────────────────────────────────────────
 
-/// One row in the transcript.
-#[derive(Debug, Clone)]
+/// One row in the transcript. The `id` is a per-session monotonically
+/// increasing identifier used as the stable key for the iodilos
+/// `StreamingList` keyed engine — it lets a surviving entry keep its mapped
+/// view (and its per-item scope) across `entries.set(..)` mutations, so a
+/// streaming assistant body updates in place via the body `Signal` instead of
+/// re-running the entry's view closure.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConversationEntry {
+    pub id: u64,
     pub kind: EntryKind,
 }
 
 /// The kind + body of a transcript entry. Mirrors the old `MessageKind` enum.
-#[derive(Debug, Clone)]
+///
+/// `Assistant` and `Thinking` carry their body as a `Signal<String>` (not a
+/// plain `String`) — these are the two streaming variants, and storing them
+/// as signals lets `append_to_assistant` / `append_to_thinking` mutate the
+/// body **without** touching the parent `entries: Signal<Vec<_>>`. That keeps
+/// `StreamingList`'s keyed diff a no-op (the surviving entry's view closure
+/// is not re-invoked), and the markdown re-render is driven by the body
+/// signal's own reactive region inside the entry view. Every other variant is
+/// finalized at push time, so a plain `String` suffices.
+#[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     User(String),
-    Assistant(String),
-    Thinking(String),
+    Assistant(Signal<String>),
+    Thinking(Signal<String>),
     Tool { name: String, text: String },
     /// A finalized tool result (the output a tool produced after running).
     /// `tool` names the source tool so the renderer can apply per-tool styling
@@ -141,6 +156,10 @@ impl std::fmt::Debug for TerminalSize {
 pub struct UiState {
     /// The full conversation, oldest first. Drives the transcript `<For>`.
     pub entries: Signal<Vec<ConversationEntry>>,
+    /// Monotonic id allocator. Stamped onto each `ConversationEntry` at push
+    /// time and used as the `StreamingList` key, so entry views are reused by
+    /// id across `entries.set(..)` instead of being rebuilt by index.
+    pub next_entry_id: Signal<u64>,
     /// `true` while an agent prompt is streaming.
     pub busy: Signal<bool>,
     /// Status-line snapshot.
@@ -166,6 +185,7 @@ impl UiState {
     pub fn new(editor: EditorState) -> Self {
         Self {
             entries: create_signal(Vec::new()),
+            next_entry_id: create_signal(0),
             busy: create_signal(false),
             status: create_signal(StatusInfo::default()),
             input: create_signal(editor),
@@ -176,9 +196,18 @@ impl UiState {
         }
     }
 
+    /// Allocate the next entry id and bump the counter.
+    fn alloc_id(&self) -> u64 {
+        let id = self.next_entry_id.get();
+        self.next_entry_id.set(id + 1);
+        id
+    }
+
     /// Append a new entry of `kind`, sticking to the bottom (auto-follow).
     pub fn push(&self, kind: EntryKind) {
-        self.entries.update(|e| e.push(ConversationEntry { kind }));
+        let id = self.alloc_id();
+        self.entries
+            .update(|e| e.push(ConversationEntry { id, kind }));
         self.stick_to_bottom();
     }
 
@@ -189,11 +218,11 @@ impl UiState {
     }
 
     pub fn push_assistant(&self, text: impl Into<String>) {
-        self.push(EntryKind::Assistant(text.into()));
+        self.push(EntryKind::Assistant(create_signal(text.into())));
     }
 
     pub fn push_thinking(&self, text: impl Into<String>) {
-        self.push(EntryKind::Thinking(text.into()));
+        self.push(EntryKind::Thinking(create_signal(text.into())));
     }
 
     pub fn push_tool(&self, name: impl Into<String>, text: impl Into<String>) {
@@ -238,46 +267,49 @@ impl UiState {
     /// appended (the last entry was an assistant entry). Mirrors the old
     /// `Transcript::append_to_assistant`.
     ///
-    /// `Signal::update` returns `()`, so we capture the result via a
-    /// `Cell<Option<bool>>` shared into the closure.
+    /// Streaming append targets the entry's body **`Signal<String>`**, not the
+    /// parent `entries: Signal<Vec<_>>`. That lets the `StreamingList` keyed
+    /// engine skip the surviving entry's view closure entirely — the per-item
+    /// reactive region reading `body.get_clone()` re-renders the markdown in
+    /// place, while every other entry's view stays untouched.
     pub fn append_to_assistant(&self, text: &str) -> bool {
-        use std::cell::Cell;
         let was_following_bottom = self.scroll_offset.get() == usize::MAX;
-        let result = Cell::new(false);
-        let result_ref = &result;
-        self.entries.update(|e| {
-            if let Some(last) = e.last_mut()
-                && let EntryKind::Assistant(body) = &mut last.kind
-            {
-                body.push_str(text);
-                result_ref.set(true);
-            }
+        let body_signal = self.entries.with(|e| match e.last() {
+            Some(entry) => match &entry.kind {
+                EntryKind::Assistant(sig) => Some(*sig),
+                _ => None,
+            },
+            None => None,
         });
-        if result.get() && was_following_bottom {
+        let Some(body) = body_signal else {
+            return false;
+        };
+        body.update(|s| s.push_str(text));
+        if was_following_bottom {
             self.stick_to_bottom();
         }
-        result.get()
+        true
     }
 
     /// Append `text` to the last thinking entry. Returns `true` if it was
     /// appended (the last entry was a thinking entry).
     pub fn append_to_thinking(&self, text: &str) -> bool {
-        use std::cell::Cell;
         let was_following_bottom = self.scroll_offset.get() == usize::MAX;
-        let result = Cell::new(false);
-        let result_ref = &result;
-        self.entries.update(|e| {
-            if let Some(last) = e.last_mut()
-                && let EntryKind::Thinking(body) = &mut last.kind
-            {
-                body.push_str(text);
-                result_ref.set(true);
-            }
+        let body_signal = self.entries.with(|e| match e.last() {
+            Some(entry) => match &entry.kind {
+                EntryKind::Thinking(sig) => Some(*sig),
+                _ => None,
+            },
+            None => None,
         });
-        if result.get() && was_following_bottom {
+        let Some(body) = body_signal else {
+            return false;
+        };
+        body.update(|s| s.push_str(text));
+        if was_following_bottom {
             self.stick_to_bottom();
         }
-        result.get()
+        true
     }
 
     /// Whether the last entry is an assistant entry.
@@ -403,7 +435,7 @@ mod tests {
                 let EntryKind::Thinking(body) = &entries[0].kind else {
                     panic!("expected thinking entry");
                 };
-                text.replace(body.clone());
+                text.replace(body.get_clone());
             });
         });
 
