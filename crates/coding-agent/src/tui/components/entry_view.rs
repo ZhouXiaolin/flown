@@ -29,7 +29,7 @@ use std::rc::Rc;
 use iodilos::node::TuiNode;
 use iodilos::prelude::*;
 use iodilos::producer::Lines;
-use iodilos_md::StreamingParser;
+use iodilos_md::StreamingSurface;
 
 use crate::tui::components::message_block::{Row, render_entry};
 use crate::tui::state::{ConversationEntry, EntryKind, TerminalSize};
@@ -65,10 +65,13 @@ pub fn entry_view(entry: ConversationEntry, top_margin: bool) -> View {
     // once — keyed reuse keeps it identical across list mutations.
     let leaf: View = match entry.kind.clone() {
         EntryKind::Assistant(body) => {
-            // Per-entry StreamingParser owned by the keyed-map's per-item
-            // scope. It caches the committed markdown prefix and is reused
-            // across body.set(..) ticks; only the open tail is re-parsed.
-            let parser = Rc::new(RefCell::new(StreamingParser::new()));
+            // Per-entry StreamingSurface owned by the keyed-map's per-item
+            // scope. It caches both the committed markdown *parse* and the
+            // committed *rendered rows*, so a body.set(..) tick only re-parses
+            // and re-renders the open tail — the committed prefix's rows are
+            // reused verbatim (the cache keys off the parser's byte-boundary
+            // `committed_len` plus the render width).
+            let parser = Rc::new(RefCell::new(StreamingSurface::new()));
             View::from_dynamic(move || {
                 // Read both signals so this region tracks both dependencies.
                 let width = entry_render_width(cols.get());

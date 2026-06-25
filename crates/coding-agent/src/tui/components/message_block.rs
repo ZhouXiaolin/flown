@@ -2,7 +2,7 @@
 
 use iodilos::prelude::{Color, Modifier};
 use iodilos::text::SpanStyle;
-use iodilos_md::{MarkdownTheme, StreamingParser, markdown_surface};
+use iodilos_md::{MarkdownTheme, StreamingSurface, markdown_surface};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::state::{ConversationEntry, EntryKind};
@@ -31,7 +31,7 @@ const LINE_NUM_COLOR: Color = Color::Rgb { r: 100, g: 100, b: 100 };     // Dark
 pub fn render_entry(
     entry: &ConversationEntry,
     render_width: usize,
-    parser: Option<&mut StreamingParser>,
+    parser: Option<&mut StreamingSurface>,
 ) -> Vec<Row> {
     let width = render_width.max(1);
     match &entry.kind {
@@ -62,6 +62,9 @@ pub fn render_entry(
                 parser,
             )
         }
+        // Note: render_thinking_block below does not take the streaming parser —
+        // thinking blocks are capped/bounded views, so the incremental cache is
+        // not worth threading through.
         EntryKind::Thinking(body) => {
             let text = body.get_clone();
             render_thinking_block(&text, width)
@@ -97,7 +100,7 @@ fn render_tool(
     name: &str,
     text: &str,
     render_width: usize,
-    parser: Option<&mut StreamingParser>,
+    parser: Option<&mut StreamingSurface>,
 ) -> Vec<Row> {
     match name {
         "write" => render_write_tool(text, render_width, parser),
@@ -202,7 +205,7 @@ fn truncate_with_ellipsis(text: &str, budget: usize) -> String {
 fn render_write_tool(
     text: &str,
     render_width: usize,
-    parser: Option<&mut StreamingParser>,
+    parser: Option<&mut StreamingSurface>,
 ) -> Vec<Row> {
     let (dot, color) = tool_dot("write");
     let style = fg(color);
@@ -220,7 +223,7 @@ fn render_write_tool(
     if !body.is_empty() {
         let theme = MarkdownTheme::default();
         let surface = match parser {
-            Some(p) => p.feed_to_surface(&body, render_width, &theme),
+            Some(p) => p.render(&body, render_width, &theme),
             None => markdown_surface(&body, render_width, &theme),
         };
         for row in &surface.rows {
@@ -492,11 +495,11 @@ fn render_markdown(
     color: Color,
     body: &str,
     render_width: usize,
-    parser: Option<&mut StreamingParser>,
+    parser: Option<&mut StreamingSurface>,
 ) -> Vec<Row> {
     let theme = MarkdownTheme::default();
     let surface = match parser {
-        Some(parser) => parser.feed_to_surface(body, render_width, &theme),
+        Some(parser) => parser.render(body, render_width, &theme),
         None => markdown_surface(body, render_width, &theme),
     };
     let mut rows = surface.rows.clone();
